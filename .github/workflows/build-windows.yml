@@ -16,16 +16,17 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'npm'
 
       - name: Install dependencies
-        run: npm ci
+        env:
+          NODE_ENV: development
+        run: npm ci --include=dev --no-audit --no-fund
 
       - name: Ensure Windows native bindings
         shell: pwsh
         run: |
-          if (-not (Test-Path "node_modules/@rolldown/binding-win32-x64-msvc")) {
-            npm install --no-save @rolldown/binding-win32-x64-msvc @tailwindcss/oxide-win32-x64-msvc lightningcss-win32-x64-msvc
+          if (-not (Test-Path "node_modules/@rolldown/binding-win32-x64-msvc") -or -not (Test-Path "node_modules/@tailwindcss/oxide-win32-x64-msvc") -or -not (Test-Path "node_modules/lightningcss-win32-x64-msvc")) {
+            npm install --no-save @rolldown/binding-win32-x64-msvc @tailwindcss/oxide-win32-x64-msvc lightningcss-win32-x64-msvc @esbuild/win32-x64 @esbuild/win32-ia32
           }
 
       - name: Build Rinse web & server bundles
