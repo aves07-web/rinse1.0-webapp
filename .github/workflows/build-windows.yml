@@ -1,0 +1,37 @@
+name: Build Windows Desktop App (32-bit & 64-bit)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build Rinse web & server bundles
+        run: npm run build
+
+      - name: Package Portable Windows .exe & .zip (32-bit + 64-bit)
+        run: npx electron-builder --config electron-builder.json --win --ia32 --x64
+
+      - name: Upload Windows .exe & .zip Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Rinse-Windows-32bit-64bit
+          path: |
+            release/Rinse-Portable-ia32.exe
+            release/Rinse-Portable-x64.exe
+            release/Rinse-*-win.zip
+          if-no-files-found: warn

@@ -1,0 +1,6 @@
+{
+  "name": "Atelier Linen ERP",
+  "description": "Local-first Laundry Business Management System with accrual double-entry accounting, corporate linen tracking, task scheduling, calendar sync, and automated notifications.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,225 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-sans: "DM Sans", -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+:root,
+[data-theme="colorful"] {
+  --erp-primary: #0071e3;
+  --erp-primary-hover: #0062c8;
+  --erp-success: #16a34a;
+  --erp-warning: #d97706;
+  --erp-danger: #dc2626;
+  --erp-info: #0d9488;
+  --erp-accent: #7c3aed;
+
+  --erp-sidebar-from: #0f2947;
+  --erp-sidebar-mid: #163d68;
+  --erp-sidebar-to: #1e5087;
+
+  --erp-table-head-bg: rgba(239, 246, 255, 0.85);
+  --erp-table-head-text: #1e3a5f;
+  --erp-table-zebra: rgba(248, 250, 252, 0.72);
+  --erp-table-hover: rgba(219, 234, 254, 0.45);
+}
+
+[data-theme="classic-blue"] {
+  --erp-primary: #0071e3;
+  --erp-primary-hover: #0062c8;
+  --erp-success: #15803d;
+  --erp-warning: #b45309;
+  --erp-danger: #dc2626;
+  --erp-info: #0284c7;
+  --erp-accent: #1d4ed8;
+
+  --erp-sidebar-from: #0c2340;
+  --erp-sidebar-mid: #123663;
+  --erp-sidebar-to: #1a4b88;
+
+  --erp-table-head-bg: rgba(241, 245, 249, 0.9);
+  --erp-table-head-text: #334155;
+  --erp-table-zebra: rgba(248, 250, 252, 0.65);
+  --erp-table-hover: rgba(224, 242, 254, 0.4);
+}
+
+[data-theme="calm"] {
+  --erp-primary: #2563eb;
+  --erp-primary-hover: #1d4ed8;
+  --erp-success: #2e7d5b;
+  --erp-warning: #b86e1b;
+  --erp-danger: #b93838;
+  --erp-info: #2c7a7b;
+  --erp-accent: #6d5cae;
+
+  --erp-sidebar-from: #1b324b;
+  --erp-sidebar-mid: #234262;
+  --erp-sidebar-to: #2d5378;
+
+  --erp-table-head-bg: rgba(241, 245, 249, 0.85);
+  --erp-table-head-text: #334155;
+  --erp-table-zebra: rgba(248, 250, 252, 0.5);
+  --erp-table-hover: rgba(226, 232, 240, 0.45);
+}
+
+@layer base {
+  body {
+    font-family: var(--font-sans);
+    background-color: #f5f5f7;
+    color: #1d1d1f;
+    background-image:
+      radial-gradient(circle at 12% 8%, rgba(0, 113, 227, 0.05) 0%, transparent 42%),
+      radial-gradient(circle at 88% 16%, rgba(124, 58, 237, 0.03) 0%, transparent 38%),
+      radial-gradient(circle at 50% 92%, rgba(13, 148, 136, 0.03) 0%, transparent 48%);
+    background-attachment: fixed;
+  }
+
+  h1, h2, h3, h4, .font-display {
+    font-family: var(--font-display);
+  }
+}
+
+.liquid-glass {
+  background: rgba(255, 255, 255, 0.78);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid rgba(226, 232, 240, 0.9);
+  box-shadow:
+    0 8px 32px rgba(15, 23, 42, 0.045),
+    0 1px 2px rgba(15, 23, 42, 0.03),
+    inset 0 1px 0 rgba(255, 255, 255, 0.92);
+}
+
+.liquid-glass-subtle {
+  background: rgba(255, 255, 255, 0.56);
+  backdrop-filter: blur(16px) saturate(160%);
+  -webkit-backdrop-filter: blur(16px) saturate(160%);
+  border: 1px solid rgba(226, 232, 240, 0.8);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+}
+
+.erp-sidebar {
+  background: linear-gradient(
+    180deg,
+    var(--erp-sidebar-from) 0%,
+    var(--erp-sidebar-mid) 55%,
+    var(--erp-sidebar-to) 100%
+  );
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow:
+    0 16px 40px rgba(15, 41, 71, 0.22),
+    inset 0 1px 0 rgba(255, 255, 255, 0.16);
+}
+
+/* Controlled Data Tables: colored header, subtle zebra striping, hover tint */
+.erp-table thead tr {
+  background-color: var(--erp-table-head-bg);
+  color: var(--erp-table-head-text);
+}
+
+.erp-table tbody tr:nth-child(even) {
+  background-color: var(--erp-table-zebra);
+}
+
+.erp-table tbody tr:hover {
+  background-color: var(--erp-table-hover);
+}
+
+/* Clear Button Hierarchy */
+.btn-primary {
+  background-color: var(--erp-primary);
+  color: #ffffff;
+}
+.btn-primary:hover {
+  background-color: var(--erp-primary-hover);
+}
+
+.btn-secondary {
+  background-color: #ffffff;
+  color: #334155;
+  border: 1px solid #cbd5e1;
+}
+.btn-secondary:hover {
+  border-color: var(--erp-primary);
+  color: var(--erp-primary);
+}
+
+.btn-danger {
+  background-color: var(--erp-danger);
+  color: #ffffff;
+}
+.btn-danger:hover {
+  background-color: #b91c1c;
+}
+
+/* Light-grey checkerboard preview background for transparent logo check */
+.checkerboard-bg {
+  background-color: #f1f5f9;
+  background-image:
+    linear-gradient(45deg, #e2e8f0 25%, transparent 25%),
+    linear-gradient(-45deg, #e2e8f0 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #e2e8f0 75%),
+    linear-gradient(-45deg, transparent 75%, #e2e8f0 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* A4 Screen & Print Invoice Rules */
+.a4-invoice-sheet {
+  width: 210mm;
+  min-height: 297mm;
+  padding: 12mm;
+  background-color: #ffffff !important;
+  color: #0f172a !important;
+}
+
+.a4-invoice-table thead {
+  display: table-header-group;
+}
+
+.a4-invoice-table tr,
+.a4-signature-keep {
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@page {
+  size: A4 portrait;
+  margin: 12mm;
+}
+
+@media print {
+  html, body {
+    background: #ffffff !important;
+    background-image: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+  .no-print {
+    display: none !important;
+  }
+  .print-only-container {
+    box-shadow: none !important;
+    border: none !important;
+    border-radius: 0 !important;
+    background: #ffffff !important;
+    margin: 0 !important;
+    width: 100% !important;
+    max-width: none !important;
+    min-height: auto !important;
+    padding: 0 !important;
+  }
+}

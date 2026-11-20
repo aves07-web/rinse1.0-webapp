@@ -1,0 +1,18 @@
+{
+  "githubUser": {
+    "login": "aves07-web",
+    "avatarUrl": "https://avatars.githubusercontent.com/u/359011390?v=4",
+    "name": "aves07-web"
+  },
+  "repoFullName": "aves07-web/rinse-claude-data",
+  "repoPrivate": true,
+  "lastEnvRepo": "rinse-claude-data",
+  "branch": "main",
+  "filePath": "data/laundry-erp.json",
+  "autoSync": true,
+  "lastFileSha": "e2d9e045ea7303a30c25c6bb93e2935719e1090c",
+  "lastEtag": "\"e2d9e045ea7303a30c25c6bb93e2935719e1090c\"",
+  "lastSyncedAt": "2026-11-20T06:28:38.514Z",
+  "lastSyncDirection": "pull",
+  "lastCommitSha": "ebb529e710790d4ee6452a04020f38626a280afe"
+}
