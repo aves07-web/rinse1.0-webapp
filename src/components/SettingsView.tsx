@@ -24,6 +24,7 @@ import {
   Users,
   X,
 } from 'lucide-react';
+import rinseLogo from '../assets/images/rinse_logo_1795028808300.jpg';
 import {
   AppearanceTheme,
   AppSettings,
@@ -486,7 +487,7 @@ export function SettingsView({
     img.onerror = () => {
       setLogoError('Could not load default Rinse logo asset.');
     };
-    img.src = '/src/assets/images/rinse_logo_1795028808300.jpg';
+    img.src = rinseLogo;
   };
 
   const handleDownloadJsonBackup = () => {

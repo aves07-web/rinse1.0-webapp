@@ -196,6 +196,9 @@ export function migrateErpState(raw: Partial<ErpState> | null | undefined): ErpS
     });
   }
 
+  const arr = <T,>(val: T[] | undefined | null, fallback: T[]): T[] =>
+    Array.isArray(val) ? val : fallback;
+
   return {
     ...INITIAL_ERP_STATE,
     ...raw,
@@ -206,6 +209,10 @@ export function migrateErpState(raw: Partial<ErpState> | null | undefined): ErpS
       companyLogoSize: raw.settings.companyLogoSize || 'Medium',
       showBrandNameWithLogo: raw.settings.showBrandNameWithLogo ?? true,
       appearanceTheme: raw.settings.appearanceTheme || 'colorful',
+      expenseCategories: arr(
+        raw.settings.expenseCategories,
+        INITIAL_ERP_STATE.settings.expenseCategories
+      ),
     },
     idFormats: {
       ...DEFAULT_ID_FORMATS,
@@ -217,9 +224,30 @@ export function migrateErpState(raw: Partial<ErpState> | null | undefined): ErpS
           ...raw.openingBalance,
         }
       : createDefaultOpeningBalanceDraft(raw),
-    users: raw.users && raw.users.length > 0 ? raw.users : INITIAL_ERP_STATE.users,
-    rolePermissions: migratedRolePerms,
+    categories: arr(raw.categories, INITIAL_ERP_STATE.categories),
+    customers: arr(raw.customers, INITIAL_ERP_STATE.customers),
+    products: arr(raw.products, INITIAL_ERP_STATE.products),
+    services: arr(raw.services, INITIAL_ERP_STATE.services),
+    prices: arr(raw.prices, INITIAL_ERP_STATE.prices),
+    customerCustomPrices: arr(raw.customerCustomPrices, INITIAL_ERP_STATE.customerCustomPrices),
+    deliveryOptions: arr(raw.deliveryOptions, INITIAL_ERP_STATE.deliveryOptions),
+    orders: arr(raw.orders, INITIAL_ERP_STATE.orders),
     corporateCustomers: migratedCorp,
+    corporateMovements: arr(raw.corporateMovements, INITIAL_ERP_STATE.corporateMovements),
+    suppliers: arr(raw.suppliers, INITIAL_ERP_STATE.suppliers),
+    chemicals: arr(raw.chemicals, INITIAL_ERP_STATE.chemicals),
+    stockMovements: arr(raw.stockMovements, INITIAL_ERP_STATE.stockMovements),
     accounts,
+    journalEntries: arr(raw.journalEntries, INITIAL_ERP_STATE.journalEntries),
+    employees: arr(raw.employees, INITIAL_ERP_STATE.employees),
+    payrollRecords: arr(raw.payrollRecords, INITIAL_ERP_STATE.payrollRecords),
+    expenses: arr(raw.expenses, INITIAL_ERP_STATE.expenses),
+    invoices: arr(raw.invoices, INITIAL_ERP_STATE.invoices),
+    tasks: arr(raw.tasks, INITIAL_ERP_STATE.tasks),
+    notifications: arr(raw.notifications, INITIAL_ERP_STATE.notifications),
+    notificationRules: arr(raw.notificationRules, INITIAL_ERP_STATE.notificationRules),
+    blackBox: arr(raw.blackBox, INITIAL_ERP_STATE.blackBox),
+    users: arr(raw.users, []).length > 0 ? arr(raw.users, INITIAL_ERP_STATE.users) : INITIAL_ERP_STATE.users,
+    rolePermissions: migratedRolePerms,
   };
 }

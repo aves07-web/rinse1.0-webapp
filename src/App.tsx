@@ -100,15 +100,56 @@ import {
   getExistingIdsForType,
 } from './utils/smartId';
 
+import rinseLogo from './assets/images/rinse_logo_1795028808300.jpg';
+
 const SESSION_USER_KEY = 'atelier_linen_user_id';
+
+function safeSessionGet(key: string): string | null {
+  try {
+    if (typeof window === 'undefined') return null;
+    return window.sessionStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function safeSessionSet(key: string, value: string): void {
+  try {
+    if (typeof window !== 'undefined') {
+      window.sessionStorage.setItem(key, value);
+    }
+  } catch {
+    // ignore when storage is blocked in third-party iframe
+  }
+}
+
+function safeSessionRemove(key: string): void {
+  try {
+    if (typeof window !== 'undefined') {
+      window.sessionStorage.removeItem(key);
+    }
+  } catch {
+    // ignore when storage is blocked in third-party iframe
+  }
+}
+
+function safeNotificationPermission(): NotificationPermission | 'unsupported' {
+  try {
+    if (typeof window !== 'undefined' && 'Notification' in window) {
+      return Notification.permission;
+    }
+  } catch {
+    // ignore restricted environment
+  }
+  return 'unsupported';
+}
 
 export default function App() {
   const [state, setState] = useState<ErpState>(INITIAL_ERP_STATE);
   const [loadedFromServer, setLoadedFromServer] = useState(false);
-  const [currentUserId, setCurrentUserId] = useState<string | null>(() => {
-    if (typeof window === 'undefined') return null;
-    return window.sessionStorage.getItem(SESSION_USER_KEY);
-  });
+  const [currentUserId, setCurrentUserId] = useState<string | null>(() =>
+    safeSessionGet(SESSION_USER_KEY)
+  );
   const [activeSection, setActiveSection] = useState<NavSection>('dashboard');
   const [accountingInitialTab, setAccountingInitialTab] = useState<
     'statements' | 'journals' | 'drawCashIn' | 'coa'
@@ -123,7 +164,7 @@ export default function App() {
     mode: 'invoice',
   });
   const [browserPermission, setBrowserPermission] = useState<NotificationPermission | 'unsupported'>(
-    () => (typeof window !== 'undefined' && 'Notification' in window ? Notification.permission : 'unsupported')
+    () => safeNotificationPermission()
   );
 
   // Safe Undo / Redo stacks for non-posted edits (Catalogue & Tasks)
@@ -262,7 +303,12 @@ export default function App() {
       if (closedByEffect) return;
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${protocol}//${window.location.host}/ws`;
-      const ws = new WebSocket(wsUrl);
+      let ws: WebSocket;
+      try {
+        ws = new WebSocket(wsUrl);
+      } catch {
+        return;
+      }
       wsRef.current = ws;
 
       ws.onopen = () => {
@@ -581,7 +627,7 @@ export default function App() {
   // --- AUTHENTICATION & OWNER RBAC HANDLERS ---
 
   const handleLoginSuccess = (user: UserAccount) => {
-    window.sessionStorage.setItem(SESSION_USER_KEY, user.id);
+    safeSessionSet(SESSION_USER_KEY, user.id);
     setCurrentUserId(user.id);
     setPermissionError('');
     const rolePerms =
@@ -618,7 +664,7 @@ export default function App() {
         return { ...prev, blackBox: [bb, ...prev.blackBox] };
       });
     }
-    window.sessionStorage.removeItem(SESSION_USER_KEY);
+    safeSessionRemove(SESSION_USER_KEY);
     setCurrentUserId(null);
     setMobileMenuOpen(false);
     setQuickSearchOpen(false);
@@ -4220,7 +4266,7 @@ export default function App() {
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 rounded-xl bg-white p-1 shrink-0 overflow-hidden shadow-xs">
                 <img
-                  src="/src/assets/images/rinse_logo_1795028808300.jpg"
+                  src={rinseLogo}
                   alt="Rinse logo"
                   referrerPolicy="no-referrer"
                   className="w-full h-full object-contain"
@@ -4309,7 +4355,7 @@ export default function App() {
                 <div className="flex items-center gap-2.5 min-w-0">
                   <div className="w-8 h-8 rounded-lg bg-white p-0.5 shrink-0 overflow-hidden">
                     <img
-                      src="/src/assets/images/rinse_logo_1795028808300.jpg"
+                      src={rinseLogo}
                       alt="Rinse logo"
                       referrerPolicy="no-referrer"
                       className="w-full h-full object-contain"

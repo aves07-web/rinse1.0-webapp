@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { Eye, EyeOff, Lock, Shield, UserCheck } from 'lucide-react';
+import rinseLogo from '../assets/images/rinse_logo_1795028808300.jpg';
 import { UserAccount, UserRole } from '../types/erp';
 
 interface LoginViewProps {
@@ -64,7 +65,7 @@ export function LoginView({
         <div className="text-center space-y-2.5">
           <div className="w-16 h-16 mx-auto rounded-2xl bg-white p-1.5 shadow-md border border-slate-200/80 overflow-hidden">
             <img
-              src="/src/assets/images/rinse_logo_1795028808300.jpg"
+              src={rinseLogo}
               alt="Rinse logo"
               referrerPolicy="no-referrer"
               className="w-full h-full object-contain"
