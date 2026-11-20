@@ -10,6 +10,8 @@
   "files": [
     "dist/**/*",
     "electron/**/*",
+    "build/icon.ico",
+    "build/icon.png",
     "package.json",
     "!dist/**/*.map",
     "!node_modules/vite/**/*",

@@ -1458,6 +1458,11 @@ export function SettingsView({
                         className="w-full px-3 py-2 text-xs rounded-xl bg-white border border-slate-200"
                       >
                         <option value="">-- Choose Repository --</option>
+                        {ghRepoInput && !ghRepos.some((r) => r.fullName === ghRepoInput) && (
+                          <option value={ghRepoInput} disabled>
+                            {ghRepoInput} (Not accessible / 404)
+                          </option>
+                        )}
                         {ghRepos.map((r) => (
                           <option key={r.fullName} value={r.fullName}>
                             {r.fullName} {r.private ? '(Private)' : '(Public)'}
@@ -1480,10 +1485,10 @@ export function SettingsView({
                     </div>
                   )}
 
-                  {!ghRepoInput && (
+                  {(!ghRepoInput || Boolean(githubStatus.lastError)) && (
                     <div className="p-3 rounded-xl bg-slate-50 border border-slate-200/80 space-y-2">
                       <p className="text-[11px] font-semibold text-slate-700">
-                        Or create a new Private GitHub Data Repository:
+                        Create a new Private GitHub Data Repository:
                       </p>
                       <div className="flex gap-2">
                         <input

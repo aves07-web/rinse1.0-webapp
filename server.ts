@@ -383,7 +383,7 @@ export async function startServer(options: StartServerOptions = {}) {
       }
       const status = githubSync.getStatus(callbackUrl);
       console.info(
-        `[GET /api/github/status] connected=${status.connected} envToken=${status.envTokenConfigured} repo=${status.repoFullName || 'unset'} branch=${status.branch} path=${status.filePath}${status.lastError ? ` error="${status.lastError}"` : ''}`
+        `[GET /api/github/status] connected=${status.connected} envToken=${status.envTokenConfigured} repo=${status.repoFullName || 'unset'} branch=${status.branch} path=${status.filePath}`
       );
       res.json(status);
     } catch (err) {
@@ -868,7 +868,7 @@ export async function startServer(options: StartServerOptions = {}) {
         });
       })
       .catch((err) => {
-        console.error('[GitHubSync Boot] Sync failed:', err instanceof Error ? err.message : err);
+        console.warn('[GitHubSync Boot] Sync skipped:', err instanceof Error ? err.message : err);
         broadcastJson({
           type: 'github:status',
           status: githubSync.getStatus(`${resolveAppUrl()}/auth/callback`),

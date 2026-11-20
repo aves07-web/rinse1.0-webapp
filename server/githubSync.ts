@@ -183,21 +183,26 @@ export class GitHubSyncManager {
     });
     if (repoRes.status === 401 || repoRes.status === 403) {
       const msg = `GitHub authentication/permission failed (${repoRes.status}) for "${repo}". Verify GITHUB_TOKEN has Contents read/write access.`;
-      console.error(`[GitHubSync] ${msg}`);
+      console.warn(`[GitHubSync] ${msg}`);
       this.config.lastError = msg;
       this.saveConfig();
       return { ok: false, error: msg };
     }
     if (repoRes.status === 404) {
-      const msg = `GitHub repository "${repo}" returned 404 Not Found. Check GITHUB_REPO ("owner/repo") and verify GITHUB_TOKEN has access to this repository.`;
-      console.error(`[GitHubSync] ${msg}`);
+      const accessible = await this.listRepos().catch(() => []);
+      const accessibleHint =
+        accessible.length > 0
+          ? ` Accessible repos for this token: ${accessible.map((r) => r.fullName).join(', ')}.`
+          : '';
+      const msg = `GitHub repository "${repo}" was not found or token lacks access (404).${accessibleHint} Choose an accessible repo or click "Create Private Repo" in Settings.`;
+      console.warn(`[GitHubSync] ${msg}`);
       this.config.lastError = msg;
       this.saveConfig();
       return { ok: false, error: msg };
     }
     if (!repoRes.ok) {
       const msg = `GitHub repository check failed (${repoRes.status}) for "${repo}".`;
-      console.error(`[GitHubSync] ${msg}`);
+      console.warn(`[GitHubSync] ${msg}`);
       this.config.lastError = msg;
       this.saveConfig();
       return { ok: false, error: msg };
@@ -254,7 +259,7 @@ export class GitHubSyncManager {
       this.saveConfig();
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'GitHub initialization failed';
-      console.error('[GitHubSync] ensureInitialized error:', msg);
+      console.warn('[GitHubSync] ensureInitialized warning:', msg);
       this.config.lastError = msg;
       this.saveConfig();
     }
@@ -621,7 +626,7 @@ export class GitHubSyncManager {
             }
           }
           const msg = `GitHub push failed (${res.status}) on "${repo}/${filePath}@${branch}": ${errText.slice(0, 180)}`;
-          console.error(`[GitHubSync] ${msg}`);
+          console.warn(`[GitHubSync] ${msg}`);
           this.config.lastError = msg;
           this.saveConfig();
           throw new Error(msg);
@@ -664,7 +669,7 @@ export class GitHubSyncManager {
       try {
         await this.pushState(getLatestState(), updatedBy);
       } catch (err) {
-        console.error('[GitHubSync] Auto-push failed:', err instanceof Error ? err.message : err);
+        console.warn('[GitHubSync] Auto-push skipped:', err instanceof Error ? err.message : err);
       } finally {
         onComplete?.();
       }
