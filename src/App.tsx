@@ -238,39 +238,64 @@ export default function App() {
   const wsRef = useRef<WebSocket | null>(null);
   const [onlineUsers, setOnlineUsers] = useState<OnlinePresenceUser[]>([]);
   const [githubStatus, setGithubStatus] = useState<GitHubSyncStatus | null>(null);
+  const [backendMode, setBackendMode] = useState<'unknown' | 'server' | 'static'>('unknown');
+
+  const STATIC_STATE_KEY = 'rinse_static_erp_state_v2';
 
   const refreshGitHubStatus = useCallback(async () => {
     try {
       const res = await fetch('/api/github/status');
-      if (res.ok) {
+      const ct = res.headers.get('content-type') || '';
+      if (res.ok && ct.includes('application/json')) {
         const data = (await res.json()) as GitHubSyncStatus;
         setGithubStatus(data);
       }
     } catch {
-      // ignore offline
+      // ignore offline or static host
     }
   }, []);
 
-  // Load persisted state from server on mount & migrate safely
+  // Load persisted state from server on mount (or localStorage on static hosts like GitHub Pages)
   useEffect(() => {
     let active = true;
     fetch('/api/state')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data: Partial<ErpState> | null) => {
-        if (active && data && data.settings && Array.isArray(data.accounts)) {
+      .then(async (res) => {
+        const ct = res.headers.get('content-type') || '';
+        if (!res.ok || !ct.includes('application/json')) {
+          throw new Error('Static host or backend unavailable');
+        }
+        return (await res.json()) as Partial<ErpState>;
+      })
+      .then((data) => {
+        if (!active) return;
+        setBackendMode('server');
+        if (data && data.settings && Array.isArray(data.accounts)) {
           const migrated = migrateErpState(data);
           isRemoteUpdateRef.current = true;
           syncedRevisionRef.current = migrated.syncRevision ?? 1;
           setState(migrated);
         }
+        refreshGitHubStatus();
       })
       .catch(() => {
-        // fallback to INITIAL_ERP_STATE
+        if (!active) return;
+        setBackendMode('static');
+        try {
+          const raw = window.localStorage.getItem(STATIC_STATE_KEY);
+          if (raw) {
+            const parsed = JSON.parse(raw) as Partial<ErpState>;
+            if (parsed && parsed.settings && Array.isArray(parsed.accounts)) {
+              isRemoteUpdateRef.current = true;
+              setState(migrateErpState(parsed));
+            }
+          }
+        } catch {
+          // ignore blocked storage
+        }
       })
       .finally(() => {
         if (active) setLoadedFromServer(true);
       });
-    refreshGitHubStatus();
     return () => {
       active = false;
     };
@@ -294,7 +319,7 @@ export default function App() {
   }, [currentUser]);
 
   useEffect(() => {
-    if (typeof window === 'undefined') return;
+    if (typeof window === 'undefined' || backendMode !== 'server') return;
     let closedByEffect = false;
     let reconnectTimer: number | null = null;
     let attempt = 0;
@@ -389,9 +414,9 @@ export default function App() {
         wsRef.current = null;
       }
     };
-  }, []);
+  }, [backendMode]);
 
-  // Persist state atomically to server when modified locally
+  // Persist state atomically to server (or localStorage on static hosts) when modified locally
   const saveTimerRef = useRef<number | null>(null);
   useEffect(() => {
     if (!loadedFromServer) return;
@@ -399,6 +424,15 @@ export default function App() {
       isRemoteUpdateRef.current = false;
       return;
     }
+    if (backendMode === 'static') {
+      try {
+        window.localStorage.setItem(STATIC_STATE_KEY, JSON.stringify(state));
+      } catch {
+        // ignore storage quota/blocked
+      }
+      return;
+    }
+    if (backendMode !== 'server') return;
     if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
     saveTimerRef.current = window.setTimeout(async () => {
       try {
@@ -436,7 +470,7 @@ export default function App() {
     return () => {
       if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
     };
-  }, [state, loadedFromServer, activeUserName, showToast]);
+  }, [state, loadedFromServer, backendMode, activeUserName, showToast]);
 
   const commitState = useCallback(
     (updater: (prev: ErpState) => ErpState, recordUndo = false) => {
