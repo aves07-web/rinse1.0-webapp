@@ -984,7 +984,7 @@ export function SettingsView({
                         </p>
                         <p className="text-[11px] text-[#0071E3] font-medium">{u.role}</p>
                       </div>
-                      {u.id !== 'owner' && (
+                      {u.id !== 'Ankonbabu' && u.id !== 'owner' && (
                         <button
                           type="button"
                           onClick={() => onUpdateUser(u.id, { active: !u.active })}

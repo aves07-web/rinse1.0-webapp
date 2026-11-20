@@ -7,8 +7,10 @@ import {
   Pencil,
   Plus,
   Search,
+  SlidersHorizontal,
   Tag,
   Trash2,
+  X,
 } from 'lucide-react';
 import {
   ErpState,
@@ -18,7 +20,7 @@ import {
   OrderStage,
   PaymentSplit,
 } from '../types/erp';
-import { formatMoney, getMoneySourceAccounts } from '../utils/accounting';
+import { dateInputToIso, formatMoney, getMoneySourceAccounts, toDateInputValue } from '../utils/accounting';
 import {
   DEFAULT_ID_FORMATS,
   generateNextSmartId,
@@ -32,6 +34,7 @@ import { ZeroPriceAffectedLine, ZeroPriceWarningModal } from './ZeroPriceWarning
 
 interface OrdersViewProps {
   state: ErpState;
+  isOwner?: boolean;
   initialOpenCreate?: boolean;
   canEditIssuedIds?: boolean;
   onCreateOrder: (params: {
@@ -56,12 +59,34 @@ interface OrdersViewProps {
     additionalChargeLabel: string;
     addAdditionalToOrder: boolean;
     notes: string;
+    orderDate?: string;
+    invoiceDate?: string;
     initialPaidAmount: number;
     paymentAccountCode: string;
     paymentSplits?: PaymentSplit[];
   }) => void;
   onRenameOrderId?: (oldId: string, newId: string) => boolean;
   onDeleteOrder?: (orderId: string) => void;
+  onOwnerCustomizeOrder?: (
+    orderId: string,
+    updated: {
+      customerId: string;
+      createdAt: string;
+      expectedDeliveryAt: string;
+      invoiceIssuedAt?: string;
+      deliveryOptionId: string;
+      stage: OrderStage;
+      physicallyReceived: boolean;
+      lines: OrderLine[];
+      orderDiscount: number;
+      additionalCharge: number;
+      additionalChargeLabel?: string;
+      addAdditionalToOrder: boolean;
+      paidAmount: number;
+      paymentSplits?: PaymentSplit[];
+      notes: string;
+    }
+  ) => void;
   onGoToAccounting?: () => void;
   onRequestDelete?: (req: DeleteConfirmationRequest) => void;
   onAdvanceStage: (orderId: string, nextStage: OrderStage, note?: string) => void;
@@ -83,11 +108,13 @@ interface OrdersViewProps {
 
 export function OrdersView({
   state,
+  isOwner = false,
   initialOpenCreate = false,
   canEditIssuedIds = false,
   onCreateOrder,
   onRenameOrderId,
   onDeleteOrder,
+  onOwnerCustomizeOrder,
   onGoToAccounting,
   onRequestDelete,
   onAdvanceStage,
@@ -144,9 +171,28 @@ export function OrdersView({
   const moneyAccounts = useMemo(() => getMoneySourceAccounts(state.accounts), [state.accounts]);
   const defaultMoneyAccountCode = moneyAccounts[0]?.code || '1010';
   const [notes, setNotes] = useState('');
+  const [orderDate, setOrderDate] = useState(() => toDateInputValue());
+  const [invoiceDate, setInvoiceDate] = useState(() => toDateInputValue());
   const [initialSplits, setInitialSplits] = useState<PaymentSplit[]>(() => [
     { accountCode: defaultMoneyAccountCode, accountName: moneyAccounts[0]?.name, amount: 0 },
   ]);
+
+  // Owner Customize Order Modal State
+  const [customizeOrderOpen, setCustomizeOrderOpen] = useState(false);
+  const [custOrderCustomerId, setCustOrderCustomerId] = useState('');
+  const [custOrderDate, setCustOrderDate] = useState('');
+  const [custExpectedDate, setCustExpectedDate] = useState('');
+  const [custInvoiceDate, setCustInvoiceDate] = useState('');
+  const [custDeliveryOptionId, setCustDeliveryOptionId] = useState('');
+  const [custStage, setCustStage] = useState<OrderStage>('Received');
+  const [custPhysicallyReceived, setCustPhysicallyReceived] = useState(true);
+  const [custLines, setCustLines] = useState<OrderLine[]>([]);
+  const [custDiscount, setCustDiscount] = useState(0);
+  const [custExtraCharge, setCustExtraCharge] = useState(0);
+  const [custExtraLabel, setCustExtraLabel] = useState('Extra Charge');
+  const [custAddExtra, setCustAddExtra] = useState(false);
+  const [custPaidSplits, setCustPaidSplits] = useState<PaymentSplit[]>([]);
+  const [custNotes, setCustNotes] = useState('');
 
   const activeProducts = useMemo(() => state.products.filter((p) => p.active), [state.products]);
   const activeServices = useMemo(() => state.services.filter((s) => s.active), [state.services]);
@@ -321,6 +367,8 @@ export function OrdersView({
       additionalChargeLabel,
       addAdditionalToOrder,
       notes,
+      orderDate,
+      invoiceDate,
       initialPaidAmount: totalInitialPaid,
       paymentAccountCode: primaryAcc,
       paymentSplits: validSplits.length > 0 ? validSplits : undefined,
@@ -577,6 +625,28 @@ export function OrdersView({
                   <span className="text-amber-700">Recorded as Not Yet Received</span>
                 )}
               </div>
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">Order Date</label>
+              <input
+                type="date"
+                value={orderDate}
+                onChange={(e) => setOrderDate(e.target.value)}
+                className="w-full px-3 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-700 mb-1">
+                Billing / Invoice Date
+              </label>
+              <input
+                type="date"
+                value={invoiceDate}
+                onChange={(e) => setInvoiceDate(e.target.value)}
+                className="w-full px-3 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
+              />
             </div>
           </div>
 
@@ -1038,6 +1108,48 @@ export function OrdersView({
                   </div>
 
                   <div className="flex flex-wrap items-center gap-2">
+                    {isOwner && onOwnerCustomizeOrder && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const linkedInv = activeOrder.invoiceId
+                            ? state.invoices.find((i) => i.id === activeOrder.invoiceId)
+                            : undefined;
+                          setCustOrderCustomerId(activeOrder.customerId);
+                          setCustOrderDate(toDateInputValue(activeOrder.createdAt));
+                          setCustExpectedDate(toDateInputValue(activeOrder.expectedDeliveryAt));
+                          setCustInvoiceDate(
+                            toDateInputValue(linkedInv?.issuedAt || activeOrder.createdAt)
+                          );
+                          setCustDeliveryOptionId(activeOrder.deliveryOptionId);
+                          setCustStage(activeOrder.stage);
+                          setCustPhysicallyReceived(activeOrder.physicallyReceived);
+                          setCustLines(activeOrder.lines.map((l) => ({ ...l })));
+                          setCustDiscount(activeOrder.orderDiscount);
+                          setCustExtraCharge(activeOrder.additionalCharge);
+                          setCustExtraLabel(activeOrder.additionalChargeLabel || 'Extra Charge');
+                          setCustAddExtra(activeOrder.addAdditionalToOrder);
+                          setCustPaidSplits(
+                            activeOrder.paymentSplits && activeOrder.paymentSplits.length > 0
+                              ? activeOrder.paymentSplits.map((s) => ({ ...s }))
+                              : [
+                                  {
+                                    accountCode: defaultMoneyAccountCode,
+                                    accountName: moneyAccounts[0]?.name,
+                                    amount: activeOrder.paidAmount,
+                                  },
+                                ]
+                          );
+                          setCustNotes(activeOrder.notes || '');
+                          setCustomizeOrderOpen(true);
+                        }}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-xl bg-amber-50 border border-amber-300 text-amber-800 hover:bg-amber-100"
+                        title="Owner Customize Order, Items, Dates & Payments"
+                      >
+                        <SlidersHorizontal className="w-3.5 h-3.5" />
+                        Customize
+                      </button>
+                    )}
                     {activeOrder.invoiceId && (
                       <button
                         onClick={() => onOpenDocument('invoice', activeOrder.invoiceId!)}
@@ -1058,6 +1170,21 @@ export function OrdersView({
                       <button
                         type="button"
                         onClick={() => {
+                          if (isOwner) {
+                            onRequestDelete({
+                              itemType: 'Retail Order (Owner Override)',
+                              itemNameOrId: `${activeOrder.id} (${activeOrder.customerName})`,
+                              bodyText: `Permanently delete order ${activeOrder.id} (${formatMoney(
+                                activeOrder.totalAmount,
+                                sym
+                              )}) along with its linked invoice, customer due balance, and accounting journals?`,
+                              linkedInfo:
+                                'Owner override: Linked invoice, Sales/Collection journals, and customer due will be cleanly reversed.',
+                              accountingProtected: false,
+                              onConfirmDelete: () => onDeleteOrder?.(activeOrder.id),
+                            });
+                            return;
+                          }
                           const hasPostedPaymentOrInvoice =
                             activeOrder.paidAmount > 0 || Boolean(activeOrder.invoiceId);
                           if (hasPostedPaymentOrInvoice || activeOrder.isOpening) {
@@ -1088,7 +1215,7 @@ export function OrdersView({
                           }
                         }}
                         className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-xl border border-red-200 bg-white text-red-600 hover:bg-red-50"
-                        title="Delete order"
+                        title={isOwner ? 'Delete order & reverse ledger (Owner)' : 'Delete order'}
                       >
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>
@@ -1453,6 +1580,428 @@ export function OrdersView({
           commitOrderSubmission(approved);
         }}
       />
+
+      {/* Owner-Only Customize Order Modal */}
+      {isOwner && customizeOrderOpen && activeOrder && onOwnerCustomizeOrder && (
+        <div
+          className="fixed inset-0 z-50 flex items-start justify-center p-4 sm:p-6 bg-slate-900/45 backdrop-blur-xs overflow-y-auto"
+          onClick={() => setCustomizeOrderOpen(false)}
+        >
+          <form
+            onClick={(e) => e.stopPropagation()}
+            onSubmit={(e) => {
+              e.preventDefault();
+              const validSplits = custPaidSplits.filter((s) => Number(s.amount) > 0);
+              const totalPaid = Number(
+                validSplits.reduce((s, sp) => s + Number(sp.amount || 0), 0).toFixed(2)
+              );
+              onOwnerCustomizeOrder(activeOrder.id, {
+                customerId: custOrderCustomerId,
+                createdAt: dateInputToIso(custOrderDate, activeOrder.createdAt),
+                expectedDeliveryAt: dateInputToIso(
+                  custExpectedDate,
+                  activeOrder.expectedDeliveryAt
+                ),
+                invoiceIssuedAt: dateInputToIso(custInvoiceDate, activeOrder.createdAt),
+                deliveryOptionId: custDeliveryOptionId,
+                stage: custStage,
+                physicallyReceived: custPhysicallyReceived,
+                lines: custLines,
+                orderDiscount: custDiscount,
+                additionalCharge: custExtraCharge,
+                additionalChargeLabel: custExtraLabel,
+                addAdditionalToOrder: custAddExtra,
+                paidAmount: totalPaid,
+                paymentSplits: validSplits,
+                notes: custNotes,
+              });
+              setCustomizeOrderOpen(false);
+            }}
+            className="w-full max-w-4xl bg-white rounded-2xl border border-slate-200 shadow-2xl p-6 space-y-5 my-auto"
+          >
+            <div className="flex items-center justify-between border-b border-slate-200 pb-3">
+              <div>
+                <h3 className="text-base font-semibold text-slate-900">
+                  Customize Order · {activeOrder.id}
+                </h3>
+                <p className="text-xs text-slate-500">
+                  Owner override: Edit dates, customer, garment lines, discounts, payments, or delete
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setCustomizeOrderOpen(false)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">Customer</label>
+                <select
+                  value={custOrderCustomerId}
+                  onChange={(e) => setCustOrderCustomerId(e.target.value)}
+                  className="w-full px-3 py-2 text-xs rounded-xl bg-white border border-slate-200"
+                >
+                  {state.customers.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.id} — {c.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">Order Date</label>
+                <input
+                  type="date"
+                  value={custOrderDate}
+                  onChange={(e) => setCustOrderDate(e.target.value)}
+                  className="w-full px-3 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                  Invoice / Billing Date
+                </label>
+                <input
+                  type="date"
+                  value={custInvoiceDate}
+                  onChange={(e) => setCustInvoiceDate(e.target.value)}
+                  className="w-full px-3 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                  Expected Delivery Date
+                </label>
+                <input
+                  type="date"
+                  value={custExpectedDate}
+                  onChange={(e) => setCustExpectedDate(e.target.value)}
+                  className="w-full px-3 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                  Delivery Option
+                </label>
+                <select
+                  value={custDeliveryOptionId}
+                  onChange={(e) => setCustDeliveryOptionId(e.target.value)}
+                  className="w-full px-3 py-2 text-xs rounded-xl bg-white border border-slate-200"
+                >
+                  {state.deliveryOptions.map((d) => (
+                    <option key={d.id} value={d.id}>
+                      {d.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">Stage</label>
+                <select
+                  value={custStage}
+                  onChange={(e) => setCustStage(e.target.value as OrderStage)}
+                  className="w-full px-3 py-2 text-xs rounded-xl bg-white border border-slate-200"
+                >
+                  {(
+                    [
+                      'Not yet received',
+                      'Received',
+                      'Processing',
+                      'Ready to deliver',
+                      'Delivered',
+                    ] as OrderStage[]
+                  ).map((st) => (
+                    <option key={st} value={st}>
+                      {st}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <label className="inline-flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={custPhysicallyReceived}
+                onChange={(e) => setCustPhysicallyReceived(e.target.checked)}
+              />
+              Items physically received
+            </label>
+
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-slate-700">Order Lines</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const p = state.products[0];
+                    const s = state.services[0];
+                    setCustLines((prev) => [
+                      ...prev,
+                      {
+                        id: `ol-cust-${Date.now()}`,
+                        productId: p?.id || '',
+                        productName: p?.name || 'Item',
+                        serviceId: s?.id || '',
+                        serviceName: s?.name || 'Service',
+                        quantityOrdered: 1,
+                        quantityReceived: custPhysicallyReceived ? 1 : 0,
+                        quantityDelivered: 0,
+                        quantityRewash: 0,
+                        unitPrice: p && s ? resolveDefaultUnitPrice(custOrderCustomerId, p.id, s.id, custDeliveryOptionId) : 0,
+                        discount: 0,
+                      },
+                    ]);
+                  }}
+                  className="inline-flex items-center gap-1 text-xs font-medium text-[#0071E3] hover:underline"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  Add Item Line
+                </button>
+              </div>
+
+              {custLines.map((line, i) => (
+                <div
+                  key={line.id}
+                  className="grid grid-cols-1 md:grid-cols-12 gap-2 items-end p-2.5 rounded-xl bg-slate-50 border border-slate-200"
+                >
+                  <div className="md:col-span-3">
+                    <label className="block text-[10px] text-slate-500 mb-0.5">Product</label>
+                    <select
+                      value={line.productId}
+                      onChange={(e) => {
+                        const prod = state.products.find((p) => p.id === e.target.value);
+                        setCustLines((prev) =>
+                          prev.map((row, idx) =>
+                            idx === i
+                              ? { ...row, productId: e.target.value, productName: prod?.name || row.productName }
+                              : row
+                          )
+                        );
+                      }}
+                      className="w-full px-2 py-1.5 text-xs rounded-lg bg-white border border-slate-200"
+                    >
+                      {state.products.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="md:col-span-3">
+                    <label className="block text-[10px] text-slate-500 mb-0.5">Service</label>
+                    <select
+                      value={line.serviceId}
+                      onChange={(e) => {
+                        const srv = state.services.find((s) => s.id === e.target.value);
+                        setCustLines((prev) =>
+                          prev.map((row, idx) =>
+                            idx === i
+                              ? { ...row, serviceId: e.target.value, serviceName: srv?.name || row.serviceName }
+                              : row
+                          )
+                        );
+                      }}
+                      className="w-full px-2 py-1.5 text-xs rounded-lg bg-white border border-slate-200"
+                    >
+                      {state.services.map((s) => (
+                        <option key={s.id} value={s.id}>
+                          {s.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="md:col-span-2">
+                    <label className="block text-[10px] text-slate-500 mb-0.5">Qty</label>
+                    <input
+                      type="number"
+                      min={0}
+                      value={line.quantityOrdered}
+                      onChange={(e) => {
+                        const q = Math.max(0, Number(e.target.value));
+                        setCustLines((prev) =>
+                          prev.map((row, idx) =>
+                            idx === i
+                              ? {
+                                  ...row,
+                                  quantityOrdered: q,
+                                  quantityReceived: custPhysicallyReceived ? q : 0,
+                                }
+                              : row
+                          )
+                        );
+                      }}
+                      className="w-full px-2 py-1.5 text-xs font-mono rounded-lg bg-white border border-slate-200"
+                    />
+                  </div>
+                  <div className="md:col-span-2">
+                    <label className="block text-[10px] text-slate-500 mb-0.5">Unit Price</label>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.5"
+                      value={line.unitPrice}
+                      onChange={(e) =>
+                        setCustLines((prev) =>
+                          prev.map((row, idx) =>
+                            idx === i ? { ...row, unitPrice: Math.max(0, Number(e.target.value)) } : row
+                          )
+                        )
+                      }
+                      className="w-full px-2 py-1.5 text-xs font-mono rounded-lg bg-white border border-slate-200"
+                    />
+                  </div>
+                  <div className="md:col-span-1">
+                    <label className="block text-[10px] text-slate-500 mb-0.5">Disc.</label>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.5"
+                      value={line.discount}
+                      onChange={(e) =>
+                        setCustLines((prev) =>
+                          prev.map((row, idx) =>
+                            idx === i ? { ...row, discount: Math.max(0, Number(e.target.value)) } : row
+                          )
+                        )
+                      }
+                      className="w-full px-2 py-1.5 text-xs font-mono rounded-lg bg-white border border-slate-200"
+                    />
+                  </div>
+                  <div className="md:col-span-1 text-right">
+                    {custLines.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={() => setCustLines((prev) => prev.filter((_, idx) => idx !== i))}
+                        className="p-1.5 text-red-500 hover:bg-red-50 rounded-lg"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {(() => {
+              const lineSub = custLines.reduce(
+                (s, l) => s + Math.max(0, l.quantityOrdered * l.unitPrice - l.discount),
+                0
+              );
+              const calcTotal = Math.max(
+                0,
+                Number((lineSub - custDiscount + (custAddExtra ? custExtraCharge : 0)).toFixed(2))
+              );
+              return (
+                <div className="grid grid-cols-1 md:grid-cols-12 gap-3 pt-3 border-t border-slate-200 items-start">
+                  <div className="md:col-span-2">
+                    <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                      Order Discount ({sym})
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      value={custDiscount}
+                      onChange={(e) => setCustDiscount(Math.max(0, Number(e.target.value)))}
+                      className="w-full px-2.5 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
+                    />
+                  </div>
+                  <div className="md:col-span-4 space-y-1.5">
+                    <label className="inline-flex items-center gap-1.5 text-[11px] font-medium text-slate-700 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={custAddExtra}
+                        onChange={(e) => setCustAddExtra(e.target.checked)}
+                      />
+                      Include Extra Charge
+                    </label>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <input
+                        disabled={!custAddExtra}
+                        value={custExtraLabel}
+                        onChange={(e) => setCustExtraLabel(e.target.value)}
+                        className="px-2.5 py-1.5 text-xs rounded-lg bg-white border border-slate-200 disabled:opacity-50"
+                      />
+                      <input
+                        type="number"
+                        min={0}
+                        disabled={!custAddExtra}
+                        value={custExtraCharge}
+                        onChange={(e) => setCustExtraCharge(Math.max(0, Number(e.target.value)))}
+                        className="px-2.5 py-1.5 text-xs font-mono rounded-lg bg-white border border-slate-200 disabled:opacity-50"
+                      />
+                    </div>
+                  </div>
+                  <div className="md:col-span-6">
+                    <SplitPaymentInput
+                      accounts={state.accounts}
+                      currencySymbol={sym}
+                      splits={custPaidSplits}
+                      onChange={setCustPaidSplits}
+                      maxTotal={calcTotal}
+                      allowZero
+                      label={`Paid Amount (Order Total: ${formatMoney(calcTotal, sym)})`}
+                      onAddMoneyAccount={onAddMoneyAccount}
+                    />
+                  </div>
+                </div>
+              );
+            })()}
+
+            <div>
+              <label className="block text-[11px] font-medium text-slate-600 mb-1">Notes</label>
+              <input
+                value={custNotes}
+                onChange={(e) => setCustNotes(e.target.value)}
+                className="w-full px-3 py-2 text-xs rounded-xl bg-white border border-slate-200"
+              />
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-3 pt-3 border-t border-slate-200">
+              {onRequestDelete ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCustomizeOrderOpen(false);
+                    onRequestDelete({
+                      itemType: 'Retail Order (Owner Override)',
+                      itemNameOrId: `${activeOrder.id} (${activeOrder.customerName})`,
+                      bodyText: `Permanently delete order ${activeOrder.id} and reverse its linked invoice & ledger journals?`,
+                      accountingProtected: false,
+                      onConfirmDelete: () => onDeleteOrder?.(activeOrder.id),
+                    });
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium rounded-xl border border-red-200 text-red-600 hover:bg-red-50"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  Delete Order
+                </button>
+              ) : (
+                <span />
+              )}
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setCustomizeOrderOpen(false)}
+                  className="px-4 py-2 text-xs font-medium rounded-xl border border-slate-200 text-slate-600 hover:bg-slate-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-5 py-2 text-xs font-semibold rounded-xl bg-[#0071E3] text-white hover:bg-[#0077ED]"
+                >
+                  Save Customized Order &amp; Ledger
+                </button>
+              </div>
+            </div>
+          </form>
+        </div>
+      )}
     </div>
   );
 }

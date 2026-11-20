@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Pencil, Plus, Search, Trash2, UserPlus, Wallet } from 'lucide-react';
+import { Pencil, Plus, Search, SlidersHorizontal, Trash2, UserPlus, Wallet, X } from 'lucide-react';
 import { Customer, CustomerCategory, ErpState, PaymentSplit } from '../types/erp';
-import { formatMoney, getMoneySourceAccounts } from '../utils/accounting';
+import { formatMoney, getMoneySourceAccounts, toDateInputValue } from '../utils/accounting';
 import {
   DEFAULT_ID_FORMATS,
   generateNextSmartId,
@@ -13,10 +13,27 @@ import { QuickAddMoneyAccountParams, SplitPaymentInput } from './SplitPaymentInp
 
 interface CustomersViewProps {
   state: ErpState;
+  isOwner?: boolean;
   canEditIssuedIds?: boolean;
   onAddCustomer: (
     customer: Omit<Customer, 'id' | 'registeredAt' | 'outstandingBalance' | 'advanceBalance'>,
     options?: { customId?: string; advanceCounterTo?: number }
+  ) => void;
+  onOwnerUpdateCustomer?: (
+    customerId: string,
+    patch: {
+      name: string;
+      phone: string;
+      altPhone?: string;
+      address: string;
+      categoryId: string;
+      notes: string;
+      outstandingBalance?: number;
+      advanceBalance?: number;
+      adjustmentDate?: string;
+      adjustmentOffsetCode?: string;
+      reason?: string;
+    }
   ) => void;
   onRenameCustomerId?: (oldId: string, newId: string) => boolean;
   onDeleteCustomer?: (customerId: string) => void;
@@ -38,8 +55,10 @@ interface CustomersViewProps {
 
 export function CustomersView({
   state,
+  isOwner = false,
   canEditIssuedIds = false,
   onAddCustomer,
+  onOwnerUpdateCustomer,
   onRenameCustomerId,
   onDeleteCustomer,
   onDeactivateCustomer,
@@ -105,6 +124,20 @@ export function CustomersView({
   // New Category inline
   const [newCatName, setNewCatName] = useState('');
   const [newCatColor, setNewCatColor] = useState('#0071E3');
+
+  // Owner Customize Customer Modal
+  const [custModalOpen, setCustModalOpen] = useState(false);
+  const [eName, setEName] = useState('');
+  const [ePhone, setEPhone] = useState('');
+  const [eAltPhone, setEAltPhone] = useState('');
+  const [eAddress, setEAddress] = useState('');
+  const [eCatId, setECatId] = useState('');
+  const [eNotes, setENotes] = useState('');
+  const [eOutBal, setEOutBal] = useState(0);
+  const [eAdvBal, setEAdvBal] = useState(0);
+  const [eAdjDate, setEAdjDate] = useState(() => toDateInputValue());
+  const [eAdjOffset, setEAdjOffset] = useState('3040');
+  const [eAdjReason, setEAdjReason] = useState('Owner customer balance adjustment');
 
   const filteredCustomers = state.customers.filter((c) => {
     const matchesCat = selectedCategoryFilter === 'ALL' || c.categoryId === selectedCategoryFilter;
@@ -568,6 +601,30 @@ export function CustomersView({
                         Advance Held: {formatMoney(activeCustomer.advanceBalance, sym)}
                       </p>
                     </div>
+                    {isOwner && onOwnerUpdateCustomer && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEName(activeCustomer.name);
+                          setEPhone(activeCustomer.phone);
+                          setEAltPhone(activeCustomer.altPhone || '');
+                          setEAddress(activeCustomer.address);
+                          setECatId(activeCustomer.categoryId);
+                          setENotes(activeCustomer.notes || '');
+                          setEOutBal(activeCustomer.outstandingBalance);
+                          setEAdvBal(activeCustomer.advanceBalance);
+                          setEAdjDate(toDateInputValue());
+                          setEAdjOffset('3040');
+                          setEAdjReason('Owner customer balance adjustment');
+                          setCustModalOpen(true);
+                        }}
+                        className="inline-flex items-center gap-1 px-2.5 py-2 text-xs font-semibold rounded-xl bg-amber-50 border border-amber-300 text-amber-800 hover:bg-amber-100"
+                        title="Owner Customize Customer Profile & Balances"
+                      >
+                        <SlidersHorizontal className="w-3.5 h-3.5" />
+                        Customize
+                      </button>
+                    )}
                     {onRequestDelete && (
                       <button
                         type="button"
@@ -837,6 +894,202 @@ export function CustomersView({
           )}
         </div>
       </div>
+
+      {/* Owner Customize Customer & Balance Modal */}
+      {isOwner && custModalOpen && activeCustomer && onOwnerUpdateCustomer && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/45 backdrop-blur-xs"
+          onClick={() => setCustModalOpen(false)}
+        >
+          <form
+            onClick={(e) => e.stopPropagation()}
+            onSubmit={(e) => {
+              e.preventDefault();
+              onOwnerUpdateCustomer(activeCustomer.id, {
+                name: eName,
+                phone: ePhone,
+                altPhone: eAltPhone,
+                address: eAddress,
+                categoryId: eCatId,
+                notes: eNotes,
+                outstandingBalance: eOutBal,
+                advanceBalance: eAdvBal,
+                adjustmentDate: eAdjDate,
+                adjustmentOffsetCode: eAdjOffset,
+                reason: eAdjReason,
+              });
+              setCustModalOpen(false);
+            }}
+            className="w-full max-w-xl bg-white rounded-2xl border border-slate-200 shadow-2xl p-6 space-y-4 text-xs"
+          >
+            <div className="flex items-center justify-between border-b border-slate-200 pb-3">
+              <div>
+                <h3 className="text-base font-semibold text-slate-900">
+                  Customize Customer · {activeCustomer.id}
+                </h3>
+                <p className="text-slate-500">
+                  Edit profile or adjust Outstanding Due &amp; Advance Held anytime (Owner)
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setCustModalOpen(false)}
+                className="p-1 text-slate-400 hover:text-slate-700"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Name</label>
+                <input
+                  required
+                  value={eName}
+                  onChange={(e) => setEName(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Phone</label>
+                <input
+                  required
+                  value={ePhone}
+                  onChange={(e) => setEPhone(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Alt Phone</label>
+                <input
+                  value={eAltPhone}
+                  onChange={(e) => setEAltPhone(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Category</label>
+                <select
+                  value={eCatId}
+                  onChange={(e) => setECatId(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl bg-white border border-slate-200"
+                >
+                  {state.categories.map((cat) => (
+                    <option key={cat.id} value={cat.id}>
+                      {cat.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="sm:col-span-2">
+                <label className="block font-medium text-slate-600 mb-1">Address</label>
+                <input
+                  value={eAddress}
+                  onChange={(e) => setEAddress(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div className="sm:col-span-2">
+                <label className="block font-medium text-slate-600 mb-1">Notes</label>
+                <input
+                  value={eNotes}
+                  onChange={(e) => setENotes(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+            </div>
+
+            <div className="p-3.5 rounded-xl bg-amber-50/70 border border-amber-200 space-y-3">
+              <p className="font-semibold text-amber-900">
+                Adjust Balances (Posts balanced ledger adjustment automatically)
+              </p>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                <div>
+                  <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                    Outstanding Due ({sym})
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    step="0.01"
+                    value={eOutBal}
+                    onChange={(e) => setEOutBal(Math.max(0, Number(e.target.value)))}
+                    className="w-full px-3 py-1.5 font-mono rounded-lg bg-white border border-slate-200"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                    Advance Held ({sym})
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    step="0.01"
+                    value={eAdvBal}
+                    onChange={(e) => setEAdvBal(Math.max(0, Number(e.target.value)))}
+                    className="w-full px-3 py-1.5 font-mono rounded-lg bg-white border border-slate-200"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                    Adjustment Date
+                  </label>
+                  <input
+                    type="date"
+                    value={eAdjDate}
+                    onChange={(e) => setEAdjDate(e.target.value)}
+                    className="w-full px-3 py-1.5 font-mono rounded-lg bg-white border border-slate-200"
+                  />
+                </div>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <div>
+                  <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                    Offset Account
+                  </label>
+                  <select
+                    value={eAdjOffset}
+                    onChange={(e) => setEAdjOffset(e.target.value)}
+                    className="w-full px-2.5 py-1.5 rounded-lg bg-white border border-slate-200"
+                  >
+                    {state.accounts
+                      .filter((a) => a.code !== '1100' && a.code !== '2100')
+                      .map((a) => (
+                        <option key={a.code} value={a.code}>
+                          {a.code} · {a.name}
+                        </option>
+                      ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[11px] font-medium text-slate-600 mb-1">Reason</label>
+                  <input
+                    value={eAdjReason}
+                    onChange={(e) => setEAdjReason(e.target.value)}
+                    className="w-full px-3 py-1.5 rounded-lg bg-white border border-slate-200"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-200">
+              <button
+                type="button"
+                onClick={() => setCustModalOpen(false)}
+                className="px-4 py-2 font-medium rounded-xl border border-slate-200 text-slate-600"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="px-5 py-2 font-semibold rounded-xl bg-[#0071E3] text-white hover:bg-[#0077ED]"
+              >
+                Save Customer Changes
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
     </div>
   );
 }

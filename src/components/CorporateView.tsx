@@ -1,14 +1,26 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Building2, FileText, Plus, Receipt, Trash2, Wallet, X } from 'lucide-react';
+import {
+  Building2,
+  FileText,
+  Plus,
+  Receipt,
+  SlidersHorizontal,
+  Trash2,
+  Wallet,
+  X,
+} from 'lucide-react';
 import {
   BillingBasis,
   BillingCycle,
   CorporateCustomer,
+  CorporateMovement,
   CorporateMovementType,
   ErpState,
+  Invoice,
+  InvoiceLineSnapshot,
   PaymentSplit,
 } from '../types/erp';
-import { formatMoney, getMoneySourceAccounts } from '../utils/accounting';
+import { dateInputToIso, formatMoney, getMoneySourceAccounts, toDateInputValue } from '../utils/accounting';
 import { getCorporateBrandColor } from '../utils/migration';
 import {
   DEFAULT_ID_FORMATS,
@@ -22,6 +34,7 @@ import { ZeroPriceAffectedLine, ZeroPriceWarningModal } from './ZeroPriceWarning
 
 interface CorporateViewProps {
   state: ErpState;
+  isOwner?: boolean;
   onCreateCorporate: (params: {
     name: string;
     contactPerson: string;
@@ -33,6 +46,24 @@ interface CorporateViewProps {
     copyRetailCatalogueOnce: boolean;
   }) => void;
   onUpdateCorporateBillingBasis: (corpId: string, basis: BillingBasis) => void;
+  onOwnerUpdateCorporateProfile?: (
+    corpId: string,
+    patch: {
+      name: string;
+      contactPerson: string;
+      phone: string;
+      address: string;
+      billingBasis: BillingBasis;
+      billingCycle: BillingCycle;
+      cutoffDayOrTime: string;
+      discountPct: number;
+      notes: string;
+      outstandingBalance?: number;
+      adjustmentDate?: string;
+      adjustmentOffsetCode?: string;
+      reason?: string;
+    }
+  ) => void;
   onAddCorporateProduct: (corpId: string, name: string, type: string) => void;
   onAddCorporateService: (corpId: string, name: string) => void;
   onUpsertCorporatePrice: (corpId: string, productId: string, serviceId: string, price: number) => void;
@@ -45,16 +76,52 @@ interface CorporateViewProps {
     serviceId: string;
     qty: number;
     reason: string;
+    date?: string;
   }) => void;
+  onOwnerCustomizeCorporateMovement?: (
+    movId: string,
+    updated: {
+      date: string;
+      orderId?: string;
+      event: CorporateMovementType;
+      productId: string;
+      serviceId: string;
+      qty: number;
+      unitPriceSnapshot: number;
+      reason?: string;
+    }
+  ) => void;
+  onOwnerDeleteCorporateMovement?: (movId: string) => void;
   onGenerateCorporateInvoice: (
     corpId: string,
     periodLabel: string,
     options?: {
       customInvoiceId?: string;
       advanceCounterTo?: number;
+      issuedAt?: string;
+      dueDate?: string;
       approvedZeroPriceLines?: Array<{ productName: string; serviceName: string; quantity: number }>;
     }
   ) => void;
+  onOwnerCustomizeInvoice?: (
+    invoiceId: string,
+    updated: {
+      issuedAt: string;
+      dueDate: string;
+      customerName: string;
+      customerPhone: string;
+      customerAddress: string;
+      periodCovered?: string;
+      paymentTerms: string;
+      termsAndConditions: string;
+      lines: InvoiceLineSnapshot[];
+      discountTotal: number;
+      extraCharges: number;
+      paidAmount: number;
+      paymentAccountCode?: string;
+    }
+  ) => void;
+  onOwnerDeleteInvoice?: (invoiceId: string) => void;
   onCollectCorporatePayment: (
     corpId: string,
     amount: number,
@@ -74,13 +141,19 @@ interface CorporateViewProps {
 
 export function CorporateView({
   state,
+  isOwner = false,
   onCreateCorporate,
   onUpdateCorporateBillingBasis,
+  onOwnerUpdateCorporateProfile,
   onAddCorporateProduct,
   onAddCorporateService,
   onUpsertCorporatePrice,
   onLogCorporateMovement,
+  onOwnerCustomizeCorporateMovement,
+  onOwnerDeleteCorporateMovement,
   onGenerateCorporateInvoice,
+  onOwnerCustomizeInvoice,
+  onOwnerDeleteInvoice,
   onCollectCorporatePayment,
   onOpenInvoice,
   onDeleteCorporate,
@@ -113,6 +186,7 @@ export function CorporateView({
   );
   const [continueCorpOrderNum, setContinueCorpOrderNum] = useState(false);
   const [movOrderErr, setMovOrderErr] = useState('');
+  const [movDate, setMovDate] = useState(() => toDateInputValue());
   const [movEvent, setMovEvent] = useState<CorporateMovementType>('Received');
   const [movProdId, setMovProdId] = useState('');
   const [movSrvId, setMovSrvId] = useState('');
@@ -135,6 +209,10 @@ export function CorporateView({
     return `Period ending ${d.toLocaleDateString()}`;
   });
   const [invoiceDialogOpen, setInvoiceDialogOpen] = useState(false);
+  const [invIssueDate, setInvIssueDate] = useState(() => toDateInputValue());
+  const [invDueDate, setInvDueDate] = useState(() =>
+    toDateInputValue(new Date(Date.now() + 7 * 86400000).toISOString())
+  );
   const [customCorpInvId, setCustomCorpInvId] = useState(() =>
     generateNextSmartId(state, 'corporateInvoice').id
   );
@@ -157,6 +235,46 @@ export function CorporateView({
   >(undefined);
   const [highlightedMovementIds, setHighlightedMovementIds] = useState<Set<string>>(new Set());
   const [billingRateError, setBillingRateError] = useState('');
+
+  // Owner Customize Corporate Profile & Balance Modal
+  const [custCorpOpen, setCustCorpOpen] = useState(false);
+  const [ecName, setEcName] = useState('');
+  const [ecContact, setEcContact] = useState('');
+  const [ecPhone, setEcPhone] = useState('');
+  const [ecAddress, setEcAddress] = useState('');
+  const [ecBasis, setEcBasis] = useState<BillingBasis>('Delivered-wise');
+  const [ecCycle, setEcCycle] = useState<BillingCycle>('Weekly');
+  const [ecCutoff, setEcCutoff] = useState('');
+  const [ecDiscount, setEcDiscount] = useState(0);
+  const [ecNotes, setEcNotes] = useState('');
+  const [ecOutstanding, setEcOutstanding] = useState(0);
+  const [ecAdjDate, setEcAdjDate] = useState(() => toDateInputValue());
+  const [ecAdjOffset, setEcAdjOffset] = useState('3040');
+  const [ecAdjReason, setEcAdjReason] = useState('Owner balance adjustment');
+
+  // Owner Customize Corporate Movement Modal
+  const [editMovTarget, setEditMovTarget] = useState<CorporateMovement | null>(null);
+  const [emDate, setEmDate] = useState('');
+  const [emOrderId, setEmOrderId] = useState('');
+  const [emEvent, setEmEvent] = useState<CorporateMovementType>('Received');
+  const [emProdId, setEmProdId] = useState('');
+  const [emSrvId, setEmSrvId] = useState('');
+  const [emQty, setEmQty] = useState(1);
+  const [emUnitPrice, setEmUnitPrice] = useState(0);
+  const [emReason, setEmReason] = useState('');
+
+  // Owner Customize Corporate Invoice Modal
+  const [editInvTarget, setEditInvTarget] = useState<Invoice | null>(null);
+  const [eiIssuedAt, setEiIssuedAt] = useState('');
+  const [eiDueDate, setEiDueDate] = useState('');
+  const [eiPeriod, setEiPeriod] = useState('');
+  const [eiPayTerms, setEiPayTerms] = useState('');
+  const [eiTermsCond, setEiTermsCond] = useState('');
+  const [eiLines, setEiLines] = useState<InvoiceLineSnapshot[]>([]);
+  const [eiDiscount, setEiDiscount] = useState(0);
+  const [eiExtra, setEiExtra] = useState(0);
+  const [eiPaid, setEiPaid] = useState(0);
+  const [eiPayAcc, setEiPayAcc] = useState(defaultCorpMoneyCode);
 
   useEffect(() => {
     setMovOrderId(generateNextSmartId(state, 'corporateOrder').id);
@@ -480,6 +598,32 @@ export function CorporateView({
                         {formatMoney(activeCorp.outstandingBalance, sym)}
                       </span>
                     </div>
+                    {isOwner && onOwnerUpdateCorporateProfile && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEcName(activeCorp.name);
+                          setEcContact(activeCorp.contactPerson);
+                          setEcPhone(activeCorp.phone);
+                          setEcAddress(activeCorp.address);
+                          setEcBasis(activeCorp.billingBasis);
+                          setEcCycle(activeCorp.billingCycle);
+                          setEcCutoff(activeCorp.cutoffDayOrTime);
+                          setEcDiscount(activeCorp.discountPct);
+                          setEcNotes(activeCorp.notes || '');
+                          setEcOutstanding(activeCorp.outstandingBalance);
+                          setEcAdjDate(toDateInputValue());
+                          setEcAdjOffset('3040');
+                          setEcAdjReason('Owner balance adjustment');
+                          setCustCorpOpen(true);
+                        }}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-xl bg-amber-50 border border-amber-300 text-amber-800 hover:bg-amber-100"
+                        title="Owner Customize Corporate Profile & Balance"
+                      >
+                        <SlidersHorizontal className="w-3.5 h-3.5" />
+                        Customize
+                      </button>
+                    )}
                     {onRequestDelete && (
                       <button
                         type="button"
@@ -574,6 +718,7 @@ export function CorporateView({
                         serviceId: sId,
                         qty: movQty,
                         reason: movReason.trim() || `${movEvent} batch`,
+                        date: movDate,
                       });
                       setMovReason('');
                       setMovOrderErr('');
@@ -582,10 +727,17 @@ export function CorporateView({
                   >
                     <div className="flex flex-wrap items-center justify-between gap-3">
                       <h3 className="text-sm font-semibold text-slate-900">
-                        Record Immutable Movement Event (Draws Only From {activeCorp.name} Private Catalogue)
+                        Record Movement Event (Draws Only From {activeCorp.name} Private Catalogue)
                       </h3>
                       <div className="flex flex-wrap items-center gap-2">
-                        <label className="text-[11px] font-medium text-slate-600">
+                        <label className="text-[11px] font-medium text-slate-600">Date:</label>
+                        <input
+                          type="date"
+                          value={movDate}
+                          onChange={(e) => setMovDate(e.target.value)}
+                          className="px-2.5 py-1 text-xs font-mono rounded-lg bg-white border border-slate-200"
+                        />
+                        <label className="text-[11px] font-medium text-slate-600 ml-1">
                           Batch / Order ID:
                         </label>
                         <input
@@ -782,33 +934,74 @@ export function CorporateView({
                                   ? `Billed (${m.billedQty}) ${m.invoiceId || ''}`
                                   : 'Unbilled'}
                               </td>
-                              {onRequestDelete && (
-                                <td className="py-2.5 px-2 text-right">
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      onRequestDelete({
-                                        itemType: 'Movement Log Entry',
-                                        itemNameOrId: `${m.orderId || m.id} (${m.event} · ${m.productName})`,
-                                        bodyText:
-                                          'Physical linen movement log entries form an immutable append-only audit trail and cannot be deleted.',
-                                        linkedInfo:
-                                          'To correct an entry error, post an Adjustment movement event instead so pending counts stay auditable.',
-                                        accountingProtected: true,
-                                        alternativeLabel: 'Log Adjustment Entry',
-                                        onAlternative: () => {
-                                          setMovEvent('Adjustment');
-                                          setMovProdId(m.productId);
-                                          setMovSrvId(m.serviceId);
-                                          setMovReason(`Correction for ${m.orderId || m.id}`);
-                                        },
-                                      })
-                                    }
-                                    className="p-1 text-slate-400 hover:text-red-600"
-                                    title="Movement entries are audit-protected"
-                                  >
-                                    <Trash2 className="w-3.5 h-3.5" />
-                                  </button>
+                              {(onRequestDelete || isOwner) && (
+                                <td className="py-2.5 px-2 text-right whitespace-nowrap">
+                                  <div className="inline-flex items-center justify-end gap-1">
+                                    {isOwner && onOwnerCustomizeCorporateMovement && (
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setEditMovTarget(m);
+                                          setEmDate(toDateInputValue(m.date));
+                                          setEmOrderId(m.orderId || '');
+                                          setEmEvent(m.event);
+                                          setEmProdId(m.productId);
+                                          setEmSrvId(m.serviceId);
+                                          setEmQty(Math.abs(m.qtyDelta));
+                                          setEmUnitPrice(m.unitPriceSnapshot);
+                                          setEmReason(m.reason || '');
+                                        }}
+                                        className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded-lg bg-amber-50 border border-amber-200 text-amber-800 hover:bg-amber-100"
+                                        title="Customize movement (Owner)"
+                                      >
+                                        <SlidersHorizontal className="w-3 h-3" />
+                                        Customize
+                                      </button>
+                                    )}
+                                    {onRequestDelete && (
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          if (isOwner && onOwnerDeleteCorporateMovement) {
+                                            onRequestDelete({
+                                              itemType: 'Corporate Movement (Owner Override)',
+                                              itemNameOrId: `${m.orderId || m.id} (${m.event} · ${m.productName})`,
+                                              bodyText: `Permanently delete this ${m.event} movement (${Math.abs(
+                                                m.qtyDelta
+                                              )}x ${m.productName}) and recalculate pending linen balances?`,
+                                              accountingProtected: false,
+                                              onConfirmDelete: () => onOwnerDeleteCorporateMovement(m.id),
+                                            });
+                                            return;
+                                          }
+                                          onRequestDelete({
+                                            itemType: 'Movement Log Entry',
+                                            itemNameOrId: `${m.orderId || m.id} (${m.event} · ${m.productName})`,
+                                            bodyText:
+                                              'Physical linen movement log entries form an immutable append-only audit trail and cannot be deleted.',
+                                            linkedInfo:
+                                              'To correct an entry error, post an Adjustment movement event instead so pending counts stay auditable.',
+                                            accountingProtected: true,
+                                            alternativeLabel: 'Log Adjustment Entry',
+                                            onAlternative: () => {
+                                              setMovEvent('Adjustment');
+                                              setMovProdId(m.productId);
+                                              setMovSrvId(m.serviceId);
+                                              setMovReason(`Correction for ${m.orderId || m.id}`);
+                                            },
+                                          });
+                                        }}
+                                        className="p-1 text-slate-400 hover:text-red-600"
+                                        title={
+                                          isOwner
+                                            ? 'Delete movement (Owner Override)'
+                                            : 'Movement entries are audit-protected'
+                                        }
+                                      >
+                                        <Trash2 className="w-3.5 h-3.5" />
+                                      </button>
+                                    )}
+                                  </div>
                                 </td>
                               )}
                             </tr>
@@ -1284,10 +1477,46 @@ export function CorporateView({
                                 <FileText className="w-3.5 h-3.5" />
                                 View / Print
                               </button>
+                              {isOwner && onOwnerCustomizeInvoice && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setEditInvTarget(inv);
+                                    setEiIssuedAt(toDateInputValue(inv.issuedAt));
+                                    setEiDueDate(toDateInputValue(inv.dueDate));
+                                    setEiPeriod(inv.periodCovered || '');
+                                    setEiPayTerms(inv.paymentTerms);
+                                    setEiTermsCond(inv.termsAndConditions);
+                                    setEiLines(inv.lines.map((l) => ({ ...l })));
+                                    setEiDiscount(inv.discountTotal);
+                                    setEiExtra(inv.extraCharges);
+                                    setEiPaid(inv.paidAmount);
+                                    setEiPayAcc(defaultCorpMoneyCode);
+                                  }}
+                                  className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold rounded-lg bg-amber-50 border border-amber-200 text-amber-800 hover:bg-amber-100"
+                                  title="Customize corporate invoice (Owner)"
+                                >
+                                  <SlidersHorizontal className="w-3.5 h-3.5" />
+                                  Customize
+                                </button>
+                              )}
                               {onRequestDelete && (
                                 <button
                                   type="button"
-                                  onClick={() =>
+                                  onClick={() => {
+                                    if (isOwner && onOwnerDeleteInvoice) {
+                                      onRequestDelete({
+                                        itemType: 'Corporate Invoice (Owner Override)',
+                                        itemNameOrId: `${inv.id} (${inv.customerName})`,
+                                        bodyText: `Permanently delete corporate invoice ${inv.id} (${formatMoney(
+                                          inv.grandTotal,
+                                          sym
+                                        )}), unbill linked movements, and reverse its Sales journal & client due balance?`,
+                                        accountingProtected: false,
+                                        onConfirmDelete: () => onOwnerDeleteInvoice(inv.id),
+                                      });
+                                      return;
+                                    }
                                     onRequestDelete({
                                       itemType: 'Posted Invoice',
                                       itemNameOrId: `${inv.id} (${inv.customerName})`,
@@ -1299,10 +1528,10 @@ export function CorporateView({
                                         ? 'Reverse in Accounting'
                                         : undefined,
                                       onAlternative: onGoToAccounting,
-                                    })
-                                  }
+                                    });
+                                  }}
                                   className="p-1.5 rounded-lg text-slate-400 hover:text-red-600"
-                                  title="Posted invoice protection"
+                                  title={isOwner ? 'Delete invoice (Owner Override)' : 'Posted invoice protection'}
                                 >
                                   <Trash2 className="w-3.5 h-3.5" />
                                 </button>
@@ -1396,6 +1625,27 @@ export function CorporateView({
                 />
               </div>
 
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block font-medium text-slate-700 mb-1">Invoice Date</label>
+                  <input
+                    type="date"
+                    value={invIssueDate}
+                    onChange={(e) => setInvIssueDate(e.target.value)}
+                    className="w-full px-3 py-2 font-mono rounded-xl bg-white border border-slate-200"
+                  />
+                </div>
+                <div>
+                  <label className="block font-medium text-slate-700 mb-1">Due Date</label>
+                  <input
+                    type="date"
+                    value={invDueDate}
+                    onChange={(e) => setInvDueDate(e.target.value)}
+                    className="w-full px-3 py-2 font-mono rounded-xl bg-white border border-slate-200"
+                  />
+                </div>
+              </div>
+
               <div className="p-3 rounded-xl bg-white/80 border border-slate-200/80 flex items-center justify-between tabular-nums">
                 <span className="text-slate-600">
                   {unbilledItems.length} unbilled line(s)
@@ -1430,6 +1680,8 @@ export function CorporateView({
                       continueCorpInvNum && corpInvCheck.matchedHigherNumber
                         ? corpInvCheck.matchedHigherNumber + 1
                         : undefined,
+                    issuedAt: invIssueDate,
+                    dueDate: invDueDate,
                     approvedZeroPriceLines: approvedCorpZeroLines,
                   });
                   setApprovedCorpZeroLines(undefined);
@@ -1466,6 +1718,623 @@ export function CorporateView({
           setInvoiceDialogOpen(true);
         }}
       />
+
+      {/* Owner Customize Corporate Account & Balance Modal */}
+      {isOwner && custCorpOpen && activeCorp && onOwnerUpdateCorporateProfile && (
+        <div
+          className="fixed inset-0 z-50 flex items-start justify-center p-4 sm:p-6 bg-slate-900/45 backdrop-blur-xs overflow-y-auto"
+          onClick={() => setCustCorpOpen(false)}
+        >
+          <form
+            onClick={(e) => e.stopPropagation()}
+            onSubmit={(e) => {
+              e.preventDefault();
+              onOwnerUpdateCorporateProfile(activeCorp.id, {
+                name: ecName,
+                contactPerson: ecContact,
+                phone: ecPhone,
+                address: ecAddress,
+                billingBasis: ecBasis,
+                billingCycle: ecCycle,
+                cutoffDayOrTime: ecCutoff,
+                discountPct: ecDiscount,
+                notes: ecNotes,
+                outstandingBalance: ecOutstanding,
+                adjustmentDate: ecAdjDate,
+                adjustmentOffsetCode: ecAdjOffset,
+                reason: ecAdjReason,
+              });
+              setCustCorpOpen(false);
+            }}
+            className="w-full max-w-2xl bg-white rounded-2xl border border-slate-200 shadow-2xl p-6 space-y-4 my-auto"
+          >
+            <div className="flex items-center justify-between border-b border-slate-200 pb-3">
+              <div>
+                <h3 className="text-base font-semibold text-slate-900">
+                  Customize Corporate Account · {activeCorp.id}
+                </h3>
+                <p className="text-xs text-slate-500">
+                  Edit profile, discount, billing rules, or adjust Balance Due anytime (Owner)
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setCustCorpOpen(false)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Organization Name</label>
+                <input
+                  required
+                  value={ecName}
+                  onChange={(e) => setEcName(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Contact Person</label>
+                <input
+                  value={ecContact}
+                  onChange={(e) => setEcContact(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Phone</label>
+                <input
+                  value={ecPhone}
+                  onChange={(e) => setEcPhone(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Discount (%)</label>
+                <input
+                  type="number"
+                  min={0}
+                  max={100}
+                  step="0.5"
+                  value={ecDiscount}
+                  onChange={(e) => setEcDiscount(Number(e.target.value))}
+                  className="w-full px-3 py-2 font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Billing Basis</label>
+                <select
+                  value={ecBasis}
+                  onChange={(e) => setEcBasis(e.target.value as BillingBasis)}
+                  className="w-full px-3 py-2 rounded-xl bg-white border border-slate-200"
+                >
+                  <option value="Delivered-wise">Delivered-wise</option>
+                  <option value="Received-wise">Received-wise</option>
+                </select>
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Billing Cycle</label>
+                <select
+                  value={ecCycle}
+                  onChange={(e) => setEcCycle(e.target.value as BillingCycle)}
+                  className="w-full px-3 py-2 rounded-xl bg-white border border-slate-200"
+                >
+                  <option value="Daily">Daily</option>
+                  <option value="Weekly">Weekly</option>
+                  <option value="Monthly">Monthly</option>
+                  <option value="Fixed-date">Fixed-date</option>
+                  <option value="Custom">Custom</option>
+                </select>
+              </div>
+              <div className="sm:col-span-2">
+                <label className="block font-medium text-slate-600 mb-1">Address &amp; Cutoff</label>
+                <div className="grid grid-cols-2 gap-2">
+                  <input
+                    value={ecAddress}
+                    onChange={(e) => setEcAddress(e.target.value)}
+                    placeholder="Address..."
+                    className="px-3 py-2 rounded-xl bg-white border border-slate-200"
+                  />
+                  <input
+                    value={ecCutoff}
+                    onChange={(e) => setEcCutoff(e.target.value)}
+                    placeholder="Cutoff schedule..."
+                    className="px-3 py-2 rounded-xl bg-white border border-slate-200"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="p-3.5 rounded-xl bg-amber-50/70 border border-amber-200 space-y-3 text-xs">
+              <p className="font-semibold text-amber-900">
+                Adjust Outstanding Balance (Posts balanced ledger adjustment)
+              </p>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                <div>
+                  <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                    Balance Due ({sym})
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    step="0.01"
+                    value={ecOutstanding}
+                    onChange={(e) => setEcOutstanding(Math.max(0, Number(e.target.value)))}
+                    className="w-full px-3 py-1.5 font-mono rounded-lg bg-white border border-slate-200"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                    Adjustment Date
+                  </label>
+                  <input
+                    type="date"
+                    value={ecAdjDate}
+                    onChange={(e) => setEcAdjDate(e.target.value)}
+                    className="w-full px-3 py-1.5 font-mono rounded-lg bg-white border border-slate-200"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                    Offset Account
+                  </label>
+                  <select
+                    value={ecAdjOffset}
+                    onChange={(e) => setEcAdjOffset(e.target.value)}
+                    className="w-full px-2.5 py-1.5 rounded-lg bg-white border border-slate-200"
+                  >
+                    {state.accounts
+                      .filter((a) => a.code !== '1110')
+                      .map((a) => (
+                        <option key={a.code} value={a.code}>
+                          {a.code} · {a.name}
+                        </option>
+                      ))}
+                  </select>
+                </div>
+              </div>
+              <input
+                value={ecAdjReason}
+                onChange={(e) => setEcAdjReason(e.target.value)}
+                placeholder="Reason for adjustment..."
+                className="w-full px-3 py-1.5 rounded-lg bg-white border border-slate-200"
+              />
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-200">
+              <button
+                type="button"
+                onClick={() => setCustCorpOpen(false)}
+                className="px-4 py-2 text-xs font-medium rounded-xl border border-slate-200 text-slate-600"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="px-5 py-2 text-xs font-semibold rounded-xl bg-[#0071E3] text-white hover:bg-[#0077ED]"
+              >
+                Save Corporate Changes
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* Owner Customize Corporate Movement Modal */}
+      {isOwner && editMovTarget && activeCorp && onOwnerCustomizeCorporateMovement && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/45 backdrop-blur-xs"
+          onClick={() => setEditMovTarget(null)}
+        >
+          <form
+            onClick={(e) => e.stopPropagation()}
+            onSubmit={(e) => {
+              e.preventDefault();
+              onOwnerCustomizeCorporateMovement(editMovTarget.id, {
+                date: dateInputToIso(emDate, editMovTarget.date),
+                orderId: emOrderId,
+                event: emEvent,
+                productId: emProdId,
+                serviceId: emSrvId,
+                qty: emQty,
+                unitPriceSnapshot: emUnitPrice,
+                reason: emReason,
+              });
+              setEditMovTarget(null);
+            }}
+            className="w-full max-w-lg bg-white rounded-2xl border border-slate-200 shadow-2xl p-6 space-y-4 text-xs"
+          >
+            <div className="flex items-center justify-between border-b border-slate-200 pb-3">
+              <h3 className="text-base font-semibold text-slate-900">
+                Customize Movement · {editMovTarget.orderId || editMovTarget.id}
+              </h3>
+              <button
+                type="button"
+                onClick={() => setEditMovTarget(null)}
+                className="p-1 text-slate-400 hover:text-slate-700"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Movement Date</label>
+                <input
+                  type="date"
+                  required
+                  value={emDate}
+                  onChange={(e) => setEmDate(e.target.value)}
+                  className="w-full px-3 py-2 font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Batch / Order ID</label>
+                <input
+                  value={emOrderId}
+                  onChange={(e) => setEmOrderId(e.target.value)}
+                  className="w-full px-3 py-2 font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Event</label>
+                <select
+                  value={emEvent}
+                  onChange={(e) => setEmEvent(e.target.value as CorporateMovementType)}
+                  className="w-full px-3 py-2 rounded-xl bg-white border border-slate-200"
+                >
+                  <option value="Received">Received (+)</option>
+                  <option value="Delivered">Delivered (-)</option>
+                  <option value="Returned">Returned (-)</option>
+                  <option value="Rewash">Rewash</option>
+                  <option value="Damaged">Damaged (-)</option>
+                  <option value="Missing">Missing (-)</option>
+                  <option value="Adjustment">Adjustment (+)</option>
+                </select>
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Quantity</label>
+                <input
+                  type="number"
+                  min={0}
+                  value={emQty}
+                  onChange={(e) => setEmQty(Math.max(0, Number(e.target.value)))}
+                  className="w-full px-3 py-2 font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Private Product</label>
+                <select
+                  value={emProdId}
+                  onChange={(e) => setEmProdId(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl bg-white border border-slate-200"
+                >
+                  {activeCorp.products.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Private Service</label>
+                <select
+                  value={emSrvId}
+                  onChange={(e) => setEmSrvId(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl bg-white border border-slate-200"
+                >
+                  {activeCorp.services.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Rate ({sym})</label>
+                <input
+                  type="number"
+                  min={0}
+                  step="0.5"
+                  value={emUnitPrice}
+                  onChange={(e) => setEmUnitPrice(Math.max(0, Number(e.target.value)))}
+                  className="w-full px-3 py-2 font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Reason / Note</label>
+                <input
+                  value={emReason}
+                  onChange={(e) => setEmReason(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-200">
+              <button
+                type="button"
+                onClick={() => setEditMovTarget(null)}
+                className="px-4 py-2 font-medium rounded-xl border border-slate-200 text-slate-600"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="px-5 py-2 font-semibold rounded-xl bg-[#0071E3] text-white hover:bg-[#0077ED]"
+              >
+                Save Movement
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* Owner Customize Corporate Invoice Modal */}
+      {isOwner && editInvTarget && activeCorp && onOwnerCustomizeInvoice && (
+        <div
+          className="fixed inset-0 z-50 flex items-start justify-center p-4 sm:p-6 bg-slate-900/45 backdrop-blur-xs overflow-y-auto"
+          onClick={() => setEditInvTarget(null)}
+        >
+          <form
+            onClick={(e) => e.stopPropagation()}
+            onSubmit={(e) => {
+              e.preventDefault();
+              onOwnerCustomizeInvoice(editInvTarget.id, {
+                issuedAt: dateInputToIso(eiIssuedAt, editInvTarget.issuedAt),
+                dueDate: dateInputToIso(eiDueDate, editInvTarget.dueDate),
+                customerName: editInvTarget.customerName,
+                customerPhone: editInvTarget.customerPhone,
+                customerAddress: editInvTarget.customerAddress,
+                periodCovered: eiPeriod || undefined,
+                paymentTerms: eiPayTerms,
+                termsAndConditions: eiTermsCond,
+                lines: eiLines,
+                discountTotal: eiDiscount,
+                extraCharges: eiExtra,
+                paidAmount: eiPaid,
+                paymentAccountCode: eiPayAcc,
+              });
+              setEditInvTarget(null);
+            }}
+            className="w-full max-w-3xl bg-white rounded-2xl border border-slate-200 shadow-2xl p-6 space-y-4 my-auto text-xs"
+          >
+            <div className="flex items-center justify-between border-b border-slate-200 pb-3">
+              <div>
+                <h3 className="text-base font-semibold text-slate-900">
+                  Customize Corporate Invoice · {editInvTarget.id}
+                </h3>
+                <p className="text-slate-500">
+                  Edit billing date, due date, lines, discounts, charges, and collected amount
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditInvTarget(null)}
+                className="p-1 text-slate-400 hover:text-slate-700"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Invoice Billing Date</label>
+                <input
+                  type="date"
+                  required
+                  value={eiIssuedAt}
+                  onChange={(e) => setEiIssuedAt(e.target.value)}
+                  className="w-full px-3 py-2 font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Due Date</label>
+                <input
+                  type="date"
+                  required
+                  value={eiDueDate}
+                  onChange={(e) => setEiDueDate(e.target.value)}
+                  className="w-full px-3 py-2 font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Period Covered</label>
+                <input
+                  value={eiPeriod}
+                  onChange={(e) => setEiPeriod(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="font-semibold text-slate-700">Billed Lines</span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setEiLines((prev) => [
+                      ...prev,
+                      {
+                        productName: activeCorp.products[0]?.name || 'Linen',
+                        serviceName: activeCorp.services[0]?.name || 'Laundry',
+                        quantity: 1,
+                        unitPrice: 0,
+                        discount: 0,
+                        total: 0,
+                      },
+                    ])
+                  }
+                  className="inline-flex items-center gap-1 font-medium text-[#0071E3] hover:underline"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  Add Line
+                </button>
+              </div>
+              {eiLines.map((line, i) => (
+                <div
+                  key={i}
+                  className="grid grid-cols-12 gap-2 items-end p-2 rounded-xl bg-slate-50 border border-slate-200"
+                >
+                  <div className="col-span-3">
+                    <label className="block text-[10px] text-slate-500">Item</label>
+                    <input
+                      value={line.productName}
+                      onChange={(e) =>
+                        setEiLines((prev) =>
+                          prev.map((row, idx) =>
+                            idx === i ? { ...row, productName: e.target.value } : row
+                          )
+                        )
+                      }
+                      className="w-full px-2 py-1 rounded bg-white border border-slate-200"
+                    />
+                  </div>
+                  <div className="col-span-3">
+                    <label className="block text-[10px] text-slate-500">Service</label>
+                    <input
+                      value={line.serviceName}
+                      onChange={(e) =>
+                        setEiLines((prev) =>
+                          prev.map((row, idx) =>
+                            idx === i ? { ...row, serviceName: e.target.value } : row
+                          )
+                        )
+                      }
+                      className="w-full px-2 py-1 rounded bg-white border border-slate-200"
+                    />
+                  </div>
+                  <div className="col-span-2">
+                    <label className="block text-[10px] text-slate-500">Qty</label>
+                    <input
+                      type="number"
+                      min={0}
+                      value={line.quantity}
+                      onChange={(e) =>
+                        setEiLines((prev) =>
+                          prev.map((row, idx) =>
+                            idx === i ? { ...row, quantity: Math.max(0, Number(e.target.value)) } : row
+                          )
+                        )
+                      }
+                      className="w-full px-2 py-1 font-mono rounded bg-white border border-slate-200"
+                    />
+                  </div>
+                  <div className="col-span-2">
+                    <label className="block text-[10px] text-slate-500">Price</label>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.5"
+                      value={line.unitPrice}
+                      onChange={(e) =>
+                        setEiLines((prev) =>
+                          prev.map((row, idx) =>
+                            idx === i ? { ...row, unitPrice: Math.max(0, Number(e.target.value)) } : row
+                          )
+                        )
+                      }
+                      className="w-full px-2 py-1 font-mono rounded bg-white border border-slate-200"
+                    />
+                  </div>
+                  <div className="col-span-1">
+                    <label className="block text-[10px] text-slate-500">Disc</label>
+                    <input
+                      type="number"
+                      min={0}
+                      value={line.discount}
+                      onChange={(e) =>
+                        setEiLines((prev) =>
+                          prev.map((row, idx) =>
+                            idx === i ? { ...row, discount: Math.max(0, Number(e.target.value)) } : row
+                          )
+                        )
+                      }
+                      className="w-full px-2 py-1 font-mono rounded bg-white border border-slate-200"
+                    />
+                  </div>
+                  <div className="col-span-1 text-right">
+                    {eiLines.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={() => setEiLines((prev) => prev.filter((_, idx) => idx !== i))}
+                        className="p-1 text-red-500 hover:bg-red-50 rounded"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-2 border-t border-slate-200">
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Discount ({sym})</label>
+                <input
+                  type="number"
+                  min={0}
+                  value={eiDiscount}
+                  onChange={(e) => setEiDiscount(Math.max(0, Number(e.target.value)))}
+                  className="w-full px-3 py-1.5 font-mono rounded-lg bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Extra Charges ({sym})</label>
+                <input
+                  type="number"
+                  min={0}
+                  value={eiExtra}
+                  onChange={(e) => setEiExtra(Math.max(0, Number(e.target.value)))}
+                  className="w-full px-3 py-1.5 font-mono rounded-lg bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Paid Amount ({sym})</label>
+                <input
+                  type="number"
+                  min={0}
+                  value={eiPaid}
+                  onChange={(e) => setEiPaid(Math.max(0, Number(e.target.value)))}
+                  className="w-full px-3 py-1.5 font-mono rounded-lg bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Payment Account</label>
+                <select
+                  value={eiPayAcc}
+                  onChange={(e) => setEiPayAcc(e.target.value)}
+                  className="w-full px-2.5 py-1.5 rounded-lg bg-white border border-slate-200"
+                >
+                  {moneyAccounts.map((acc) => (
+                    <option key={acc.code} value={acc.code}>
+                      {acc.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2 pt-3 border-t border-slate-200">
+              <button
+                type="button"
+                onClick={() => setEditInvTarget(null)}
+                className="px-4 py-2 font-medium rounded-xl border border-slate-200 text-slate-600"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="px-5 py-2 font-semibold rounded-xl bg-[#0071E3] text-white hover:bg-[#0077ED]"
+              >
+                Save Invoice &amp; Sync Ledger
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
     </div>
   );
 }

@@ -1,19 +1,22 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import {
   Download,
   Eye,
   FileText,
   Pencil,
+  Plus,
   Printer,
+  SlidersHorizontal,
   Tag,
   Trash2,
   X,
 } from 'lucide-react';
-import { ErpState } from '../types/erp';
-import { formatMoney } from '../utils/accounting';
+import { ErpState, InvoiceLineSnapshot } from '../types/erp';
+import { dateInputToIso, formatMoney, getMoneySourceAccounts, toDateInputValue } from '../utils/accounting';
 import { exportInvoiceToA4Pdf } from '../utils/pdfExport';
 import {
   DEFAULT_ID_FORMATS,
+  generateNextSmartId,
   getExistingIdsForType,
   validateCustomSmartId,
 } from '../utils/smartId';
@@ -23,22 +26,61 @@ import { QrCanvas } from './QrCanvas';
 
 interface DocumentsPrintViewProps {
   state: ErpState;
+  isOwner?: boolean;
   initialMode?: 'invoice' | 'token';
   initialId?: string;
   canEditIssuedIds?: boolean;
   onRecordPrint: (kind: 'Invoice' | 'Token', id: string) => void;
   onRenameInvoiceId?: (oldId: string, newId: string) => boolean;
+  onOwnerCreateCustomInvoice?: (params: {
+    isCorporate: boolean;
+    customerId: string;
+    issuedAt: string;
+    dueDate: string;
+    periodCovered?: string;
+    paymentTerms: string;
+    termsAndConditions: string;
+    lines: InvoiceLineSnapshot[];
+    discountTotal: number;
+    extraCharges: number;
+    paidAmount: number;
+    paymentAccountCode?: string;
+    customInvoiceId?: string;
+  }) => void;
+  onOwnerCustomizeInvoice?: (
+    invoiceId: string,
+    updated: {
+      issuedAt: string;
+      dueDate: string;
+      customerName: string;
+      customerPhone: string;
+      customerAddress: string;
+      periodCovered?: string;
+      paymentTerms: string;
+      termsAndConditions: string;
+      lines: InvoiceLineSnapshot[];
+      discountTotal: number;
+      extraCharges: number;
+      paidAmount: number;
+      paymentAccountCode?: string;
+    }
+  ) => void;
+  onOwnerDeleteInvoice?: (invoiceId: string) => void;
   onRequestDelete?: (req: DeleteConfirmationRequest) => void;
   onGoToAccounting?: () => void;
 }
 
 export function DocumentsPrintView({
   state,
+  isOwner = false,
   initialMode = 'invoice',
   initialId,
   canEditIssuedIds = false,
   onRecordPrint,
   onRenameInvoiceId,
+  onOwnerCreateCustomInvoice,
+  onOwnerCustomizeInvoice,
+  onOwnerDeleteInvoice,
   onRequestDelete,
   onGoToAccounting,
 }: DocumentsPrintViewProps) {
@@ -65,6 +107,43 @@ export function DocumentsPrintView({
   const [editingInvId, setEditingInvId] = useState(false);
   const [renameInvInput, setRenameInvInput] = useState('');
   const [renameInvErr, setRenameInvErr] = useState('');
+
+  const moneyAccounts = useMemo(() => getMoneySourceAccounts(state.accounts), [state.accounts]);
+  const defaultMoneyCode = moneyAccounts[0]?.code || '1010';
+
+  // Owner Customize Invoice Modal State
+  const [custModalOpen, setCustModalOpen] = useState(false);
+  const [cIssuedAt, setCIssuedAt] = useState('');
+  const [cDueDate, setCDueDate] = useState('');
+  const [cCustName, setCCustName] = useState('');
+  const [cCustPhone, setCCustPhone] = useState('');
+  const [cCustAddr, setCCustAddr] = useState('');
+  const [cPeriod, setCPeriod] = useState('');
+  const [cPayTerms, setCPayTerms] = useState('');
+  const [cTermsCond, setCTermsCond] = useState('');
+  const [cLines, setCLines] = useState<InvoiceLineSnapshot[]>([]);
+  const [cDiscount, setCDiscount] = useState(0);
+  const [cExtra, setCExtra] = useState(0);
+  const [cPaid, setCPaid] = useState(0);
+  const [cPayAcc, setCPayAcc] = useState(defaultMoneyCode);
+
+  // Owner Create Custom Invoice Modal State
+  const [newInvModalOpen, setNewInvModalOpen] = useState(false);
+  const [nIsCorp, setNIsCorp] = useState(false);
+  const [nCustomerId, setNCustomerId] = useState(state.customers[0]?.id || '');
+  const [nCustomId, setNCustomId] = useState('');
+  const [nIssuedAt, setNIssuedAt] = useState(() => toDateInputValue());
+  const [nDueDate, setNDueDate] = useState(() => toDateInputValue());
+  const [nPeriod, setNPeriod] = useState('');
+  const [nPayTerms, setNPayTerms] = useState('Due on Receipt');
+  const [nTermsCond, setNTermsCond] = useState(state.settings.invoiceTerms);
+  const [nLines, setNLines] = useState<InvoiceLineSnapshot[]>([
+    { productName: 'Shirt', serviceName: 'Wash & Iron', quantity: 1, unitPrice: 100, discount: 0, total: 100 },
+  ]);
+  const [nDiscount, setNDiscount] = useState(0);
+  const [nExtra, setNExtra] = useState(0);
+  const [nPaid, setNPaid] = useState(0);
+  const [nPayAcc, setNPayAcc] = useState(defaultMoneyCode);
 
   const invoice =
     state.invoices.find((inv) => inv.id === selectedInvoiceId) || state.invoices[0] || null;
@@ -144,6 +223,68 @@ export function DocumentsPrintView({
 
             {invoice && (
               <div className="flex flex-wrap items-center gap-2">
+                {isOwner && onOwnerCreateCustomInvoice && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setNIsCorp(false);
+                      setNCustomerId(state.customers[0]?.id || '');
+                      setNCustomId(generateNextSmartId(state, 'retailInvoice').id);
+                      setNIssuedAt(toDateInputValue());
+                      setNDueDate(toDateInputValue());
+                      setNPeriod('');
+                      setNPayTerms('Due on Delivery');
+                      setNTermsCond(state.settings.invoiceTerms);
+                      setNLines([
+                        {
+                          productName: state.products[0]?.name || 'Garment',
+                          serviceName: state.services[0]?.name || 'Laundry',
+                          quantity: 1,
+                          unitPrice: state.prices[0]?.price || 0,
+                          discount: 0,
+                          total: state.prices[0]?.price || 0,
+                        },
+                      ]);
+                      setNDiscount(0);
+                      setNExtra(0);
+                      setNPaid(0);
+                      setNPayAcc(defaultMoneyCode);
+                      setNewInvModalOpen(true);
+                    }}
+                    className="inline-flex items-center gap-1 px-3 py-2 text-xs font-semibold rounded-xl bg-[#0071E3] text-white hover:bg-[#0077ED]"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    New Custom Invoice
+                  </button>
+                )}
+
+                {isOwner && onOwnerCustomizeInvoice && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCIssuedAt(toDateInputValue(invoice.issuedAt));
+                      setCDueDate(toDateInputValue(invoice.dueDate));
+                      setCCustName(invoice.customerName);
+                      setCCustPhone(invoice.customerPhone);
+                      setCCustAddr(invoice.customerAddress);
+                      setCPeriod(invoice.periodCovered || '');
+                      setCPayTerms(invoice.paymentTerms);
+                      setCTermsCond(invoice.termsAndConditions);
+                      setCLines(invoice.lines.map((l) => ({ ...l })));
+                      setCDiscount(invoice.discountTotal);
+                      setCExtra(invoice.extraCharges);
+                      setCPaid(invoice.paidAmount);
+                      setCPayAcc(defaultMoneyCode);
+                      setCustModalOpen(true);
+                    }}
+                    className="inline-flex items-center gap-1 px-3 py-2 text-xs font-semibold rounded-xl bg-amber-50 border border-amber-300 text-amber-800 hover:bg-amber-100"
+                    title="Owner Customize Invoice Date, Items, Amounts & Payment"
+                  >
+                    <SlidersHorizontal className="w-3.5 h-3.5" />
+                    Customize
+                  </button>
+                )}
+
                 {canEditIssuedIds && onRenameInvoiceId && !editingInvId && (
                   <button
                     type="button"
@@ -191,7 +332,22 @@ export function DocumentsPrintView({
                 {onRequestDelete && (
                   <button
                     type="button"
-                    onClick={() =>
+                    onClick={() => {
+                      if (isOwner && onOwnerDeleteInvoice) {
+                        onRequestDelete({
+                          itemType: 'Invoice (Owner Override)',
+                          itemNameOrId: `${invoice.id} · ${invoice.customerName}`,
+                          bodyText: `Permanently delete invoice ${invoice.id} (${formatMoney(
+                            invoice.grandTotal,
+                            sym
+                          )}) and reverse its customer/corporate due balance and Sales journals?`,
+                          linkedInfo:
+                            'Owner override: Linked Sales journals and customer receivables will be cleanly reversed.',
+                          accountingProtected: false,
+                          onConfirmDelete: () => onOwnerDeleteInvoice(invoice.id),
+                        });
+                        return;
+                      }
                       onRequestDelete({
                         itemType: 'Posted Invoice',
                         itemNameOrId: `${invoice.id} · ${invoice.customerName}`,
@@ -204,15 +360,32 @@ export function DocumentsPrintView({
                         accountingProtected: true,
                         alternativeLabel: onGoToAccounting ? 'Go to Accounting Reversals' : undefined,
                         onAlternative: onGoToAccounting,
-                      })
-                    }
+                      });
+                    }}
                     className="inline-flex items-center gap-1 px-3 py-2 text-xs font-medium rounded-xl border border-red-200 bg-white text-red-600 hover:bg-red-50"
-                    title="Delete Invoice (Accounting Protected)"
+                    title={isOwner ? 'Delete Invoice (Owner Override)' : 'Delete Invoice (Accounting Protected)'}
                   >
                     <Trash2 className="w-3.5 h-3.5" />
                   </button>
                 )}
               </div>
+            )}
+            {!invoice && isOwner && onOwnerCreateCustomInvoice && (
+              <button
+                type="button"
+                onClick={() => {
+                  setNIsCorp(false);
+                  setNCustomerId(state.customers[0]?.id || '');
+                  setNCustomId(generateNextSmartId(state, 'retailInvoice').id);
+                  setNIssuedAt(toDateInputValue());
+                  setNDueDate(toDateInputValue());
+                  setNewInvModalOpen(true);
+                }}
+                className="inline-flex items-center gap-1 px-3 py-2 text-xs font-semibold rounded-xl bg-[#0071E3] text-white hover:bg-[#0077ED]"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                New Custom Invoice
+              </button>
             )}
           </div>
 
@@ -479,6 +652,676 @@ export function DocumentsPrintView({
               <A4InvoiceDocument invoice={invoice} settings={state.settings} isPreviewFrame />
             </div>
           </div>
+        </div>
+      )}
+      {/* Owner Customize Invoice Modal */}
+      {isOwner && custModalOpen && invoice && onOwnerCustomizeInvoice && (
+        <div
+          className="no-print fixed inset-0 z-50 flex items-start justify-center p-4 sm:p-6 bg-slate-900/45 backdrop-blur-xs overflow-y-auto"
+          onClick={() => setCustModalOpen(false)}
+        >
+          <form
+            onClick={(e) => e.stopPropagation()}
+            onSubmit={(e) => {
+              e.preventDefault();
+              onOwnerCustomizeInvoice(invoice.id, {
+                issuedAt: dateInputToIso(cIssuedAt, invoice.issuedAt),
+                dueDate: dateInputToIso(cDueDate, invoice.dueDate),
+                customerName: cCustName,
+                customerPhone: cCustPhone,
+                customerAddress: cCustAddr,
+                periodCovered: cPeriod || undefined,
+                paymentTerms: cPayTerms,
+                termsAndConditions: cTermsCond,
+                lines: cLines,
+                discountTotal: cDiscount,
+                extraCharges: cExtra,
+                paidAmount: cPaid,
+                paymentAccountCode: cPayAcc,
+              });
+              setCustModalOpen(false);
+            }}
+            className="w-full max-w-4xl bg-white rounded-2xl border border-slate-200 shadow-2xl p-6 space-y-5 my-auto"
+          >
+            <div className="flex items-center justify-between border-b border-slate-200 pb-3">
+              <div>
+                <h3 className="text-base font-semibold text-slate-900">
+                  Customize Invoice · {invoice.id}
+                </h3>
+                <p className="text-xs text-slate-500">
+                  Owner override: Edit invoice date, due date, lines, discounts, charges &amp; paid amount
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setCustModalOpen(false)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                  Invoice Billing Date
+                </label>
+                <input
+                  type="date"
+                  required
+                  value={cIssuedAt}
+                  onChange={(e) => setCIssuedAt(e.target.value)}
+                  className="w-full px-3 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">Due Date</label>
+                <input
+                  type="date"
+                  required
+                  value={cDueDate}
+                  onChange={(e) => setCDueDate(e.target.value)}
+                  className="w-full px-3 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                  Period Covered (Optional)
+                </label>
+                <input
+                  value={cPeriod}
+                  onChange={(e) => setCPeriod(e.target.value)}
+                  placeholder="e.g., Week 12 / Oct 2025"
+                  className="w-full px-3 py-2 text-xs rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                  Customer Name
+                </label>
+                <input
+                  required
+                  value={cCustName}
+                  onChange={(e) => setCCustName(e.target.value)}
+                  className="w-full px-3 py-2 text-xs rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">Phone</label>
+                <input
+                  value={cCustPhone}
+                  onChange={(e) => setCCustPhone(e.target.value)}
+                  className="w-full px-3 py-2 text-xs rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">Address</label>
+                <input
+                  value={cCustAddr}
+                  onChange={(e) => setCCustAddr(e.target.value)}
+                  className="w-full px-3 py-2 text-xs rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-slate-700">Invoice Line Items</span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setCLines((prev) => [
+                      ...prev,
+                      {
+                        productName: state.products[0]?.name || 'Item',
+                        serviceName: state.services[0]?.name || 'Laundry',
+                        quantity: 1,
+                        unitPrice: 0,
+                        discount: 0,
+                        total: 0,
+                      },
+                    ])
+                  }
+                  className="inline-flex items-center gap-1 text-xs font-medium text-[#0071E3] hover:underline"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  Add Line
+                </button>
+              </div>
+              {cLines.map((line, i) => (
+                <div
+                  key={i}
+                  className="grid grid-cols-1 md:grid-cols-12 gap-2 items-end p-2.5 rounded-xl bg-slate-50 border border-slate-200"
+                >
+                  <div className="md:col-span-3">
+                    <label className="block text-[10px] text-slate-500 mb-0.5">Item</label>
+                    <input
+                      value={line.productName}
+                      onChange={(e) =>
+                        setCLines((prev) =>
+                          prev.map((row, idx) =>
+                            idx === i ? { ...row, productName: e.target.value } : row
+                          )
+                        )
+                      }
+                      className="w-full px-2 py-1.5 text-xs rounded-lg bg-white border border-slate-200"
+                    />
+                  </div>
+                  <div className="md:col-span-3">
+                    <label className="block text-[10px] text-slate-500 mb-0.5">Service</label>
+                    <input
+                      value={line.serviceName}
+                      onChange={(e) =>
+                        setCLines((prev) =>
+                          prev.map((row, idx) =>
+                            idx === i ? { ...row, serviceName: e.target.value } : row
+                          )
+                        )
+                      }
+                      className="w-full px-2 py-1.5 text-xs rounded-lg bg-white border border-slate-200"
+                    />
+                  </div>
+                  <div className="md:col-span-2">
+                    <label className="block text-[10px] text-slate-500 mb-0.5">Qty</label>
+                    <input
+                      type="number"
+                      min={0}
+                      value={line.quantity}
+                      onChange={(e) =>
+                        setCLines((prev) =>
+                          prev.map((row, idx) =>
+                            idx === i ? { ...row, quantity: Math.max(0, Number(e.target.value)) } : row
+                          )
+                        )
+                      }
+                      className="w-full px-2 py-1.5 text-xs font-mono rounded-lg bg-white border border-slate-200"
+                    />
+                  </div>
+                  <div className="md:col-span-2">
+                    <label className="block text-[10px] text-slate-500 mb-0.5">Unit Price</label>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.5"
+                      value={line.unitPrice}
+                      onChange={(e) =>
+                        setCLines((prev) =>
+                          prev.map((row, idx) =>
+                            idx === i ? { ...row, unitPrice: Math.max(0, Number(e.target.value)) } : row
+                          )
+                        )
+                      }
+                      className="w-full px-2 py-1.5 text-xs font-mono rounded-lg bg-white border border-slate-200"
+                    />
+                  </div>
+                  <div className="md:col-span-1">
+                    <label className="block text-[10px] text-slate-500 mb-0.5">Disc.</label>
+                    <input
+                      type="number"
+                      min={0}
+                      value={line.discount}
+                      onChange={(e) =>
+                        setCLines((prev) =>
+                          prev.map((row, idx) =>
+                            idx === i ? { ...row, discount: Math.max(0, Number(e.target.value)) } : row
+                          )
+                        )
+                      }
+                      className="w-full px-2 py-1.5 text-xs font-mono rounded-lg bg-white border border-slate-200"
+                    />
+                  </div>
+                  <div className="md:col-span-1 text-right">
+                    {cLines.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={() => setCLines((prev) => prev.filter((_, idx) => idx !== i))}
+                        className="p-1.5 text-red-500 hover:bg-red-50 rounded-lg"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 pt-2 border-t border-slate-200">
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                  Discount ({sym})
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  value={cDiscount}
+                  onChange={(e) => setCDiscount(Math.max(0, Number(e.target.value)))}
+                  className="w-full px-3 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                  Extra Charges ({sym})
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  value={cExtra}
+                  onChange={(e) => setCExtra(Math.max(0, Number(e.target.value)))}
+                  className="w-full px-3 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                  Paid Amount ({sym})
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  value={cPaid}
+                  onChange={(e) => setCPaid(Math.max(0, Number(e.target.value)))}
+                  className="w-full px-3 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                  Payment Account
+                </label>
+                <select
+                  value={cPayAcc}
+                  onChange={(e) => setCPayAcc(e.target.value)}
+                  className="w-full px-3 py-2 text-xs rounded-xl bg-white border border-slate-200"
+                >
+                  {moneyAccounts.map((acc) => (
+                    <option key={acc.code} value={acc.code}>
+                      {acc.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                  Payment Terms
+                </label>
+                <input
+                  value={cPayTerms}
+                  onChange={(e) => setCPayTerms(e.target.value)}
+                  className="w-full px-3 py-2 text-xs rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                  Terms &amp; Conditions
+                </label>
+                <input
+                  value={cTermsCond}
+                  onChange={(e) => setCTermsCond(e.target.value)}
+                  className="w-full px-3 py-2 text-xs rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2 pt-3 border-t border-slate-200">
+              <button
+                type="button"
+                onClick={() => setCustModalOpen(false)}
+                className="px-4 py-2 text-xs font-medium rounded-xl border border-slate-200 text-slate-600 hover:bg-slate-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="px-5 py-2 text-xs font-semibold rounded-xl bg-[#0071E3] text-white hover:bg-[#0077ED]"
+              >
+                Save Invoice &amp; Sync Ledger
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* Owner New Custom Invoice Modal */}
+      {isOwner && newInvModalOpen && onOwnerCreateCustomInvoice && (
+        <div
+          className="no-print fixed inset-0 z-50 flex items-start justify-center p-4 sm:p-6 bg-slate-900/45 backdrop-blur-xs overflow-y-auto"
+          onClick={() => setNewInvModalOpen(false)}
+        >
+          <form
+            onClick={(e) => e.stopPropagation()}
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (!nCustomerId || nLines.length === 0) return;
+              onOwnerCreateCustomInvoice({
+                isCorporate: nIsCorp,
+                customerId: nCustomerId,
+                issuedAt: nIssuedAt,
+                dueDate: nDueDate,
+                periodCovered: nPeriod || undefined,
+                paymentTerms: nPayTerms,
+                termsAndConditions: nTermsCond,
+                lines: nLines,
+                discountTotal: nDiscount,
+                extraCharges: nExtra,
+                paidAmount: nPaid,
+                paymentAccountCode: nPayAcc,
+                customInvoiceId: nCustomId,
+              });
+              setSelectedInvoiceId(nCustomId);
+              setNewInvModalOpen(false);
+            }}
+            className="w-full max-w-4xl bg-white rounded-2xl border border-slate-200 shadow-2xl p-6 space-y-5 my-auto"
+          >
+            <div className="flex items-center justify-between border-b border-slate-200 pb-3">
+              <div>
+                <h3 className="text-base font-semibold text-slate-900">
+                  Create Custom / Backdated Invoice (Owner)
+                </h3>
+                <p className="text-xs text-slate-500">
+                  Add a missed retail or corporate invoice with custom billing date and automatic ledger posting
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setNewInvModalOpen(false)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                  Account Type
+                </label>
+                <select
+                  value={nIsCorp ? 'corp' : 'retail'}
+                  onChange={(e) => {
+                    const corp = e.target.value === 'corp';
+                    setNIsCorp(corp);
+                    setNCustomerId(
+                      corp ? state.corporateCustomers[0]?.id || '' : state.customers[0]?.id || ''
+                    );
+                    setNCustomId(
+                      generateNextSmartId(state, corp ? 'corporateInvoice' : 'retailInvoice').id
+                    );
+                  }}
+                  className="w-full px-3 py-2 text-xs rounded-xl bg-white border border-slate-200"
+                >
+                  <option value="retail">Retail Customer</option>
+                  <option value="corp">Corporate Account</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                  Customer / Client
+                </label>
+                <select
+                  required
+                  value={nCustomerId}
+                  onChange={(e) => setNCustomerId(e.target.value)}
+                  className="w-full px-3 py-2 text-xs rounded-xl bg-white border border-slate-200"
+                >
+                  {(nIsCorp ? state.corporateCustomers : state.customers).map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.id} — {c.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                  Invoice Number
+                </label>
+                <input
+                  required
+                  value={nCustomId}
+                  onChange={(e) => setNCustomId(e.target.value)}
+                  className="w-full px-3 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                  Billing Date
+                </label>
+                <input
+                  type="date"
+                  required
+                  value={nIssuedAt}
+                  onChange={(e) => setNIssuedAt(e.target.value)}
+                  className="w-full px-3 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">Due Date</label>
+                <input
+                  type="date"
+                  required
+                  value={nDueDate}
+                  onChange={(e) => setNDueDate(e.target.value)}
+                  className="w-full px-3 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                  Period Covered
+                </label>
+                <input
+                  value={nPeriod}
+                  onChange={(e) => setNPeriod(e.target.value)}
+                  placeholder="Optional period label..."
+                  className="w-full px-3 py-2 text-xs rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                  Payment Terms
+                </label>
+                <input
+                  value={nPayTerms}
+                  onChange={(e) => setNPayTerms(e.target.value)}
+                  className="w-full px-3 py-2 text-xs rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-slate-700">Line Items</span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setNLines((prev) => [
+                      ...prev,
+                      {
+                        productName: state.products[0]?.name || 'Item',
+                        serviceName: state.services[0]?.name || 'Laundry',
+                        quantity: 1,
+                        unitPrice: 0,
+                        discount: 0,
+                        total: 0,
+                      },
+                    ])
+                  }
+                  className="inline-flex items-center gap-1 text-xs font-medium text-[#0071E3] hover:underline"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  Add Line
+                </button>
+              </div>
+              {nLines.map((line, i) => (
+                <div
+                  key={i}
+                  className="grid grid-cols-1 md:grid-cols-12 gap-2 items-end p-2.5 rounded-xl bg-slate-50 border border-slate-200"
+                >
+                  <div className="md:col-span-3">
+                    <label className="block text-[10px] text-slate-500 mb-0.5">Item</label>
+                    <input
+                      value={line.productName}
+                      onChange={(e) =>
+                        setNLines((prev) =>
+                          prev.map((row, idx) =>
+                            idx === i ? { ...row, productName: e.target.value } : row
+                          )
+                        )
+                      }
+                      className="w-full px-2 py-1.5 text-xs rounded-lg bg-white border border-slate-200"
+                    />
+                  </div>
+                  <div className="md:col-span-3">
+                    <label className="block text-[10px] text-slate-500 mb-0.5">Service</label>
+                    <input
+                      value={line.serviceName}
+                      onChange={(e) =>
+                        setNLines((prev) =>
+                          prev.map((row, idx) =>
+                            idx === i ? { ...row, serviceName: e.target.value } : row
+                          )
+                        )
+                      }
+                      className="w-full px-2 py-1.5 text-xs rounded-lg bg-white border border-slate-200"
+                    />
+                  </div>
+                  <div className="md:col-span-2">
+                    <label className="block text-[10px] text-slate-500 mb-0.5">Qty</label>
+                    <input
+                      type="number"
+                      min={0}
+                      value={line.quantity}
+                      onChange={(e) =>
+                        setNLines((prev) =>
+                          prev.map((row, idx) =>
+                            idx === i ? { ...row, quantity: Math.max(0, Number(e.target.value)) } : row
+                          )
+                        )
+                      }
+                      className="w-full px-2 py-1.5 text-xs font-mono rounded-lg bg-white border border-slate-200"
+                    />
+                  </div>
+                  <div className="md:col-span-2">
+                    <label className="block text-[10px] text-slate-500 mb-0.5">Unit Price</label>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.5"
+                      value={line.unitPrice}
+                      onChange={(e) =>
+                        setNLines((prev) =>
+                          prev.map((row, idx) =>
+                            idx === i ? { ...row, unitPrice: Math.max(0, Number(e.target.value)) } : row
+                          )
+                        )
+                      }
+                      className="w-full px-2 py-1.5 text-xs font-mono rounded-lg bg-white border border-slate-200"
+                    />
+                  </div>
+                  <div className="md:col-span-1">
+                    <label className="block text-[10px] text-slate-500 mb-0.5">Disc.</label>
+                    <input
+                      type="number"
+                      min={0}
+                      value={line.discount}
+                      onChange={(e) =>
+                        setNLines((prev) =>
+                          prev.map((row, idx) =>
+                            idx === i ? { ...row, discount: Math.max(0, Number(e.target.value)) } : row
+                          )
+                        )
+                      }
+                      className="w-full px-2 py-1.5 text-xs font-mono rounded-lg bg-white border border-slate-200"
+                    />
+                  </div>
+                  <div className="md:col-span-1 text-right">
+                    {nLines.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={() => setNLines((prev) => prev.filter((_, idx) => idx !== i))}
+                        className="p-1.5 text-red-500 hover:bg-red-50 rounded-lg"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 pt-2 border-t border-slate-200">
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                  Discount ({sym})
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  value={nDiscount}
+                  onChange={(e) => setNDiscount(Math.max(0, Number(e.target.value)))}
+                  className="w-full px-3 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                  Extra Charges ({sym})
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  value={nExtra}
+                  onChange={(e) => setNExtra(Math.max(0, Number(e.target.value)))}
+                  className="w-full px-3 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                  Paid Amount ({sym})
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  value={nPaid}
+                  onChange={(e) => setNPaid(Math.max(0, Number(e.target.value)))}
+                  className="w-full px-3 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                  Payment Account
+                </label>
+                <select
+                  value={nPayAcc}
+                  onChange={(e) => setNPayAcc(e.target.value)}
+                  className="w-full px-3 py-2 text-xs rounded-xl bg-white border border-slate-200"
+                >
+                  {moneyAccounts.map((acc) => (
+                    <option key={acc.code} value={acc.code}>
+                      {acc.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2 pt-3 border-t border-slate-200">
+              <button
+                type="button"
+                onClick={() => setNewInvModalOpen(false)}
+                className="px-4 py-2 text-xs font-medium rounded-xl border border-slate-200 text-slate-600 hover:bg-slate-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="px-5 py-2 text-xs font-semibold rounded-xl bg-[#0071E3] text-white hover:bg-[#0077ED]"
+              >
+                Create Invoice &amp; Post Sales
+              </button>
+            </div>
+          </form>
         </div>
       )}
     </div>

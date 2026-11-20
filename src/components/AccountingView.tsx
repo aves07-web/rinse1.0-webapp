@@ -6,36 +6,70 @@ import {
   Plus,
   PlusCircle,
   RotateCcw,
+  SlidersHorizontal,
   Trash2,
   Wallet,
+  X,
 } from 'lucide-react';
 import {
   Account,
   AccountType,
   ErpState,
   JournalEntry,
+  JournalLine,
   MoneySourceChannel,
 } from '../types/erp';
 import {
   calculateCashOutFee,
   computeFinancialStatements,
+  dateInputToIso,
   formatMoney,
   generateNextMoneyAccountCode,
   getMoneySourceAccounts,
+  toDateInputValue,
 } from '../utils/accounting';
 import { DeleteConfirmationRequest } from './ConfirmDeleteModal';
 
+const JOURNAL_CATEGORIES: JournalEntry['category'][] = [
+  'Transfer',
+  'Sudden Adjustment',
+  'Expense',
+  'Sales',
+  'Collection',
+  'Advance',
+  'Purchase',
+  'Supplier Payment',
+  'Payroll',
+  'Owner Draw',
+  'Owner Capital',
+  'Loan',
+  'Opening Adjustment',
+];
+
 interface AccountingViewProps {
   state: ErpState;
+  isOwner?: boolean;
   initialSubTab?: 'statements' | 'journals' | 'drawCashIn' | 'coa';
-  onPostOwnerDraw: (amount: number, paymentAccountCode: string, note: string) => void;
+  onPostOwnerDraw: (
+    amount: number,
+    paymentAccountCode: string,
+    note: string,
+    date?: string
+  ) => void;
   onPostCashIn: (params: {
     inflowType: 'Owner Capital' | 'Loan Received' | 'Other Inflow';
     amount: number;
     toAccountCode: string;
     note: string;
+    date?: string;
   }) => void;
-  onPostTransfer: (fromCode: string, toCode: string, amount: number, note: string) => void;
+  onPostTransfer: (
+    fromCode: string,
+    toCode: string,
+    amount: number,
+    note: string,
+    date?: string
+  ) => void;
   onPostManualJournal: (params: {
     description: string;
     reference: string;
@@ -43,6 +77,7 @@ interface AccountingViewProps {
     debitCode: string;
     creditCode: string;
     amount: number;
+    date?: string;
   }) => void;
   onPostSuddenAdjustment?: (params: {
     accountCode: string;
@@ -52,6 +87,35 @@ interface AccountingViewProps {
     reason: string;
     date?: string;
   }) => void;
+  onOwnerCustomizeJournal?: (
+    entryId: string,
+    updated: {
+      date: string;
+      reference: string;
+      description: string;
+      category: JournalEntry['category'];
+      lines: JournalLine[];
+    }
+  ) => void;
+  onOwnerDeleteJournal?: (entryId: string) => void;
+  onOwnerAdjustAccountBalance?: (params: {
+    accountCode: string;
+    targetBalance: number;
+    offsetAccountCode: string;
+    date: string;
+    reason: string;
+  }) => void;
+  onOwnerUpdateAccount?: (
+    accountCode: string,
+    patch: {
+      name: string;
+      channel?: MoneySourceChannel;
+      walletType?: string;
+      cashOutChargePercent?: number;
+      cashOutChargeFlat?: number;
+      active?: boolean;
+    }
+  ) => void;
   onReverseJournal: (entryId: string) => void;
   onAddAccount: (
     code: string,
@@ -71,12 +135,17 @@ interface AccountingViewProps {
 
 export function AccountingView({
   state,
+  isOwner = false,
   initialSubTab,
   onPostOwnerDraw,
   onPostCashIn,
   onPostTransfer,
   onPostManualJournal,
   onPostSuddenAdjustment,
+  onOwnerCustomizeJournal,
+  onOwnerDeleteJournal,
+  onOwnerAdjustAccountBalance,
+  onOwnerUpdateAccount,
   onReverseJournal,
   onAddAccount,
   onDeleteAccount,
@@ -105,6 +174,7 @@ export function AccountingView({
   // Owner Draw
   const [drawAmount, setDrawAmount] = useState('');
   const [drawAcc, setDrawAcc] = useState(defaultMoneyCode);
+  const [drawDate, setDrawDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [drawNote, setDrawNote] = useState('');
 
   // Cash In
@@ -113,12 +183,14 @@ export function AccountingView({
   );
   const [cashInAmount, setCashInAmount] = useState('');
   const [cashInAcc, setCashInAcc] = useState(secondMoneyCode);
+  const [cashInDate, setCashInDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [cashInNote, setCashInNote] = useState('');
 
   // Account Transfer
   const [xferFrom, setXferFrom] = useState(defaultMoneyCode);
   const [xferTo, setXferTo] = useState(secondMoneyCode);
   const [xferAmount, setXferAmount] = useState('');
+  const [xferDate, setXferDate] = useState(() => new Date().toISOString().slice(0, 10));
 
   // Sudden Money Add / Deduct (Sheet Adjustment)
   const [suddenAcc, setSuddenAcc] = useState(defaultMoneyCode);
@@ -131,11 +203,62 @@ export function AccountingView({
   // Manual Journal
   const [jeDesc, setJeDesc] = useState('');
   const [jeRef, setJeRef] = useState('');
+  const [jeDate, setJeDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [jeCategory, setJeCategory] = useState<JournalEntry['category']>('Transfer');
   const [jeDebit, setJeDebit] = useState(state.accounts[0]?.code || defaultMoneyCode);
   const [jeCredit, setJeCredit] = useState(
     state.accounts.find((a) => a.code === '4010')?.code || state.accounts[0]?.code || '4010'
   );
   const [jeAmount, setJeAmount] = useState('');
+
+  // Owner Customize Journal Modal
+  const [editJeTarget, setEditJeTarget] = useState<JournalEntry | null>(null);
+  const [ejDate, setEjDate] = useState('');
+  const [ejRef, setEjRef] = useState('');
+  const [ejDesc, setEjDesc] = useState('');
+  const [ejCategory, setEjCategory] = useState<JournalEntry['category']>('Transfer');
+  const [ejLines, setEjLines] = useState<JournalLine[]>([]);
+
+  // Owner Customize Account & Balance Modal
+  const [editAccTarget, setEditAccTarget] = useState<Account | null>(null);
+  const [eaName, setEaName] = useState('');
+  const [eaChannel, setEaChannel] = useState<MoneySourceChannel>('Other');
+  const [eaWalletType, setEaWalletType] = useState('');
+  const [eaChargePct, setEaChargePct] = useState('');
+  const [eaChargeFlat, setEaChargeFlat] = useState('');
+  const [eaActive, setEaActive] = useState(true);
+  const [eaTargetBalance, setEaTargetBalance] = useState('');
+  const [eaOffsetCode, setEaOffsetCode] = useState('3030');
+  const [eaAdjDate, setEaAdjDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [eaAdjReason, setEaAdjReason] = useState('');
+
+  const openCustomizeJournal = (je: JournalEntry) => {
+    setEditJeTarget(je);
+    setEjDate(toDateInputValue(je.date));
+    setEjRef(je.reference);
+    setEjDesc(je.description);
+    setEjCategory(je.category);
+    setEjLines(je.lines.map((l) => ({ ...l })));
+  };
+
+  const openCustomizeAccount = (acc: Account) => {
+    setEditAccTarget(acc);
+    setEaName(acc.name);
+    setEaChannel(acc.channel || 'Other');
+    setEaWalletType(acc.walletType || '');
+    setEaChargePct(String(acc.cashOutChargePercent ?? ''));
+    setEaChargeFlat(String(acc.cashOutChargeFlat ?? ''));
+    setEaActive(acc.active !== false);
+    setEaTargetBalance(String(acc.balance));
+    const fallbackOffset =
+      state.accounts.find((a) => a.code === '3040' && a.code !== acc.code)?.code ||
+      state.accounts.find((a) => a.code === '3030' && a.code !== acc.code)?.code ||
+      state.accounts.find((a) => a.code !== acc.code)?.code ||
+      '3030';
+    setEaOffsetCode(fallbackOffset);
+    setEaAdjDate(new Date().toISOString().slice(0, 10));
+    setEaAdjReason('');
+  };
 
   // New Account
   const [newAccCode, setNewAccCode] = useState('');
@@ -433,71 +556,107 @@ export function AccountingView({
               onPostManualJournal({
                 description: jeDesc.trim(),
                 reference: jeRef.trim() || `MAN-${Date.now().toString().slice(-4)}`,
-                category: 'Transfer',
+                category: jeCategory,
                 debitCode: jeDebit,
                 creditCode: jeCredit,
                 amount: amt,
+                date: jeDate,
               });
               setJeDesc('');
               setJeRef('');
               setJeAmount('');
             }}
-            className="liquid-glass rounded-2xl p-6 grid grid-cols-1 md:grid-cols-12 gap-3 items-end"
+            className="liquid-glass rounded-2xl p-6 space-y-3"
           >
-            <div className="md:col-span-3">
-              <label className="block text-[11px] text-slate-500 mb-1">Debit Account</label>
-              <select
-                value={jeDebit}
-                onChange={(e) => setJeDebit(e.target.value)}
-                className="w-full px-2.5 py-2 text-xs rounded-xl bg-white border border-slate-200"
-              >
-                {state.accounts.map((a) => (
-                  <option key={a.code} value={a.code}>
-                    {a.code} · {a.name}
-                  </option>
-                ))}
-              </select>
+            <div className="grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
+              <div className="md:col-span-2">
+                <label className="block text-[11px] text-slate-500 mb-1">Entry Date</label>
+                <input
+                  type="date"
+                  value={jeDate}
+                  onChange={(e) => setJeDate(e.target.value)}
+                  className="w-full px-2.5 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div className="md:col-span-2">
+                <label className="block text-[11px] text-slate-500 mb-1">Category</label>
+                <select
+                  value={jeCategory}
+                  onChange={(e) => setJeCategory(e.target.value as JournalEntry['category'])}
+                  className="w-full px-2.5 py-2 text-xs rounded-xl bg-white border border-slate-200"
+                >
+                  {JOURNAL_CATEGORIES.map((cat) => (
+                    <option key={cat} value={cat}>
+                      {cat}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="md:col-span-3">
+                <label className="block text-[11px] text-slate-500 mb-1">Debit Account</label>
+                <select
+                  value={jeDebit}
+                  onChange={(e) => setJeDebit(e.target.value)}
+                  className="w-full px-2.5 py-2 text-xs rounded-xl bg-white border border-slate-200"
+                >
+                  {state.accounts.map((a) => (
+                    <option key={a.code} value={a.code}>
+                      {a.code} · {a.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="md:col-span-3">
+                <label className="block text-[11px] text-slate-500 mb-1">Credit Account</label>
+                <select
+                  value={jeCredit}
+                  onChange={(e) => setJeCredit(e.target.value)}
+                  className="w-full px-2.5 py-2 text-xs rounded-xl bg-white border border-slate-200"
+                >
+                  {state.accounts.map((a) => (
+                    <option key={a.code} value={a.code}>
+                      {a.code} · {a.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="md:col-span-2">
+                <label className="block text-[11px] text-slate-500 mb-1">Amount ({sym})</label>
+                <input
+                  type="number"
+                  min={0.5}
+                  step="0.5"
+                  required
+                  value={jeAmount}
+                  onChange={(e) => setJeAmount(e.target.value)}
+                  className="w-full px-2.5 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
             </div>
-            <div className="md:col-span-3">
-              <label className="block text-[11px] text-slate-500 mb-1">Credit Account</label>
-              <select
-                value={jeCredit}
-                onChange={(e) => setJeCredit(e.target.value)}
-                className="w-full px-2.5 py-2 text-xs rounded-xl bg-white border border-slate-200"
-              >
-                {state.accounts.map((a) => (
-                  <option key={a.code} value={a.code}>
-                    {a.code} · {a.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="md:col-span-2">
-              <label className="block text-[11px] text-slate-500 mb-1">Amount ({sym})</label>
-              <input
-                type="number"
-                min={0.5}
-                step="0.5"
-                required
-                value={jeAmount}
-                onChange={(e) => setJeAmount(e.target.value)}
-                className="w-full px-2.5 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
-              />
-            </div>
-            <div className="md:col-span-4 flex gap-2">
-              <input
-                required
-                value={jeDesc}
-                onChange={(e) => setJeDesc(e.target.value)}
-                placeholder="Journal narration..."
-                className="flex-1 min-w-0 px-2.5 py-2 text-xs rounded-xl bg-white border border-slate-200"
-              />
-              <button
-                type="submit"
-                className="px-4 py-2 text-xs font-semibold rounded-xl bg-[#0071E3] text-white whitespace-nowrap"
-              >
-                Post Journal
-              </button>
+            <div className="grid grid-cols-1 md:grid-cols-12 gap-3 items-center">
+              <div className="md:col-span-3">
+                <input
+                  value={jeRef}
+                  onChange={(e) => setJeRef(e.target.value)}
+                  placeholder="Reference (optional)"
+                  className="w-full px-2.5 py-2 text-xs rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div className="md:col-span-9 flex gap-2">
+                <input
+                  required
+                  value={jeDesc}
+                  onChange={(e) => setJeDesc(e.target.value)}
+                  placeholder="Journal narration / adjusting entry description..."
+                  className="flex-1 min-w-0 px-2.5 py-2 text-xs rounded-xl bg-white border border-slate-200"
+                />
+                <button
+                  type="submit"
+                  className="px-4 py-2 text-xs font-semibold rounded-xl bg-[#0071E3] text-white whitespace-nowrap"
+                >
+                  Post Journal
+                </button>
+              </div>
             </div>
           </form>
 
@@ -536,29 +695,52 @@ export function AccountingView({
                             : `Reversal of ${je.reversesEntryId}`}
                         </span>
                       )}
+                      {isOwner && onOwnerCustomizeJournal && (
+                        <button
+                          type="button"
+                          onClick={() => openCustomizeJournal(je)}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded-lg bg-amber-50 border border-amber-200 text-amber-800 hover:bg-amber-100"
+                          title="Customize journal entry (Owner)"
+                        >
+                          <SlidersHorizontal className="w-3 h-3" />
+                          Customize
+                        </button>
+                      )}
                       {onRequestDelete && (
                         <button
                           type="button"
                           onClick={() =>
-                            onRequestDelete({
-                              itemType: 'Posted Journal Entry',
-                              itemNameOrId: `${je.id} (${je.category})`,
-                              bodyText: `Journal entry ${je.id} (${je.description}) is posted to the double-entry General Ledger.`,
-                              linkedInfo:
-                                'Double-entry audit rules forbid plain deletion of posted journals. Post a balanced reversal entry instead.',
-                              accountingProtected: true,
-                              alternativeLabel:
-                                !je.reversedByEntryId && je.category !== 'Reversal'
-                                  ? 'Reverse Entry Instead'
-                                  : undefined,
-                              onAlternative:
-                                !je.reversedByEntryId && je.category !== 'Reversal'
-                                  ? () => onReverseJournal(je.id)
-                                  : undefined,
-                            })
+                            isOwner && onOwnerDeleteJournal
+                              ? onRequestDelete({
+                                  itemType: 'Posted Journal Entry',
+                                  itemNameOrId: `${je.id} (${je.category})`,
+                                  bodyText: `Permanently delete journal entry ${je.id} (${je.description}) and recalculate all account balances?`,
+                                  accountingProtected: false,
+                                  onConfirmDelete: () => onOwnerDeleteJournal(je.id),
+                                })
+                              : onRequestDelete({
+                                  itemType: 'Posted Journal Entry',
+                                  itemNameOrId: `${je.id} (${je.category})`,
+                                  bodyText: `Journal entry ${je.id} (${je.description}) is posted to the double-entry General Ledger.`,
+                                  linkedInfo:
+                                    'Double-entry audit rules forbid plain deletion of posted journals. Post a balanced reversal entry instead.',
+                                  accountingProtected: true,
+                                  alternativeLabel:
+                                    !je.reversedByEntryId && je.category !== 'Reversal'
+                                      ? 'Reverse Entry Instead'
+                                      : undefined,
+                                  onAlternative:
+                                    !je.reversedByEntryId && je.category !== 'Reversal'
+                                      ? () => onReverseJournal(je.id)
+                                      : undefined,
+                                })
                           }
                           className="p-1 text-slate-400 hover:text-red-600"
-                          title="Journal entries are audit-protected"
+                          title={
+                            isOwner && onOwnerDeleteJournal
+                              ? `Delete journal ${je.id} (Owner)`
+                              : 'Journal entries are audit-protected'
+                          }
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
@@ -618,13 +800,25 @@ export function AccountingView({
                         : ''}
                     </p>
                   </div>
-                  <span
-                    className={`text-sm font-mono font-semibold tabular-nums ${
-                      acc.balance < 0 ? 'text-red-600' : 'text-[#0071E3]'
-                    }`}
-                  >
-                    {formatMoney(acc.balance, sym)}
-                  </span>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <span
+                      className={`text-sm font-mono font-semibold tabular-nums ${
+                        acc.balance < 0 ? 'text-red-600' : 'text-[#0071E3]'
+                      }`}
+                    >
+                      {formatMoney(acc.balance, sym)}
+                    </span>
+                    {isOwner && (onOwnerUpdateAccount || onOwnerAdjustAccountBalance) && (
+                      <button
+                        type="button"
+                        onClick={() => openCustomizeAccount(acc)}
+                        className="p-1 rounded-lg bg-amber-50 border border-amber-200 text-amber-800 hover:bg-amber-100"
+                        title={`Customize or adjust ${acc.name} balance (Owner)`}
+                      >
+                        <SlidersHorizontal className="w-3 h-3" />
+                      </button>
+                    )}
+                  </div>
                 </div>
               ))}
             </div>
@@ -842,13 +1036,42 @@ export function AccountingView({
                             </span>
                             <span className="text-slate-700">{j.description}</span>
                           </div>
-                          <div className="flex items-center gap-3 shrink-0 font-mono tabular-nums">
+                          <div className="flex items-center gap-2 shrink-0 font-mono tabular-nums">
                             <span className="text-slate-500">
                               {new Date(j.date).toLocaleDateString()}
                             </span>
                             <span className="font-semibold text-slate-900">
                               {formatMoney(amt, sym)}
                             </span>
+                            {isOwner && onOwnerCustomizeJournal && (
+                              <button
+                                type="button"
+                                onClick={() => openCustomizeJournal(j)}
+                                className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-sans font-semibold rounded-md bg-amber-50 border border-amber-200 text-amber-800 hover:bg-amber-100"
+                                title="Customize sudden adjustment (Owner)"
+                              >
+                                <SlidersHorizontal className="w-3 h-3" />
+                                Customize
+                              </button>
+                            )}
+                            {isOwner && onOwnerDeleteJournal && onRequestDelete && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  onRequestDelete({
+                                    itemType: 'Sudden Adjustment Entry',
+                                    itemNameOrId: `${j.id} (${formatMoney(amt, sym)})`,
+                                    bodyText: `Delete sudden adjustment ${j.id} (${j.description}) and recalculate ledger balances?`,
+                                    accountingProtected: false,
+                                    onConfirmDelete: () => onOwnerDeleteJournal(j.id),
+                                  })
+                                }
+                                className="p-1 text-slate-400 hover:text-red-600"
+                                title="Delete sudden adjustment (Owner)"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            )}
                           </div>
                         </div>
                       );
@@ -869,7 +1092,8 @@ export function AccountingView({
                 onPostOwnerDraw(
                   amt,
                   resolvedDrawAcc,
-                  drawNote.trim() || 'Owner personal withdrawal'
+                  drawNote.trim() || 'Owner personal withdrawal',
+                  drawDate
                 );
                 setDrawAmount('');
                 setDrawNote('');
@@ -893,15 +1117,23 @@ export function AccountingView({
                   </option>
                 ))}
               </select>
-              <input
-                type="number"
-                required
-                min={1}
-                value={drawAmount}
-                onChange={(e) => setDrawAmount(e.target.value)}
-                placeholder={`Draw amount (${sym})`}
-                className="w-full px-3 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
-              />
+              <div className="grid grid-cols-2 gap-2">
+                <input
+                  type="number"
+                  required
+                  min={1}
+                  value={drawAmount}
+                  onChange={(e) => setDrawAmount(e.target.value)}
+                  placeholder={`Amount (${sym})`}
+                  className="w-full px-3 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
+                />
+                <input
+                  type="date"
+                  value={drawDate}
+                  onChange={(e) => setDrawDate(e.target.value)}
+                  className="w-full px-2.5 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
               <input
                 value={drawNote}
                 onChange={(e) => setDrawNote(e.target.value)}
@@ -927,6 +1159,7 @@ export function AccountingView({
                   amount: amt,
                   toAccountCode: resolvedCashInAcc,
                   note: cashInNote.trim() || cashInType,
+                  date: cashInDate,
                 });
                 setCashInAmount('');
                 setCashInNote('');
@@ -963,15 +1196,23 @@ export function AccountingView({
                   </option>
                 ))}
               </select>
-              <input
-                type="number"
-                required
-                min={1}
-                value={cashInAmount}
-                onChange={(e) => setCashInAmount(e.target.value)}
-                placeholder={`Inflow amount (${sym})`}
-                className="w-full px-3 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
-              />
+              <div className="grid grid-cols-2 gap-2">
+                <input
+                  type="number"
+                  required
+                  min={1}
+                  value={cashInAmount}
+                  onChange={(e) => setCashInAmount(e.target.value)}
+                  placeholder={`Amount (${sym})`}
+                  className="w-full px-3 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
+                />
+                <input
+                  type="date"
+                  value={cashInDate}
+                  onChange={(e) => setCashInDate(e.target.value)}
+                  className="w-full px-2.5 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
               <input
                 value={cashInNote}
                 onChange={(e) => setCashInNote(e.target.value)}
@@ -996,7 +1237,8 @@ export function AccountingView({
                   resolvedXferFrom,
                   resolvedXferTo,
                   amt,
-                  'Internal cash/bank/wallet account transfer'
+                  'Internal cash/bank/wallet account transfer',
+                  xferDate
                 );
                 setXferAmount('');
               }}
@@ -1030,15 +1272,23 @@ export function AccountingView({
                   </option>
                 ))}
               </select>
-              <input
-                type="number"
-                required
-                min={1}
-                value={xferAmount}
-                onChange={(e) => setXferAmount(e.target.value)}
-                placeholder={`Transfer amount (${sym})`}
-                className="w-full px-3 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
-              />
+              <div className="grid grid-cols-2 gap-2">
+                <input
+                  type="number"
+                  required
+                  min={1}
+                  value={xferAmount}
+                  onChange={(e) => setXferAmount(e.target.value)}
+                  placeholder={`Amount (${sym})`}
+                  className="w-full px-3 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
+                />
+                <input
+                  type="date"
+                  value={xferDate}
+                  onChange={(e) => setXferDate(e.target.value)}
+                  className="w-full px-2.5 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
               {(() => {
                 const fromObj = cashBankAccounts.find((a) => a.code === resolvedXferFrom);
                 const xferParsed = Number(xferAmount) || 0;
@@ -1191,7 +1441,9 @@ export function AccountingView({
                   <th className="py-3 px-4">Account Name</th>
                   <th className="py-3 px-4">Type</th>
                   <th className="py-3 px-4 text-right">Current Balance</th>
-                  {onRequestDelete && <th className="py-3 px-4 text-right">Action</th>}
+                  {(onRequestDelete || (isOwner && (onOwnerUpdateAccount || onOwnerAdjustAccountBalance))) && (
+                    <th className="py-3 px-4 text-right">Action</th>
+                  )}
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200/60 tabular-nums">
@@ -1236,49 +1488,64 @@ export function AccountingView({
                       <td className="py-2.5 px-4 text-right font-mono font-semibold text-slate-900">
                         {formatMoney(acc.balance, sym)}
                       </td>
-                      {onRequestDelete && (
+                      {(onRequestDelete || (isOwner && (onOwnerUpdateAccount || onOwnerAdjustAccountBalance))) && (
                         <td className="py-2.5 px-4 text-right">
-                          <button
-                            type="button"
-                            onClick={() =>
-                              onRequestDelete({
-                                itemType: 'Chart of Accounts Entry',
-                                itemNameOrId: `${acc.code} · ${acc.name}`,
-                                bodyText: canHardDelete
-                                  ? `Delete unused account "${acc.code} · ${acc.name}"? It has zero balance and no journal history.`
-                                  : `Ledger account ${acc.code} (${acc.name}) has balance ${formatMoney(acc.balance, sym)} or historical journal entries.`,
-                                linkedInfo: canHardDelete
-                                  ? undefined
-                                  : 'Accounts with ledger history stay protected to keep Trial Balance & historical journals accurate. You can deactivate non-core payment accounts to hide them from new forms.',
-                                accountingProtected: !canHardDelete,
-                                onConfirmDelete: canHardDelete
-                                  ? () => onDeleteAccount?.(acc.code)
-                                  : undefined,
-                                alternativeLabel:
-                                  !canHardDelete &&
-                                  !isCoreSystem &&
-                                  acc.active !== false &&
-                                  onDeactivateAccount
-                                    ? 'Deactivate Payment Account'
-                                    : undefined,
-                                onAlternative:
-                                  !canHardDelete &&
-                                  !isCoreSystem &&
-                                  acc.active !== false &&
-                                  onDeactivateAccount
-                                    ? () => onDeactivateAccount(acc.code)
-                                    : undefined,
-                              })
-                            }
-                            className="p-1 text-slate-400 hover:text-red-600"
-                            title={
-                              canHardDelete
-                                ? 'Delete unused account'
-                                : 'Deactivate or inspect ledger protection'
-                            }
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
+                          <div className="inline-flex items-center justify-end gap-1.5">
+                            {isOwner && (onOwnerUpdateAccount || onOwnerAdjustAccountBalance) && (
+                              <button
+                                type="button"
+                                onClick={() => openCustomizeAccount(acc)}
+                                className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-semibold rounded-lg bg-amber-50 border border-amber-200 text-amber-800 hover:bg-amber-100"
+                                title="Customize account or adjust balance (Owner)"
+                              >
+                                <SlidersHorizontal className="w-3 h-3" />
+                                Customize
+                              </button>
+                            )}
+                            {onRequestDelete && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  onRequestDelete({
+                                    itemType: 'Chart of Accounts Entry',
+                                    itemNameOrId: `${acc.code} · ${acc.name}`,
+                                    bodyText: canHardDelete
+                                      ? `Delete unused account "${acc.code} · ${acc.name}"? It has zero balance and no journal history.`
+                                      : `Ledger account ${acc.code} (${acc.name}) has balance ${formatMoney(acc.balance, sym)} or historical journal entries.`,
+                                    linkedInfo: canHardDelete
+                                      ? undefined
+                                      : 'Accounts with ledger history stay protected to keep Trial Balance & historical journals accurate. You can deactivate non-core payment accounts to hide them from new forms.',
+                                    accountingProtected: !canHardDelete,
+                                    onConfirmDelete: canHardDelete
+                                      ? () => onDeleteAccount?.(acc.code)
+                                      : undefined,
+                                    alternativeLabel:
+                                      !canHardDelete &&
+                                      !isCoreSystem &&
+                                      acc.active !== false &&
+                                      onDeactivateAccount
+                                        ? 'Deactivate Payment Account'
+                                        : undefined,
+                                    onAlternative:
+                                      !canHardDelete &&
+                                      !isCoreSystem &&
+                                      acc.active !== false &&
+                                      onDeactivateAccount
+                                        ? () => onDeactivateAccount(acc.code)
+                                        : undefined,
+                                  })
+                                }
+                                className="p-1 text-slate-400 hover:text-red-600"
+                                title={
+                                  canHardDelete
+                                    ? 'Delete unused account'
+                                    : 'Deactivate or inspect ledger protection'
+                                }
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            )}
+                          </div>
                         </td>
                       )}
                     </tr>
@@ -1286,6 +1553,499 @@ export function AccountingView({
                 })}
               </tbody>
             </table>
+          </div>
+        </div>
+      )}
+
+      {/* Owner Customize Journal Entry Modal */}
+      {isOwner && editJeTarget && onOwnerCustomizeJournal && (
+        <div
+          className="fixed inset-0 z-50 flex items-start justify-center p-4 sm:p-6 bg-slate-900/45 backdrop-blur-xs overflow-y-auto"
+          onClick={() => setEditJeTarget(null)}
+        >
+          <form
+            onClick={(e) => e.stopPropagation()}
+            onSubmit={(e) => {
+              e.preventDefault();
+              const dr = ejLines.reduce((s, l) => s + (Number(l.debit) || 0), 0);
+              const cr = ejLines.reduce((s, l) => s + (Number(l.credit) || 0), 0);
+              if (ejLines.length < 2 || Math.abs(dr - cr) > 0.01) return;
+              onOwnerCustomizeJournal(editJeTarget.id, {
+                date: dateInputToIso(ejDate, editJeTarget.date),
+                reference: ejRef.trim() || editJeTarget.reference,
+                description: ejDesc.trim() || editJeTarget.description,
+                category: ejCategory,
+                lines: ejLines.map((l) => {
+                  const accObj = state.accounts.find((a) => a.code === l.accountCode);
+                  return {
+                    accountCode: l.accountCode,
+                    accountName: accObj?.name || l.accountName,
+                    debit: Number(l.debit) || 0,
+                    credit: Number(l.credit) || 0,
+                  };
+                }),
+              });
+              setEditJeTarget(null);
+            }}
+            className="w-full max-w-2xl my-6 rounded-2xl bg-white border border-slate-200 shadow-2xl p-6 space-y-4 text-xs"
+          >
+            <div className="flex items-center justify-between border-b border-slate-200 pb-3">
+              <div>
+                <h3 className="text-base font-semibold text-slate-900">
+                  Customize Journal Entry · {editJeTarget.id}
+                </h3>
+                <p className="text-slate-500">
+                  Edit date, category, reference, narration, and balanced debit/credit lines (Owner)
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditJeTarget(null)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div>
+                <label className="block text-[11px] font-medium text-slate-500 mb-1">
+                  Journal Date
+                </label>
+                <input
+                  type="date"
+                  required
+                  value={ejDate}
+                  onChange={(e) => setEjDate(e.target.value)}
+                  className="w-full px-3 py-2 font-mono rounded-xl border border-slate-200 bg-white"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-500 mb-1">Category</label>
+                <select
+                  value={ejCategory}
+                  onChange={(e) => setEjCategory(e.target.value as JournalEntry['category'])}
+                  className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white"
+                >
+                  {JOURNAL_CATEGORIES.concat(['Reversal', 'Opening Balance']).map((cat) => (
+                    <option key={cat} value={cat}>
+                      {cat}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-500 mb-1">
+                  Reference
+                </label>
+                <input
+                  value={ejRef}
+                  onChange={(e) => setEjRef(e.target.value)}
+                  className="w-full px-3 py-2 font-mono rounded-xl border border-slate-200 bg-white"
+                />
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-medium text-slate-500 mb-1">
+                Description / Narration
+              </label>
+              <input
+                required
+                value={ejDesc}
+                onChange={(e) => setEjDesc(e.target.value)}
+                className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white"
+              />
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="font-semibold text-slate-700">Debit &amp; Credit Lines</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const fallbackAcc = state.accounts[0];
+                    setEjLines((prev) => [
+                      ...prev,
+                      {
+                        accountCode: fallbackAcc?.code || '1010',
+                        accountName: fallbackAcc?.name || 'Cash in Hand',
+                        debit: 0,
+                        credit: 0,
+                      },
+                    ]);
+                  }}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-100 text-slate-700 hover:bg-slate-200 font-medium"
+                >
+                  <Plus className="w-3 h-3" />
+                  Add Line
+                </button>
+              </div>
+              <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+                {ejLines.map((line, idx) => (
+                  <div
+                    key={idx}
+                    className="grid grid-cols-12 gap-2 items-center p-2 rounded-xl bg-slate-50 border border-slate-200/80"
+                  >
+                    <select
+                      value={line.accountCode}
+                      onChange={(e) => {
+                        const code = e.target.value;
+                        const accObj = state.accounts.find((a) => a.code === code);
+                        setEjLines((prev) =>
+                          prev.map((x, i) =>
+                            i === idx
+                              ? { ...x, accountCode: code, accountName: accObj?.name || code }
+                              : x
+                          )
+                        );
+                      }}
+                      className="col-span-6 px-2.5 py-1.5 rounded-lg bg-white border border-slate-200"
+                    >
+                      {state.accounts.map((a) => (
+                        <option key={a.code} value={a.code}>
+                          {a.code} · {a.name}
+                        </option>
+                      ))}
+                    </select>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.01"
+                      value={line.debit}
+                      onChange={(e) => {
+                        const val = Math.max(0, Number(e.target.value) || 0);
+                        setEjLines((prev) =>
+                          prev.map((x, i) =>
+                            i === idx ? { ...x, debit: val, credit: val > 0 ? 0 : x.credit } : x
+                          )
+                        );
+                      }}
+                      placeholder="Debit"
+                      className="col-span-2 px-2 py-1.5 text-right font-mono rounded-lg bg-white border border-slate-200"
+                    />
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.01"
+                      value={line.credit}
+                      onChange={(e) => {
+                        const val = Math.max(0, Number(e.target.value) || 0);
+                        setEjLines((prev) =>
+                          prev.map((x, i) =>
+                            i === idx ? { ...x, credit: val, debit: val > 0 ? 0 : x.debit } : x
+                          )
+                        );
+                      }}
+                      placeholder="Credit"
+                      className="col-span-2 px-2 py-1.5 text-right font-mono rounded-lg bg-white border border-slate-200"
+                    />
+                    <div className="col-span-2 flex justify-end">
+                      <button
+                        type="button"
+                        disabled={ejLines.length <= 2}
+                        onClick={() => setEjLines((prev) => prev.filter((_, i) => i !== idx))}
+                        className="p-1 text-slate-400 hover:text-red-600 disabled:opacity-30"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              {(() => {
+                const totalDr = ejLines.reduce((s, l) => s + (Number(l.debit) || 0), 0);
+                const totalCr = ejLines.reduce((s, l) => s + (Number(l.credit) || 0), 0);
+                const diff = Number((totalDr - totalCr).toFixed(2));
+                const balanced = Math.abs(diff) <= 0.01 && totalDr > 0;
+                return (
+                  <div
+                    className={`p-2.5 rounded-xl flex flex-wrap items-center justify-between font-mono text-xs ${
+                      balanced
+                        ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                        : 'bg-red-50 text-red-700 border border-red-200'
+                    }`}
+                  >
+                    <span>
+                      Dr: {formatMoney(totalDr, sym)} | Cr: {formatMoney(totalCr, sym)}
+                    </span>
+                    <span className="font-semibold">
+                      {balanced ? 'Balanced' : `Out of balance by ${formatMoney(Math.abs(diff), sym)}`}
+                    </span>
+                  </div>
+                );
+              })()}
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-200">
+              {onOwnerDeleteJournal ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const id = editJeTarget.id;
+                    setEditJeTarget(null);
+                    onOwnerDeleteJournal(id);
+                  }}
+                  className="inline-flex items-center gap-1 px-3 py-2 rounded-xl bg-red-50 text-red-700 border border-red-200 hover:bg-red-100 font-semibold"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  Delete Journal
+                </button>
+              ) : (
+                <span />
+              )}
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setEditJeTarget(null)}
+                  className="px-4 py-2 rounded-xl border border-slate-200 text-slate-700 font-medium"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={
+                    ejLines.length < 2 ||
+                    Math.abs(
+                      ejLines.reduce((s, l) => s + (Number(l.debit) || 0), 0) -
+                        ejLines.reduce((s, l) => s + (Number(l.credit) || 0), 0)
+                    ) > 0.01
+                  }
+                  className="px-4 py-2 rounded-xl bg-[#0071E3] text-white font-semibold disabled:opacity-40"
+                >
+                  Save Journal Changes
+                </button>
+              </div>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* Owner Customize Account & Adjust Balance Modal */}
+      {isOwner && editAccTarget && (
+        <div
+          className="fixed inset-0 z-50 flex items-start justify-center p-4 sm:p-6 bg-slate-900/45 backdrop-blur-xs overflow-y-auto"
+          onClick={() => setEditAccTarget(null)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-xl my-6 rounded-2xl bg-white border border-slate-200 shadow-2xl p-6 space-y-5 text-xs"
+          >
+            <div className="flex items-center justify-between border-b border-slate-200 pb-3">
+              <div>
+                <h3 className="text-base font-semibold text-slate-900">
+                  Customize Account · {editAccTarget.code} ({editAccTarget.type})
+                </h3>
+                <p className="text-slate-500">
+                  Current Ledger Balance:{' '}
+                  <strong className="font-mono text-slate-900">
+                    {formatMoney(editAccTarget.balance, sym)}
+                  </strong>
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditAccTarget(null)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {onOwnerUpdateAccount && (
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  onOwnerUpdateAccount(editAccTarget.code, {
+                    name: eaName.trim() || editAccTarget.name,
+                    channel: editAccTarget.type === 'Asset' ? eaChannel : undefined,
+                    walletType:
+                      editAccTarget.type === 'Asset' && eaChannel === 'E-Wallet'
+                        ? eaWalletType.trim()
+                        : undefined,
+                    cashOutChargePercent:
+                      editAccTarget.type === 'Asset' && eaChannel === 'E-Wallet'
+                        ? Math.max(0, Number(eaChargePct) || 0)
+                        : undefined,
+                    cashOutChargeFlat:
+                      editAccTarget.type === 'Asset' && eaChannel === 'E-Wallet'
+                        ? Math.max(0, Number(eaChargeFlat) || 0)
+                        : undefined,
+                    active: eaActive,
+                  });
+                  setEditAccTarget(null);
+                }}
+                className="space-y-3 pb-4 border-b border-slate-200"
+              >
+                <p className="font-semibold text-slate-800">Account Profile &amp; Settings</p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-[11px] text-slate-500 mb-1">Account Name</label>
+                    <input
+                      required
+                      value={eaName}
+                      onChange={(e) => setEaName(e.target.value)}
+                      className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white"
+                    />
+                  </div>
+                  {editAccTarget.type === 'Asset' && (
+                    <div>
+                      <label className="block text-[11px] text-slate-500 mb-1">Channel</label>
+                      <select
+                        value={eaChannel}
+                        onChange={(e) => setEaChannel(e.target.value as MoneySourceChannel)}
+                        className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white"
+                      >
+                        <option value="Cash">Cash</option>
+                        <option value="Bank">Bank</option>
+                        <option value="E-Wallet">E-Wallet</option>
+                        <option value="Other">Non-Cash Asset</option>
+                      </select>
+                    </div>
+                  )}
+                </div>
+
+                {editAccTarget.type === 'Asset' && eaChannel === 'E-Wallet' && (
+                  <div className="grid grid-cols-3 gap-2">
+                    <div>
+                      <label className="block text-[11px] text-slate-500 mb-1">Wallet Type</label>
+                      <input
+                        value={eaWalletType}
+                        onChange={(e) => setEaWalletType(e.target.value)}
+                        placeholder="Merchant / Personal"
+                        className="w-full px-2.5 py-1.5 rounded-xl border border-slate-200 bg-white"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] text-slate-500 mb-1">Cash-out %</label>
+                      <input
+                        type="number"
+                        min={0}
+                        step="0.01"
+                        value={eaChargePct}
+                        onChange={(e) => setEaChargePct(e.target.value)}
+                        className="w-full px-2.5 py-1.5 font-mono rounded-xl border border-slate-200 bg-white"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] text-slate-500 mb-1">Flat Fee ({sym})</label>
+                      <input
+                        type="number"
+                        min={0}
+                        step="0.01"
+                        value={eaChargeFlat}
+                        onChange={(e) => setEaChargeFlat(e.target.value)}
+                        className="w-full px-2.5 py-1.5 font-mono rounded-xl border border-slate-200 bg-white"
+                      />
+                    </div>
+                  </div>
+                )}
+
+                <div className="flex items-center justify-between pt-1">
+                  <label className="inline-flex items-center gap-2 text-slate-700 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={eaActive}
+                      onChange={(e) => setEaActive(e.target.checked)}
+                    />
+                    Active in selection dropdowns
+                  </label>
+                  <button
+                    type="submit"
+                    className="px-4 py-2 rounded-xl bg-slate-900 text-white font-semibold"
+                  >
+                    Save Account Info
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {onOwnerAdjustAccountBalance && (
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  const target = Number(eaTargetBalance);
+                  if (Number.isNaN(target) || eaOffsetCode === editAccTarget.code) return;
+                  onOwnerAdjustAccountBalance({
+                    accountCode: editAccTarget.code,
+                    targetBalance: target,
+                    offsetAccountCode: eaOffsetCode,
+                    date: eaAdjDate,
+                    reason: eaAdjReason.trim() || 'Owner direct balance adjustment',
+                  });
+                  setEditAccTarget(null);
+                }}
+                className="space-y-3"
+              >
+                <div>
+                  <p className="font-semibold text-slate-800">
+                    Adjust Account Balance Anytime (Balanced Entry)
+                  </p>
+                  <p className="text-[11px] text-slate-500">
+                    Sets {editAccTarget.code} · {editAccTarget.name} to the exact target balance via a balanced adjusting journal.
+                  </p>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div>
+                    <label className="block text-[11px] text-slate-500 mb-1">
+                      Target Balance ({sym})
+                    </label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      required
+                      value={eaTargetBalance}
+                      onChange={(e) => setEaTargetBalance(e.target.value)}
+                      className="w-full px-3 py-2 font-mono rounded-xl border border-slate-200 bg-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] text-slate-500 mb-1">
+                      Adjustment Date
+                    </label>
+                    <input
+                      type="date"
+                      required
+                      value={eaAdjDate}
+                      onChange={(e) => setEaAdjDate(e.target.value)}
+                      className="w-full px-3 py-2 font-mono rounded-xl border border-slate-200 bg-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] text-slate-500 mb-1">
+                      Offset Account
+                    </label>
+                    <select
+                      value={eaOffsetCode}
+                      onChange={(e) => setEaOffsetCode(e.target.value)}
+                      className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white"
+                    >
+                      {state.accounts
+                        .filter((a) => a.code !== editAccTarget.code)
+                        .map((a) => (
+                          <option key={a.code} value={a.code}>
+                            {a.code} · {a.name}
+                          </option>
+                        ))}
+                    </select>
+                  </div>
+                </div>
+                <div className="flex flex-col sm:flex-row gap-2 items-stretch sm:items-center">
+                  <input
+                    value={eaAdjReason}
+                    onChange={(e) => setEaAdjReason(e.target.value)}
+                    placeholder="Reason for balance adjustment..."
+                    className="flex-1 px-3 py-2 rounded-xl border border-slate-200 bg-white"
+                  />
+                  <button
+                    type="submit"
+                    className="px-4 py-2 rounded-xl bg-[#0071E3] text-white font-semibold whitespace-nowrap"
+                  >
+                    Apply Target Balance
+                  </button>
+                </div>
+              </form>
+            )}
           </div>
         </div>
       )}

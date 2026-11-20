@@ -59,10 +59,12 @@ import {
   DeliveryOption,
   Employee,
   ErpState,
+  ExpenseRecord,
   GitHubSyncStatus,
   IdFormatKey,
   IdFormatRule,
   Invoice,
+  InvoiceLineSnapshot,
   JournalEntry,
   JournalLine,
   MoneySourceChannel,
@@ -72,6 +74,7 @@ import {
   OpeningBalanceDraft,
   Order,
   OrderException,
+  OrderLine,
   OrderStage,
   PaymentSplit,
   PayrollRecord,
@@ -88,10 +91,13 @@ import {
   applyJournalToAccounts,
   buildJournalEntry,
   createBlackBoxEvent,
+  dateInputToIso,
   generateNextMoneyAccountCode,
   inferMoneyChannel,
+  isDebitNormal,
   isMoneySourceAccount,
   normalizePaymentSplits,
+  recalculateAccountBalancesFromJournals,
 } from './utils/accounting';
 import { getCorporateBrandColor, migrateErpState } from './utils/migration';
 import {
@@ -733,7 +739,10 @@ export default function App() {
     commitState((prev) => {
       const target = prev.users.find((u) => u.id === id);
       if (!target) return prev;
-      const safePatch = id === 'owner' ? { ...patch, active: true, role: 'Owner' as UserRole } : patch;
+      const safePatch =
+        id === 'Ankonbabu' || id === 'owner'
+          ? { ...patch, active: true, role: 'Owner' as UserRole }
+          : patch;
       const nextUsers = prev.users.map((u) => (u.id === id ? { ...u, ...safePatch } : u));
       const bb = createBlackBoxEvent(prev.blackBox, {
         user: activeUserName,
@@ -1232,6 +1241,8 @@ export default function App() {
     additionalChargeLabel: string;
     addAdditionalToOrder: boolean;
     notes: string;
+    orderDate?: string;
+    invoiceDate?: string;
     initialPaidAmount: number;
     paymentAccountCode: string;
     paymentSplits?: Array<{ accountCode: string; amount: number }>;
@@ -1267,8 +1278,16 @@ export default function App() {
         params.advanceInvoiceCounterTo ?? 0
       );
 
-      const createdAt = new Date().toISOString();
-      const expectedDeliveryAt = new Date(Date.now() + del.targetHours * 3600000).toISOString();
+      const createdAt = params.orderDate
+        ? dateInputToIso(params.orderDate)
+        : new Date().toISOString();
+      const invoiceIssuedAt = params.invoiceDate
+        ? dateInputToIso(params.invoiceDate, createdAt)
+        : createdAt;
+      const createdMs = new Date(createdAt).getTime();
+      const expectedDeliveryAt = new Date(
+        (Number.isNaN(createdMs) ? Date.now() : createdMs) + del.targetHours * 3600000
+      ).toISOString();
 
       let nextCustomPrices = [...prev.customerCustomPrices];
       const orderLines = params.lines.map((l, idx) => {
@@ -1370,7 +1389,7 @@ export default function App() {
         customerPhone: cust.phone,
         customerAddress: cust.address,
         isCorporate: false,
-        issuedAt: createdAt,
+        issuedAt: invoiceIssuedAt,
         dueDate: expectedDeliveryAt,
         lines: orderLines.map((l) => ({
           productName: l.productName,
@@ -1427,7 +1446,7 @@ export default function App() {
             : '';
         const je = buildJournalEntry({
           id: `JE-${1001 + prev.journalEntries.length}`,
-          date: createdAt,
+          date: invoiceIssuedAt,
           reference: orderId,
           description: `Retail order ${orderId} (${cust.name})${splitDesc}`,
           category: 'Sales',
@@ -1909,6 +1928,7 @@ export default function App() {
     serviceId: string;
     qty: number;
     reason: string;
+    date?: string;
   }) => {
     commitState((prev) => {
       const corp = prev.corporateCustomers.find((c) => c.id === params.corporateId);
@@ -1946,11 +1966,13 @@ export default function App() {
         params.advanceOrderCounterTo ?? 0
       );
 
+      const movDate = params.date ? dateInputToIso(params.date) : new Date().toISOString();
+
       const newMov: CorporateMovement = {
         id: `CMOV-${101 + prev.corporateMovements.length}`,
         orderId,
         corporateId: corp.id,
-        date: new Date().toISOString(),
+        date: movDate,
         event: params.event,
         productId: prod.id,
         productName: prod.name,
@@ -1993,6 +2015,8 @@ export default function App() {
     options?: {
       customInvoiceId?: string;
       advanceCounterTo?: number;
+      issuedAt?: string;
+      dueDate?: string;
       approvedZeroPriceLines?: Array<{ productName: string; serviceName: string; quantity: number }>;
     }
   ) => {
@@ -2022,8 +2046,13 @@ export default function App() {
         options?.advanceCounterTo ?? 0
       );
 
-      const issuedAt = new Date().toISOString();
-      const dueDate = new Date(Date.now() + 7 * 86400000).toISOString();
+      const issuedAt = options?.issuedAt
+        ? dateInputToIso(options.issuedAt)
+        : new Date().toISOString();
+      const issuedMs = new Date(issuedAt).getTime();
+      const dueDate = options?.dueDate
+        ? dateInputToIso(options.dueDate)
+        : new Date((Number.isNaN(issuedMs) ? Date.now() : issuedMs) + 7 * 86400000).toISOString();
 
       const lines = eligibleMovements.map((m) => {
         const qty = Math.abs(m.qtyDelta) - m.billedQty;
@@ -2423,7 +2452,12 @@ export default function App() {
 
   // --- ACCOUNTING HANDLERS ---
 
-  const handlePostOwnerDraw = (amount: number, paymentAccountCode: string, note: string) => {
+  const handlePostOwnerDraw = (
+    amount: number,
+    paymentAccountCode: string,
+    note: string,
+    date?: string
+  ) => {
     if (!requireAction(activePerms.actions.canPostAccounting, 'post owner draw entries')) return;
     commitState((prev) => {
       const drawAcc = prev.accounts.find((a) => a.code === '3020');
@@ -2432,7 +2466,7 @@ export default function App() {
 
       const je = buildJournalEntry({
         id: `JE-${1001 + prev.journalEntries.length}`,
-        date: new Date().toISOString(),
+        date: date ? dateInputToIso(date) : new Date().toISOString(),
         reference: `DRAW-${Date.now().toString().slice(-4)}`,
         description: `Owner Draw: ${note}`,
         category: 'Owner Draw',
@@ -2467,6 +2501,7 @@ export default function App() {
     amount: number;
     toAccountCode: string;
     note: string;
+    date?: string;
   }) => {
     if (!requireAction(activePerms.actions.canPostAccounting, 'post cash inflow entries')) return;
     commitState((prev) => {
@@ -2482,7 +2517,7 @@ export default function App() {
 
       const je = buildJournalEntry({
         id: `JE-${1001 + prev.journalEntries.length}`,
-        date: new Date().toISOString(),
+        date: params.date ? dateInputToIso(params.date) : new Date().toISOString(),
         reference: `IN-${Date.now().toString().slice(-4)}`,
         description: `${params.inflowType}: ${params.note}`,
         category: params.inflowType === 'Loan Received' ? 'Loan' : 'Owner Capital',
@@ -2512,7 +2547,13 @@ export default function App() {
     });
   };
 
-  const handlePostTransfer = (fromCode: string, toCode: string, amount: number, note: string) => {
+  const handlePostTransfer = (
+    fromCode: string,
+    toCode: string,
+    amount: number,
+    note: string,
+    date?: string
+  ) => {
     if (!requireAction(activePerms.actions.canPostAccounting, 'post internal account transfers')) return;
     commitState((prev) => {
       const fromAcc = prev.accounts.find((a) => a.code === fromCode);
@@ -2521,7 +2562,7 @@ export default function App() {
 
       const je = buildJournalEntry({
         id: `JE-${1001 + prev.journalEntries.length}`,
-        date: new Date().toISOString(),
+        date: date ? dateInputToIso(date) : new Date().toISOString(),
         reference: `XFER-${Date.now().toString().slice(-4)}`,
         description: note,
         category: 'Transfer',
@@ -2547,6 +2588,7 @@ export default function App() {
     debitCode: string;
     creditCode: string;
     amount: number;
+    date?: string;
   }) => {
     if (!requireAction(activePerms.actions.canPostAccounting, 'post manual journals')) return;
     commitState((prev) => {
@@ -2556,7 +2598,7 @@ export default function App() {
 
       const je = buildJournalEntry({
         id: `JE-${1001 + prev.journalEntries.length}`,
-        date: new Date().toISOString(),
+        date: params.date ? dateInputToIso(params.date) : new Date().toISOString(),
         reference: params.reference,
         description: params.description,
         category: params.category,
@@ -2923,6 +2965,7 @@ export default function App() {
     deductionAmount: number;
     paymentAccountCode: string;
     note: string;
+    date?: string;
   }) => {
     if (!requireAction(activePerms.actions.canManagePayrollExpenses, 'process payroll')) return;
     commitState((prev) => {
@@ -2932,11 +2975,12 @@ export default function App() {
       if (!emp || !payAcc || !salaryExpAcc) return prev;
 
       const netPaid = Math.max(0, Number((params.grossAmount - params.deductionAmount).toFixed(2)));
+      const recDate = params.date ? dateInputToIso(params.date) : new Date().toISOString();
       const rec: PayrollRecord = {
         id: `PAY-${201 + prev.payrollRecords.length}`,
         employeeId: emp.id,
         employeeName: emp.name,
-        date: new Date().toISOString(),
+        date: recDate,
         type: params.type,
         grossAmount: params.grossAmount,
         deductionAmount: params.deductionAmount,
@@ -2999,6 +3043,7 @@ export default function App() {
     reference: string;
     recurring: boolean;
     recurrenceCycle?: 'Weekly' | 'Monthly';
+    date?: string;
   }) => {
     if (!requireAction(activePerms.actions.canManagePayrollExpenses, 'record operating expenses')) return;
     commitState((prev) => {
@@ -3016,10 +3061,12 @@ export default function App() {
       const expAcc = prev.accounts.find((a) => a.code === expCode);
       if (!payAcc || !expAcc) return prev;
 
-      const date = new Date().toISOString();
+      const date = params.date ? dateInputToIso(params.date) : new Date().toISOString();
+      const baseMs = new Date(date).getTime();
       const nextDueDate = params.recurring
         ? new Date(
-            Date.now() + (params.recurrenceCycle === 'Weekly' ? 7 : 30) * 86400000
+            (Number.isNaN(baseMs) ? Date.now() : baseMs) +
+              (params.recurrenceCycle === 'Weekly' ? 7 : 30) * 86400000
           ).toISOString()
         : undefined;
 
@@ -3040,8 +3087,8 @@ export default function App() {
       const je = buildJournalEntry({
         id: `JE-${1001 + prev.journalEntries.length}`,
         date,
-        reference: params.reference,
-        description: `Expense (${params.category}): ${params.description}`,
+        reference: expId,
+        description: `Expense (${params.category}): ${params.description} [${params.reference}]`,
         category: 'Expense',
         createdBy: activeUserName,
         lines: [
@@ -4191,6 +4238,1917 @@ export default function App() {
     });
   };
 
+  // --- OWNER-ONLY CUSTOMIZATION, OVERRIDE DELETION & BALANCE ADJUSTMENT HANDLERS ---
+
+  const recomputeCorporateMovementsPending = (movements: CorporateMovement[]): CorporateMovement[] => {
+    const withIdx = movements.map((m, idx) => ({ m, idx }));
+    const groups = new Map<string, typeof withIdx>();
+    for (const item of withIdx) {
+      const key = `${item.m.corporateId}|${item.m.productId}|${item.m.serviceId}`;
+      const arr = groups.get(key) || [];
+      arr.push(item);
+      groups.set(key, arr);
+    }
+    const updatedMap = new Map<string, number>();
+    for (const arr of groups.values()) {
+      arr.sort((a, b) => {
+        const ta = new Date(a.m.date).getTime();
+        const tb = new Date(b.m.date).getTime();
+        if (ta !== tb) return ta - tb;
+        return a.idx - b.idx;
+      });
+      let running = 0;
+      for (const item of arr) {
+        running = Math.max(0, running + item.m.qtyDelta);
+        updatedMap.set(item.m.id, running);
+      }
+    }
+    return movements.map((m) =>
+      updatedMap.has(m.id) ? { ...m, pendingAfter: updatedMap.get(m.id)! } : m
+    );
+  };
+
+  const handleOwnerCustomizeOrder = (
+    orderId: string,
+    updated: {
+      customerId: string;
+      createdAt: string;
+      expectedDeliveryAt: string;
+      invoiceIssuedAt?: string;
+      deliveryOptionId: string;
+      stage: OrderStage;
+      physicallyReceived: boolean;
+      lines: OrderLine[];
+      orderDiscount: number;
+      additionalCharge: number;
+      additionalChargeLabel?: string;
+      addAdditionalToOrder: boolean;
+      paidAmount: number;
+      paymentSplits?: PaymentSplit[];
+      notes: string;
+    }
+  ) => {
+    if (!requireAction(currentUser?.role === 'Owner', 'customize orders (Owner only)')) return;
+    commitState((prev) => {
+      const ord = prev.orders.find((o) => o.id === orderId);
+      if (!ord) return prev;
+      const newCust =
+        prev.customers.find((c) => c.id === updated.customerId) ||
+        prev.customers.find((c) => c.id === ord.customerId);
+      if (!newCust) return prev;
+      const del =
+        prev.deliveryOptions.find((d) => d.id === updated.deliveryOptionId) ||
+        prev.deliveryOptions[0];
+
+      const cleanLines = updated.lines.map((l) => ({
+        ...l,
+        quantityOrdered: Math.max(0, Number(l.quantityOrdered) || 0),
+        quantityReceived: updated.physicallyReceived
+          ? Math.max(0, Number(l.quantityReceived || l.quantityOrdered) || 0)
+          : 0,
+        quantityDelivered: Math.max(0, Number(l.quantityDelivered) || 0),
+        quantityRewash: Math.max(0, Number(l.quantityRewash) || 0),
+        unitPrice: Math.max(0, Number(l.unitPrice) || 0),
+        discount: Math.max(0, Number(l.discount) || 0),
+      }));
+
+      const subtotal = Number(
+        cleanLines
+          .reduce((s, l) => s + Math.max(0, l.quantityOrdered * l.unitPrice - l.discount), 0)
+          .toFixed(2)
+      );
+      const orderDiscount = Math.max(0, Number(updated.orderDiscount) || 0);
+      const additionalCharge = Math.max(0, Number(updated.additionalCharge) || 0);
+      const extra = updated.addAdditionalToOrder ? additionalCharge : 0;
+      const totalAmount = Math.max(0, Number((subtotal - orderDiscount + extra).toFixed(2)));
+
+      const fallbackAccCode =
+        ord.paymentSplits?.[0]?.accountCode ||
+        prev.accounts.find((a) => isMoneySourceAccount(a))?.code ||
+        '1010';
+      const normalizedSplits = normalizePaymentSplits({
+        accounts: prev.accounts,
+        paymentSplits:
+          updated.paymentSplits && updated.paymentSplits.length > 0
+            ? updated.paymentSplits
+            : undefined,
+        fallbackAccountCode: fallbackAccCode,
+        fallbackAmount: Math.max(0, Number(updated.paidAmount) || 0),
+        capTotal: totalAmount,
+      });
+      const paidAmount = Number(normalizedSplits.reduce((s, sp) => s + sp.amount, 0).toFixed(2));
+      const dueAmount = Number((totalAmount - paidAmount).toFixed(2));
+
+      const createdAtIso = updated.createdAt || ord.createdAt;
+      const expectedDeliveryIso = updated.expectedDeliveryAt || ord.expectedDeliveryAt;
+      const invoiceIssuedIso = updated.invoiceIssuedAt || createdAtIso;
+
+      const stageHistory =
+        ord.stage !== updated.stage
+          ? [
+              ...ord.stageHistory,
+              {
+                stage: updated.stage,
+                timestamp: new Date().toISOString(),
+                user: activeUserName,
+                note: 'Stage customized by Owner',
+              },
+            ]
+          : ord.stageHistory;
+
+      const nextOrder: Order = {
+        ...ord,
+        customerId: newCust.id,
+        customerName: newCust.name,
+        createdAt: createdAtIso,
+        expectedDeliveryAt: expectedDeliveryIso,
+        deliveryOptionId: del?.id || ord.deliveryOptionId,
+        deliveryOptionName: del?.name || ord.deliveryOptionName,
+        stage: updated.stage,
+        physicallyReceived: updated.physicallyReceived,
+        stageHistory,
+        lines: cleanLines,
+        orderDiscount,
+        additionalCharge,
+        additionalChargeLabel: updated.additionalChargeLabel,
+        addAdditionalToOrder: updated.addAdditionalToOrder,
+        totalAmount,
+        paidAmount,
+        paymentSplits: normalizedSplits.length > 0 ? normalizedSplits : undefined,
+        notes: updated.notes,
+      };
+
+      const oldDue = ord.isOpening
+        ? 0
+        : Math.max(0, Number((ord.totalAmount - ord.paidAmount).toFixed(2)));
+      const newDue = ord.isOpening ? 0 : dueAmount;
+      const nextCustomers = prev.customers.map((c) => {
+        if (c.id === ord.customerId && c.id === newCust.id) {
+          return {
+            ...c,
+            outstandingBalance: Math.max(
+              0,
+              Number((c.outstandingBalance - oldDue + newDue).toFixed(2))
+            ),
+          };
+        }
+        if (c.id === ord.customerId) {
+          return {
+            ...c,
+            outstandingBalance: Math.max(0, Number((c.outstandingBalance - oldDue).toFixed(2))),
+          };
+        }
+        if (c.id === newCust.id) {
+          return {
+            ...c,
+            outstandingBalance: Math.max(0, Number((c.outstandingBalance + newDue).toFixed(2))),
+          };
+        }
+        return c;
+      });
+
+      const nextInvoices = prev.invoices.map((inv) => {
+        if (inv.id !== ord.invoiceId && inv.orderId !== orderId) return inv;
+        return {
+          ...inv,
+          customerId: newCust.id,
+          customerName: newCust.name,
+          customerPhone: newCust.phone,
+          customerAddress: newCust.address,
+          issuedAt: invoiceIssuedIso,
+          dueDate: expectedDeliveryIso,
+          lines: cleanLines.map((l) => ({
+            productName: l.productName,
+            serviceName: l.serviceName,
+            quantity: l.quantityOrdered,
+            unitPrice: l.unitPrice,
+            discount: l.discount,
+            total: Number((l.quantityOrdered * l.unitPrice - l.discount).toFixed(2)),
+          })),
+          subtotal,
+          discountTotal: orderDiscount,
+          extraCharges: extra,
+          grandTotal: totalAmount,
+          paidAmount,
+          dueAmount,
+        };
+      });
+
+      let nextJournals = prev.journalEntries;
+      let nextAccounts = prev.accounts;
+      if (!ord.isOpening) {
+        const arAcc = prev.accounts.find((a) => a.code === '1100');
+        const revAcc = prev.accounts.find((a) => a.code === '4010');
+        const existingSales = prev.journalEntries.find(
+          (j) =>
+            j.category === 'Sales' &&
+            (j.reference === orderId || (ord.invoiceId && j.reference === ord.invoiceId))
+        );
+        nextJournals = prev.journalEntries.filter(
+          (j) =>
+            !(
+              (j.category === 'Sales' || j.category === 'Collection') &&
+              (j.reference === orderId || (ord.invoiceId && j.reference === ord.invoiceId))
+            )
+        );
+        const jeLines: JournalLine[] = [];
+        for (const sp of normalizedSplits) {
+          if (sp.amount > 0) {
+            jeLines.push({
+              accountCode: sp.accountCode,
+              accountName: sp.accountName || sp.accountCode,
+              debit: sp.amount,
+              credit: 0,
+            });
+          }
+        }
+        if (dueAmount > 0 && arAcc) {
+          jeLines.push({
+            accountCode: arAcc.code,
+            accountName: arAcc.name,
+            debit: dueAmount,
+            credit: 0,
+          });
+        }
+        if (revAcc && totalAmount > 0) {
+          jeLines.push({
+            accountCode: revAcc.code,
+            accountName: revAcc.name,
+            debit: 0,
+            credit: totalAmount,
+          });
+        }
+        if (jeLines.length >= 2 && totalAmount > 0) {
+          const splitDesc =
+            normalizedSplits.length > 0
+              ? ` · Paid via ${normalizedSplits.map((s) => `${s.accountName} ${s.amount}`).join(' + ')}`
+              : '';
+          const rebuiltJe = buildJournalEntry({
+            id: existingSales?.id || `JE-${1001 + prev.journalEntries.length}`,
+            date: invoiceIssuedIso,
+            reference: orderId,
+            description: `Retail order ${orderId} (${newCust.name})${splitDesc} [Customized]`,
+            category: 'Sales',
+            createdBy: activeUserName,
+            lines: jeLines,
+          });
+          nextJournals = [rebuiltJe, ...nextJournals];
+        }
+        nextAccounts = recalculateAccountBalancesFromJournals(prev.accounts, nextJournals);
+      }
+
+      const nextTasks = prev.tasks.map((t) =>
+        t.autoGenerated && t.linkedRecordId === orderId
+          ? {
+              ...t,
+              title: `Deliver ${orderId} (${newCust.name} — ${del?.name || ord.deliveryOptionName})`,
+              description: cleanLines
+                .map((l) => `${l.quantityOrdered}x ${l.productName} (${l.serviceName})`)
+                .join(', '),
+              dueAt: expectedDeliveryIso,
+              status: updated.stage === 'Delivered' ? ('Completed' as const) : t.status,
+            }
+          : t
+      );
+
+      const bb = createBlackBoxEvent(prev.blackBox, {
+        user: activeUserName,
+        role: currentUserRole,
+        action: 'ORDER_CUSTOMIZED_BY_OWNER',
+        module: 'Orders',
+        recordId: orderId,
+        summary: `Owner customized order ${orderId} (${newCust.name}: ${prev.settings.currencySymbol} ${totalAmount}, Paid ${paidAmount})`,
+        beforeValue: ord,
+        afterValue: nextOrder,
+      });
+
+      return {
+        ...prev,
+        orders: prev.orders.map((o) => (o.id === orderId ? nextOrder : o)),
+        customers: nextCustomers,
+        invoices: nextInvoices,
+        journalEntries: nextJournals,
+        accounts: nextAccounts,
+        tasks: nextTasks,
+        blackBox: [bb, ...prev.blackBox],
+      };
+    });
+    showToast(`Order ${orderId} updated by Owner`);
+  };
+
+  const handleOwnerDeleteOrder = (orderId: string) => {
+    if (!requireAction(currentUser?.role === 'Owner', 'force-delete orders (Owner only)')) return;
+    commitState((prev) => {
+      const ord = prev.orders.find((o) => o.id === orderId);
+      if (!ord) return prev;
+
+      const oldDue = ord.isOpening
+        ? 0
+        : Math.max(0, Number((ord.totalAmount - ord.paidAmount).toFixed(2)));
+      const nextCustomers = prev.customers.map((c) =>
+        c.id === ord.customerId
+          ? { ...c, outstandingBalance: Math.max(0, Number((c.outstandingBalance - oldDue).toFixed(2))) }
+          : c
+      );
+      const nextInvoices = prev.invoices.filter(
+        (inv) => inv.id !== ord.invoiceId && inv.orderId !== orderId
+      );
+      const nextJournals = prev.journalEntries.filter(
+        (j) => !(j.reference === orderId || (ord.invoiceId && j.reference === ord.invoiceId))
+      );
+      const nextAccounts = recalculateAccountBalancesFromJournals(prev.accounts, nextJournals);
+
+      const bb = createBlackBoxEvent(prev.blackBox, {
+        user: activeUserName,
+        role: currentUserRole,
+        action: 'ORDER_DELETED_BY_OWNER',
+        module: 'Orders',
+        recordId: orderId,
+        summary: `Owner permanently deleted order ${orderId} (${ord.customerName}) and cleaned linked invoice & journals`,
+        beforeValue: ord,
+      });
+
+      return {
+        ...prev,
+        orders: prev.orders.filter((o) => o.id !== orderId),
+        customers: nextCustomers,
+        invoices: nextInvoices,
+        journalEntries: nextJournals,
+        accounts: nextAccounts,
+        tasks: prev.tasks.filter((t) => !(t.autoGenerated && t.linkedRecordId === orderId)),
+        blackBox: [bb, ...prev.blackBox],
+      };
+    });
+    showToast(`Order ${orderId} & linked records deleted`);
+  };
+
+  const handleOwnerUpdateCustomer = (
+    customerId: string,
+    patch: {
+      name: string;
+      phone: string;
+      altPhone?: string;
+      address: string;
+      categoryId: string;
+      notes: string;
+      outstandingBalance?: number;
+      advanceBalance?: number;
+      adjustmentDate?: string;
+      adjustmentOffsetCode?: string;
+      reason?: string;
+    }
+  ) => {
+    if (!requireAction(currentUser?.role === 'Owner', 'customize retail customer & balances')) return;
+    commitState((prev) => {
+      const target = prev.customers.find((c) => c.id === customerId);
+      if (!target) return prev;
+
+      const newOut =
+        patch.outstandingBalance !== undefined
+          ? Math.max(0, Number(patch.outstandingBalance.toFixed(2)))
+          : target.outstandingBalance;
+      const newAdv =
+        patch.advanceBalance !== undefined
+          ? Math.max(0, Number(patch.advanceBalance.toFixed(2)))
+          : target.advanceBalance;
+      const outDelta = Number((newOut - target.outstandingBalance).toFixed(2));
+      const advDelta = Number((newAdv - target.advanceBalance).toFixed(2));
+
+      let nextJournals = prev.journalEntries;
+      let nextAccounts = prev.accounts;
+      const adjDate = patch.adjustmentDate
+        ? dateInputToIso(patch.adjustmentDate)
+        : new Date().toISOString();
+      const offsetAcc =
+        prev.accounts.find((a) => a.code === (patch.adjustmentOffsetCode || '3040')) ||
+        prev.accounts.find((a) => a.code === '3040') ||
+        prev.accounts.find((a) => a.code === '3010');
+
+      if (Math.abs(outDelta) >= 0.01 && offsetAcc) {
+        const arAcc = prev.accounts.find((a) => a.code === '1100');
+        if (arAcc) {
+          const abs = Math.abs(outDelta);
+          const je = buildJournalEntry({
+            id: `JE-ADJ-${1001 + nextJournals.length}`,
+            date: adjDate,
+            reference: target.id,
+            description: `Owner customer due adjustment (${patch.name}): ${patch.reason || 'Balance adjustment'}`,
+            category: 'Sudden Adjustment',
+            createdBy: activeUserName,
+            lines:
+              outDelta > 0
+                ? [
+                    { accountCode: arAcc.code, accountName: arAcc.name, debit: abs, credit: 0 },
+                    { accountCode: offsetAcc.code, accountName: offsetAcc.name, debit: 0, credit: abs },
+                  ]
+                : [
+                    { accountCode: offsetAcc.code, accountName: offsetAcc.name, debit: abs, credit: 0 },
+                    { accountCode: arAcc.code, accountName: arAcc.name, debit: 0, credit: abs },
+                  ],
+          });
+          nextJournals = [je, ...nextJournals];
+        }
+      }
+
+      if (Math.abs(advDelta) >= 0.01 && offsetAcc) {
+        const advAcc = prev.accounts.find((a) => a.code === '2100');
+        if (advAcc) {
+          const abs = Math.abs(advDelta);
+          const je = buildJournalEntry({
+            id: `JE-ADJ-${1001 + nextJournals.length}`,
+            date: adjDate,
+            reference: target.id,
+            description: `Owner customer advance adjustment (${patch.name}): ${patch.reason || 'Balance adjustment'}`,
+            category: 'Sudden Adjustment',
+            createdBy: activeUserName,
+            lines:
+              advDelta > 0
+                ? [
+                    { accountCode: offsetAcc.code, accountName: offsetAcc.name, debit: abs, credit: 0 },
+                    { accountCode: advAcc.code, accountName: advAcc.name, debit: 0, credit: abs },
+                  ]
+                : [
+                    { accountCode: advAcc.code, accountName: advAcc.name, debit: abs, credit: 0 },
+                    { accountCode: offsetAcc.code, accountName: offsetAcc.name, debit: 0, credit: abs },
+                  ],
+          });
+          nextJournals = [je, ...nextJournals];
+        }
+      }
+
+      if (nextJournals !== prev.journalEntries) {
+        nextAccounts = recalculateAccountBalancesFromJournals(prev.accounts, nextJournals);
+      }
+
+      const nextCustomers = prev.customers.map((c) =>
+        c.id === customerId
+          ? {
+              ...c,
+              name: patch.name.trim() || c.name,
+              phone: patch.phone.trim(),
+              altPhone: patch.altPhone?.trim() || undefined,
+              address: patch.address.trim(),
+              categoryId: patch.categoryId || c.categoryId,
+              notes: patch.notes.trim(),
+              outstandingBalance: newOut,
+              advanceBalance: newAdv,
+            }
+          : c
+      );
+
+      const bb = createBlackBoxEvent(prev.blackBox, {
+        user: activeUserName,
+        role: currentUserRole,
+        action: 'CUSTOMER_CUSTOMIZED_BY_OWNER',
+        module: 'Customers',
+        recordId: customerId,
+        summary: `Owner updated customer ${patch.name} (${customerId})`,
+        beforeValue: target,
+        afterValue: { ...patch, newOut, newAdv },
+      });
+
+      return {
+        ...prev,
+        customers: nextCustomers,
+        journalEntries: nextJournals,
+        accounts: nextAccounts,
+        blackBox: [bb, ...prev.blackBox],
+      };
+    });
+    showToast('Customer record & balance updated');
+  };
+
+  const handleOwnerUpdateCorporateProfile = (
+    corpId: string,
+    patch: {
+      name: string;
+      contactPerson: string;
+      phone: string;
+      address: string;
+      billingBasis: BillingBasis;
+      billingCycle: BillingCycle;
+      cutoffDayOrTime: string;
+      discountPct: number;
+      notes: string;
+      outstandingBalance?: number;
+      adjustmentDate?: string;
+      adjustmentOffsetCode?: string;
+      reason?: string;
+    }
+  ) => {
+    if (!requireAction(currentUser?.role === 'Owner', 'customize corporate accounts & balances')) return;
+    commitState((prev) => {
+      const target = prev.corporateCustomers.find((c) => c.id === corpId);
+      if (!target) return prev;
+
+      const newOut =
+        patch.outstandingBalance !== undefined
+          ? Math.max(0, Number(patch.outstandingBalance.toFixed(2)))
+          : target.outstandingBalance;
+      const outDelta = Number((newOut - target.outstandingBalance).toFixed(2));
+
+      let nextJournals = prev.journalEntries;
+      let nextAccounts = prev.accounts;
+      if (Math.abs(outDelta) >= 0.01) {
+        const arAcc = prev.accounts.find((a) => a.code === '1110');
+        const offsetAcc =
+          prev.accounts.find((a) => a.code === (patch.adjustmentOffsetCode || '3040')) ||
+          prev.accounts.find((a) => a.code === '3040') ||
+          prev.accounts.find((a) => a.code === '3010');
+        if (arAcc && offsetAcc) {
+          const abs = Math.abs(outDelta);
+          const je = buildJournalEntry({
+            id: `JE-ADJ-${1001 + nextJournals.length}`,
+            date: patch.adjustmentDate
+              ? dateInputToIso(patch.adjustmentDate)
+              : new Date().toISOString(),
+            reference: corpId,
+            description: `Owner corporate due adjustment (${patch.name}): ${patch.reason || 'Balance adjustment'}`,
+            category: 'Sudden Adjustment',
+            createdBy: activeUserName,
+            lines:
+              outDelta > 0
+                ? [
+                    { accountCode: arAcc.code, accountName: arAcc.name, debit: abs, credit: 0 },
+                    { accountCode: offsetAcc.code, accountName: offsetAcc.name, debit: 0, credit: abs },
+                  ]
+                : [
+                    { accountCode: offsetAcc.code, accountName: offsetAcc.name, debit: abs, credit: 0 },
+                    { accountCode: arAcc.code, accountName: arAcc.name, debit: 0, credit: abs },
+                  ],
+          });
+          nextJournals = [je, ...nextJournals];
+          nextAccounts = recalculateAccountBalancesFromJournals(prev.accounts, nextJournals);
+        }
+      }
+
+      const nextCorps = prev.corporateCustomers.map((c) =>
+        c.id === corpId
+          ? {
+              ...c,
+              name: patch.name.trim() || c.name,
+              contactPerson: patch.contactPerson.trim(),
+              phone: patch.phone.trim(),
+              address: patch.address.trim(),
+              billingBasis: patch.billingBasis,
+              billingCycle: patch.billingCycle,
+              cutoffDayOrTime: patch.cutoffDayOrTime.trim(),
+              discountPct: Math.max(0, Math.min(100, Number(patch.discountPct) || 0)),
+              notes: patch.notes.trim(),
+              outstandingBalance: newOut,
+            }
+          : c
+      );
+
+      const bb = createBlackBoxEvent(prev.blackBox, {
+        user: activeUserName,
+        role: currentUserRole,
+        action: 'CORPORATE_CUSTOMIZED_BY_OWNER',
+        module: 'Corporate',
+        recordId: corpId,
+        summary: `Owner updated corporate account ${patch.name} (${corpId})`,
+        beforeValue: target,
+        afterValue: { ...patch, newOut },
+      });
+
+      return {
+        ...prev,
+        corporateCustomers: nextCorps,
+        journalEntries: nextJournals,
+        accounts: nextAccounts,
+        blackBox: [bb, ...prev.blackBox],
+      };
+    });
+    showToast('Corporate account customized');
+  };
+
+  const handleOwnerCustomizeCorporateMovement = (
+    movId: string,
+    updated: {
+      date: string;
+      orderId?: string;
+      event: CorporateMovementType;
+      productId: string;
+      serviceId: string;
+      qty: number;
+      unitPriceSnapshot: number;
+      reason?: string;
+    }
+  ) => {
+    if (!requireAction(currentUser?.role === 'Owner', 'customize corporate movements')) return;
+    commitState((prev) => {
+      const target = prev.corporateMovements.find((m) => m.id === movId);
+      if (!target) return prev;
+      const corp = prev.corporateCustomers.find((c) => c.id === target.corporateId);
+      const prod = corp?.products.find((p) => p.id === updated.productId);
+      const srv = corp?.services.find((s) => s.id === updated.serviceId);
+
+      const qtyAbs = Math.max(0, Number(updated.qty) || 0);
+      const isInbound = updated.event === 'Received' || updated.event === 'Adjustment';
+      const isNeutral = updated.event === 'Rewash';
+      const qtyDelta = isNeutral ? 0 : isInbound ? qtyAbs : -qtyAbs;
+
+      const mapped = prev.corporateMovements.map((m) =>
+        m.id === movId
+          ? {
+              ...m,
+              date: updated.date,
+              orderId: updated.orderId?.trim() || m.orderId,
+              event: updated.event,
+              productId: updated.productId,
+              productName: prod?.name || m.productName,
+              serviceId: updated.serviceId,
+              serviceName: srv?.name || m.serviceName,
+              qtyDelta,
+              unitPriceSnapshot: Math.max(0, Number(updated.unitPriceSnapshot) || 0),
+              billedQty: Math.min(m.billedQty, Math.abs(qtyDelta)),
+              reason: updated.reason,
+            }
+          : m
+      );
+      const nextMovements = recomputeCorporateMovementsPending(mapped);
+
+      const bb = createBlackBoxEvent(prev.blackBox, {
+        user: activeUserName,
+        role: currentUserRole,
+        action: 'CORP_MOVEMENT_CUSTOMIZED_BY_OWNER',
+        module: 'Corporate',
+        recordId: movId,
+        summary: `Owner customized corporate movement ${movId} (${updated.event} ${qtyAbs})`,
+        beforeValue: target,
+      });
+
+      return {
+        ...prev,
+        corporateMovements: nextMovements,
+        blackBox: [bb, ...prev.blackBox],
+      };
+    });
+    showToast('Corporate movement updated');
+  };
+
+  const handleOwnerDeleteCorporateMovement = (movId: string) => {
+    if (!requireAction(currentUser?.role === 'Owner', 'delete corporate movements')) return;
+    commitState((prev) => {
+      const target = prev.corporateMovements.find((m) => m.id === movId);
+      if (!target) return prev;
+      const nextMovements = recomputeCorporateMovementsPending(
+        prev.corporateMovements.filter((m) => m.id !== movId)
+      );
+      const bb = createBlackBoxEvent(prev.blackBox, {
+        user: activeUserName,
+        role: currentUserRole,
+        action: 'CORP_MOVEMENT_DELETED_BY_OWNER',
+        module: 'Corporate',
+        recordId: movId,
+        summary: `Owner deleted corporate movement ${movId} (${target.event} ${Math.abs(target.qtyDelta)} ${target.productName})`,
+        beforeValue: target,
+      });
+      return {
+        ...prev,
+        corporateMovements: nextMovements,
+        blackBox: [bb, ...prev.blackBox],
+      };
+    });
+    showToast('Corporate movement deleted');
+  };
+
+  const handleOwnerCreateCustomInvoice = (params: {
+    isCorporate: boolean;
+    customerId: string;
+    issuedAt: string;
+    dueDate: string;
+    periodCovered?: string;
+    paymentTerms: string;
+    termsAndConditions: string;
+    lines: InvoiceLineSnapshot[];
+    discountTotal: number;
+    extraCharges: number;
+    paidAmount: number;
+    paymentAccountCode?: string;
+    customInvoiceId?: string;
+  }) => {
+    if (!requireAction(currentUser?.role === 'Owner', 'create custom invoices (Owner only)')) return;
+    commitState((prev) => {
+      const cust = params.isCorporate
+        ? prev.corporateCustomers.find((c) => c.id === params.customerId)
+        : prev.customers.find((c) => c.id === params.customerId);
+      if (!cust) return prev;
+
+      const idKey = params.isCorporate ? 'corporateInvoice' : 'retailInvoice';
+      const genInv = generateNextSmartId(prev, idKey);
+      const existingInv = getExistingIdsForType(prev, idKey);
+      const reqId = params.customInvoiceId?.trim();
+      const invoiceId = reqId && !existingInv.has(reqId.toLowerCase()) ? reqId : genInv.id;
+      const invRule = prev.idFormats?.[idKey] || DEFAULT_ID_FORMATS[idKey];
+      const nextInvCounter = Math.max(
+        invRule.nextNumber,
+        invoiceId === genInv.id ? genInv.nextCounter : invRule.nextNumber
+      );
+
+      const cleanLines = params.lines.map((l) => {
+        const qty = Math.max(0, Number(l.quantity) || 0);
+        const price = Math.max(0, Number(l.unitPrice) || 0);
+        const disc = Math.max(0, Number(l.discount) || 0);
+        return {
+          ...l,
+          quantity: qty,
+          unitPrice: price,
+          discount: disc,
+          total: Number(Math.max(0, qty * price - disc).toFixed(2)),
+        };
+      });
+      const subtotal = Number(cleanLines.reduce((s, l) => s + l.total, 0).toFixed(2));
+      const discountTotal = Math.max(0, Number(params.discountTotal) || 0);
+      const extraCharges = Math.max(0, Number(params.extraCharges) || 0);
+      const grandTotal = Math.max(0, Number((subtotal - discountTotal + extraCharges).toFixed(2)));
+      const paidAmount = Math.min(grandTotal, Math.max(0, Number(params.paidAmount) || 0));
+      const dueAmount = Number((grandTotal - paidAmount).toFixed(2));
+
+      const issuedAt = dateInputToIso(params.issuedAt);
+      const dueDate = dateInputToIso(params.dueDate, issuedAt);
+
+      const newInvoice: Invoice = {
+        id: invoiceId,
+        corporateId: params.isCorporate ? cust.id : undefined,
+        customerId: cust.id,
+        customerName: cust.name,
+        customerPhone: cust.phone,
+        customerAddress: cust.address,
+        isCorporate: params.isCorporate,
+        periodCovered: params.periodCovered,
+        issuedAt,
+        dueDate,
+        lines: cleanLines,
+        subtotal,
+        discountTotal,
+        extraCharges,
+        grandTotal,
+        paidAmount,
+        dueAmount,
+        paymentTerms: params.paymentTerms || (params.isCorporate ? 'Net 7 Days' : 'Due on Delivery'),
+        termsAndConditions: params.termsAndConditions || prev.settings.invoiceTerms,
+        reprintCount: 0,
+        logoSnapshotDataUrl: prev.settings.companyLogoDataUrl,
+        logoSizeSnapshot: prev.settings.companyLogoSize || 'Medium',
+        showBrandNameSnapshot: prev.settings.showBrandNameWithLogo ?? true,
+        companyNameSnapshot: prev.settings.companyName,
+        companyAddressSnapshot: prev.settings.companyAddress,
+        companyPhoneSnapshot: prev.settings.companyPhone,
+      };
+
+      let nextJournals = prev.journalEntries;
+      let nextAccounts = prev.accounts;
+      if (grandTotal > 0) {
+        const payAcc =
+          prev.accounts.find((a) => a.code === params.paymentAccountCode) ||
+          prev.accounts.find((a) => isMoneySourceAccount(a));
+        const arAcc = prev.accounts.find((a) => a.code === (params.isCorporate ? '1110' : '1100'));
+        const revAcc = prev.accounts.find((a) => a.code === (params.isCorporate ? '4020' : '4010'));
+        const jeLines: JournalLine[] = [];
+        if (paidAmount > 0 && payAcc) {
+          jeLines.push({
+            accountCode: payAcc.code,
+            accountName: payAcc.name,
+            debit: paidAmount,
+            credit: 0,
+          });
+        }
+        if (dueAmount > 0 && arAcc) {
+          jeLines.push({
+            accountCode: arAcc.code,
+            accountName: arAcc.name,
+            debit: dueAmount,
+            credit: 0,
+          });
+        }
+        if (revAcc) {
+          jeLines.push({
+            accountCode: revAcc.code,
+            accountName: revAcc.name,
+            debit: 0,
+            credit: grandTotal,
+          });
+        }
+        if (jeLines.length >= 2) {
+          const je = buildJournalEntry({
+            id: `JE-${1001 + prev.journalEntries.length}`,
+            date: issuedAt,
+            reference: invoiceId,
+            description: `Owner custom invoice ${invoiceId} (${cust.name})`,
+            category: 'Sales',
+            createdBy: activeUserName,
+            lines: jeLines,
+          });
+          nextJournals = [je, ...nextJournals];
+          nextAccounts = recalculateAccountBalancesFromJournals(prev.accounts, nextJournals);
+        }
+      }
+
+      const nextCustomers = params.isCorporate
+        ? prev.customers
+        : prev.customers.map((c) =>
+            c.id === cust.id
+              ? { ...c, outstandingBalance: Number((c.outstandingBalance + dueAmount).toFixed(2)) }
+              : c
+          );
+      const nextCorps = params.isCorporate
+        ? prev.corporateCustomers.map((c) =>
+            c.id === cust.id
+              ? { ...c, outstandingBalance: Number((c.outstandingBalance + dueAmount).toFixed(2)) }
+              : c
+          )
+        : prev.corporateCustomers;
+
+      const bb = createBlackBoxEvent(prev.blackBox, {
+        user: activeUserName,
+        role: currentUserRole,
+        action: 'CUSTOM_INVOICE_CREATED_BY_OWNER',
+        module: 'Documents',
+        recordId: invoiceId,
+        summary: `Owner created custom invoice ${invoiceId} for ${cust.name} (${prev.settings.currencySymbol} ${grandTotal})`,
+        afterValue: newInvoice,
+      });
+
+      return {
+        ...prev,
+        idFormats: {
+          ...DEFAULT_ID_FORMATS,
+          ...(prev.idFormats || {}),
+          [idKey]: { ...invRule, nextNumber: nextInvCounter },
+        },
+        invoices: [newInvoice, ...prev.invoices],
+        customers: nextCustomers,
+        corporateCustomers: nextCorps,
+        journalEntries: nextJournals,
+        accounts: nextAccounts,
+        blackBox: [bb, ...prev.blackBox],
+      };
+    });
+    showToast('Custom invoice created');
+  };
+
+  const handleOwnerCustomizeInvoice = (
+    invoiceId: string,
+    updated: {
+      issuedAt: string;
+      dueDate: string;
+      customerName: string;
+      customerPhone: string;
+      customerAddress: string;
+      periodCovered?: string;
+      paymentTerms: string;
+      termsAndConditions: string;
+      lines: InvoiceLineSnapshot[];
+      discountTotal: number;
+      extraCharges: number;
+      paidAmount: number;
+      paymentAccountCode?: string;
+    }
+  ) => {
+    if (!requireAction(currentUser?.role === 'Owner', 'customize invoices (Owner only)')) return;
+    commitState((prev) => {
+      const inv = prev.invoices.find((i) => i.id === invoiceId);
+      if (!inv) return prev;
+
+      const cleanLines = updated.lines.map((l) => {
+        const qty = Math.max(0, Number(l.quantity) || 0);
+        const price = Math.max(0, Number(l.unitPrice) || 0);
+        const disc = Math.max(0, Number(l.discount) || 0);
+        return {
+          ...l,
+          quantity: qty,
+          unitPrice: price,
+          discount: disc,
+          total: Number(Math.max(0, qty * price - disc).toFixed(2)),
+        };
+      });
+      const subtotal = Number(cleanLines.reduce((s, l) => s + l.total, 0).toFixed(2));
+      const discountTotal = Math.max(0, Number(updated.discountTotal) || 0);
+      const extraCharges = Math.max(0, Number(updated.extraCharges) || 0);
+      const grandTotal = Math.max(0, Number((subtotal - discountTotal + extraCharges).toFixed(2)));
+      const paidAmount = Math.min(grandTotal, Math.max(0, Number(updated.paidAmount) || 0));
+      const dueAmount = Number((grandTotal - paidAmount).toFixed(2));
+      const dueDelta = Number((dueAmount - inv.dueAmount).toFixed(2));
+
+      const issuedAtIso = updated.issuedAt || inv.issuedAt;
+      const dueDateIso = updated.dueDate || inv.dueDate;
+
+      const updatedInv: Invoice = {
+        ...inv,
+        issuedAt: issuedAtIso,
+        dueDate: dueDateIso,
+        customerName: updated.customerName.trim() || inv.customerName,
+        customerPhone: updated.customerPhone.trim(),
+        customerAddress: updated.customerAddress.trim(),
+        periodCovered: updated.periodCovered,
+        paymentTerms: updated.paymentTerms,
+        termsAndConditions: updated.termsAndConditions,
+        lines: cleanLines,
+        subtotal,
+        discountTotal,
+        extraCharges,
+        grandTotal,
+        paidAmount,
+        dueAmount,
+      };
+
+      const nextCustomers = !inv.isCorporate
+        ? prev.customers.map((c) =>
+            c.id === inv.customerId
+              ? { ...c, outstandingBalance: Math.max(0, Number((c.outstandingBalance + dueDelta).toFixed(2))) }
+              : c
+          )
+        : prev.customers;
+      const nextCorps = inv.isCorporate
+        ? prev.corporateCustomers.map((c) =>
+            c.id === (inv.corporateId || inv.customerId)
+              ? { ...c, outstandingBalance: Math.max(0, Number((c.outstandingBalance + dueDelta).toFixed(2))) }
+              : c
+          )
+        : prev.corporateCustomers;
+
+      const nextOrders = inv.orderId
+        ? prev.orders.map((o) =>
+            o.id === inv.orderId
+              ? {
+                  ...o,
+                  expectedDeliveryAt: dueDateIso,
+                  orderDiscount: discountTotal,
+                  additionalCharge: extraCharges,
+                  addAdditionalToOrder: extraCharges > 0,
+                  totalAmount: grandTotal,
+                  paidAmount,
+                }
+              : o
+          )
+        : prev.orders;
+
+      let nextJournals = prev.journalEntries;
+      let nextAccounts = prev.accounts;
+      if (!inv.isOpening) {
+        const refSet = new Set([inv.id, ...(inv.orderId ? [inv.orderId] : [])]);
+        const existingSales = prev.journalEntries.find(
+          (j) => j.category === 'Sales' && refSet.has(j.reference)
+        );
+        nextJournals = prev.journalEntries.filter(
+          (j) => !((j.category === 'Sales' || j.category === 'Collection') && refSet.has(j.reference))
+        );
+
+        if (grandTotal > 0) {
+          const payAcc =
+            prev.accounts.find((a) => a.code === updated.paymentAccountCode) ||
+            prev.accounts.find((a) => isMoneySourceAccount(a));
+          const arAcc = prev.accounts.find((a) => a.code === (inv.isCorporate ? '1110' : '1100'));
+          const revAcc = prev.accounts.find((a) => a.code === (inv.isCorporate ? '4020' : '4010'));
+          const jeLines: JournalLine[] = [];
+          if (paidAmount > 0 && payAcc) {
+            jeLines.push({
+              accountCode: payAcc.code,
+              accountName: payAcc.name,
+              debit: paidAmount,
+              credit: 0,
+            });
+          }
+          if (dueAmount > 0 && arAcc) {
+            jeLines.push({
+              accountCode: arAcc.code,
+              accountName: arAcc.name,
+              debit: dueAmount,
+              credit: 0,
+            });
+          }
+          if (revAcc) {
+            jeLines.push({
+              accountCode: revAcc.code,
+              accountName: revAcc.name,
+              debit: 0,
+              credit: grandTotal,
+            });
+          }
+          if (jeLines.length >= 2) {
+            const je = buildJournalEntry({
+              id: existingSales?.id || `JE-${1001 + prev.journalEntries.length}`,
+              date: issuedAtIso,
+              reference: existingSales?.reference || inv.id,
+              description: `${inv.isCorporate ? 'Corporate' : 'Retail'} invoice ${inv.id} (${updatedInv.customerName}) [Customized]`,
+              category: 'Sales',
+              createdBy: activeUserName,
+              lines: jeLines,
+            });
+            nextJournals = [je, ...nextJournals];
+          }
+        }
+        nextAccounts = recalculateAccountBalancesFromJournals(prev.accounts, nextJournals);
+      }
+
+      const bb = createBlackBoxEvent(prev.blackBox, {
+        user: activeUserName,
+        role: currentUserRole,
+        action: 'INVOICE_CUSTOMIZED_BY_OWNER',
+        module: 'Documents',
+        recordId: invoiceId,
+        summary: `Owner customized invoice ${invoiceId} (Date: ${issuedAtIso.slice(0, 10)}, Total: ${prev.settings.currencySymbol} ${grandTotal}, Paid: ${paidAmount})`,
+        beforeValue: inv,
+        afterValue: updatedInv,
+      });
+
+      return {
+        ...prev,
+        invoices: prev.invoices.map((i) => (i.id === invoiceId ? updatedInv : i)),
+        orders: nextOrders,
+        customers: nextCustomers,
+        corporateCustomers: nextCorps,
+        journalEntries: nextJournals,
+        accounts: nextAccounts,
+        blackBox: [bb, ...prev.blackBox],
+      };
+    });
+    showToast(`Invoice ${invoiceId} customized`);
+  };
+
+  const handleOwnerDeleteInvoice = (invoiceId: string) => {
+    if (!requireAction(currentUser?.role === 'Owner', 'delete invoices (Owner only)')) return;
+    commitState((prev) => {
+      const inv = prev.invoices.find((i) => i.id === invoiceId);
+      if (!inv) return prev;
+
+      const nextCustomers = !inv.isCorporate
+        ? prev.customers.map((c) =>
+            c.id === inv.customerId
+              ? { ...c, outstandingBalance: Math.max(0, Number((c.outstandingBalance - inv.dueAmount).toFixed(2))) }
+              : c
+          )
+        : prev.customers;
+      const nextCorps = inv.isCorporate
+        ? prev.corporateCustomers.map((c) =>
+            c.id === (inv.corporateId || inv.customerId)
+              ? { ...c, outstandingBalance: Math.max(0, Number((c.outstandingBalance - inv.dueAmount).toFixed(2))) }
+              : c
+          )
+        : prev.corporateCustomers;
+
+      const nextMovements = inv.isCorporate
+        ? prev.corporateMovements.map((m) =>
+            m.invoiceId === invoiceId ? { ...m, billedQty: 0, invoiceId: undefined } : m
+          )
+        : prev.corporateMovements;
+
+      const nextOrders = inv.orderId
+        ? prev.orders.map((o) =>
+            o.id === inv.orderId ? { ...o, invoiceId: undefined, paidAmount: 0, paymentSplits: undefined } : o
+          )
+        : prev.orders;
+
+      const refSet = new Set([invoiceId, ...(inv.orderId ? [inv.orderId] : [])]);
+      const nextJournals = prev.journalEntries.filter(
+        (j) => !((j.category === 'Sales' || j.category === 'Collection') && refSet.has(j.reference))
+      );
+      const nextAccounts = recalculateAccountBalancesFromJournals(prev.accounts, nextJournals);
+
+      const bb = createBlackBoxEvent(prev.blackBox, {
+        user: activeUserName,
+        role: currentUserRole,
+        action: 'INVOICE_DELETED_BY_OWNER',
+        module: 'Documents',
+        recordId: invoiceId,
+        summary: `Owner deleted invoice ${invoiceId} (${inv.customerName}) and reversed its ledger impact`,
+        beforeValue: inv,
+      });
+
+      return {
+        ...prev,
+        invoices: prev.invoices.filter((i) => i.id !== invoiceId),
+        customers: nextCustomers,
+        corporateCustomers: nextCorps,
+        corporateMovements: nextMovements,
+        orders: nextOrders,
+        journalEntries: nextJournals,
+        accounts: nextAccounts,
+        blackBox: [bb, ...prev.blackBox],
+      };
+    });
+    showToast(`Invoice ${invoiceId} deleted`);
+  };
+
+  const handleOwnerCustomizeJournal = (
+    entryId: string,
+    updated: {
+      date: string;
+      reference: string;
+      description: string;
+      category: JournalEntry['category'];
+      lines: JournalLine[];
+    }
+  ) => {
+    if (!requireAction(currentUser?.role === 'Owner', 'customize journal entries (Owner only)')) return;
+    const totalDebit = Number(updated.lines.reduce((s, l) => s + Number(l.debit || 0), 0).toFixed(2));
+    const totalCredit = Number(updated.lines.reduce((s, l) => s + Number(l.credit || 0), 0).toFixed(2));
+    if (updated.lines.length < 2 || Math.abs(totalDebit - totalCredit) > 0.01) {
+      showToast(`Journal must balance (Debit ${totalDebit} != Credit ${totalCredit})`);
+      return;
+    }
+    commitState((prev) => {
+      const target = prev.journalEntries.find((j) => j.id === entryId);
+      if (!target) return prev;
+      const cleanLines = updated.lines.map((l) => {
+        const acc = prev.accounts.find((a) => a.code === l.accountCode);
+        return {
+          accountCode: l.accountCode,
+          accountName: acc?.name || l.accountName,
+          debit: Number(Math.max(0, Number(l.debit) || 0).toFixed(2)),
+          credit: Number(Math.max(0, Number(l.credit) || 0).toFixed(2)),
+        };
+      });
+      const edited: JournalEntry = {
+        ...target,
+        date: updated.date,
+        reference: updated.reference.trim(),
+        description: updated.description.trim(),
+        category: updated.category,
+        lines: cleanLines,
+      };
+      const nextJournals = prev.journalEntries.map((j) => (j.id === entryId ? edited : j));
+      const nextAccounts = recalculateAccountBalancesFromJournals(prev.accounts, nextJournals);
+
+      const bb = createBlackBoxEvent(prev.blackBox, {
+        user: activeUserName,
+        role: currentUserRole,
+        action: 'JOURNAL_CUSTOMIZED_BY_OWNER',
+        module: 'Accounting',
+        recordId: entryId,
+        summary: `Owner customized journal ${entryId} (${edited.category} · ${edited.date.slice(0, 10)})`,
+        beforeValue: target,
+        afterValue: edited,
+      });
+
+      return {
+        ...prev,
+        journalEntries: nextJournals,
+        accounts: nextAccounts,
+        blackBox: [bb, ...prev.blackBox],
+      };
+    });
+    showToast(`Journal entry ${entryId} updated`);
+  };
+
+  const handleOwnerDeleteJournal = (entryId: string) => {
+    if (!requireAction(currentUser?.role === 'Owner', 'delete journal entries (Owner only)')) return;
+    commitState((prev) => {
+      const target = prev.journalEntries.find((j) => j.id === entryId);
+      if (!target) return prev;
+      const nextJournals = prev.journalEntries
+        .filter((j) => j.id !== entryId)
+        .map((j) => (j.reversedByEntryId === entryId ? { ...j, reversedByEntryId: undefined } : j));
+      const nextAccounts = recalculateAccountBalancesFromJournals(prev.accounts, nextJournals);
+
+      const bb = createBlackBoxEvent(prev.blackBox, {
+        user: activeUserName,
+        role: currentUserRole,
+        action: 'JOURNAL_DELETED_BY_OWNER',
+        module: 'Accounting',
+        recordId: entryId,
+        summary: `Owner deleted journal ${entryId}: ${target.description}`,
+        beforeValue: target,
+      });
+
+      return {
+        ...prev,
+        journalEntries: nextJournals,
+        accounts: nextAccounts,
+        blackBox: [bb, ...prev.blackBox],
+      };
+    });
+    showToast(`Journal ${entryId} deleted`);
+  };
+
+  const handleOwnerAdjustAccountBalance = (params: {
+    accountCode: string;
+    targetBalance: number;
+    offsetAccountCode: string;
+    date: string;
+    reason: string;
+  }) => {
+    if (!requireAction(currentUser?.role === 'Owner', 'adjust ledger account balances')) return;
+    commitState((prev) => {
+      const acc = prev.accounts.find((a) => a.code === params.accountCode);
+      const offsetAcc = prev.accounts.find((a) => a.code === params.offsetAccountCode);
+      if (!acc || !offsetAcc || acc.code === offsetAcc.code) return prev;
+      const delta = Number((params.targetBalance - acc.balance).toFixed(2));
+      if (Math.abs(delta) < 0.01) return prev;
+
+      const abs = Math.abs(delta);
+      const debitNormal = isDebitNormal(acc.type);
+      const accGetsDebit = debitNormal ? delta > 0 : delta < 0;
+
+      const je = buildJournalEntry({
+        id: `JE-ADJ-${1001 + prev.journalEntries.length}`,
+        date: dateInputToIso(params.date),
+        reference: `BAL-${acc.code}`,
+        description: `Owner Balance Adjustment (${acc.name}): ${params.reason || 'Balance set'}`,
+        category: 'Sudden Adjustment',
+        createdBy: activeUserName,
+        lines: accGetsDebit
+          ? [
+              { accountCode: acc.code, accountName: acc.name, debit: abs, credit: 0 },
+              { accountCode: offsetAcc.code, accountName: offsetAcc.name, debit: 0, credit: abs },
+            ]
+          : [
+              { accountCode: offsetAcc.code, accountName: offsetAcc.name, debit: abs, credit: 0 },
+              { accountCode: acc.code, accountName: acc.name, debit: 0, credit: abs },
+            ],
+      });
+
+      const nextJournals = [je, ...prev.journalEntries];
+      const nextAccounts = recalculateAccountBalancesFromJournals(prev.accounts, nextJournals);
+
+      const bb = createBlackBoxEvent(prev.blackBox, {
+        user: activeUserName,
+        role: currentUserRole,
+        action: 'ACCOUNT_BALANCE_ADJUSTED_BY_OWNER',
+        module: 'Accounting',
+        recordId: acc.code,
+        summary: `Owner set ${acc.code} (${acc.name}) balance to ${prev.settings.currencySymbol} ${params.targetBalance} (Δ ${delta >= 0 ? '+' : ''}${delta})`,
+        beforeValue: { balance: acc.balance },
+        afterValue: { balance: params.targetBalance, journalId: je.id },
+      });
+
+      return {
+        ...prev,
+        accounts: nextAccounts,
+        journalEntries: nextJournals,
+        blackBox: [bb, ...prev.blackBox],
+      };
+    });
+    showToast('Account balance adjusted');
+  };
+
+  const handleOwnerUpdateAccount = (
+    accountCode: string,
+    patch: {
+      name: string;
+      channel?: MoneySourceChannel;
+      walletType?: string;
+      cashOutChargePercent?: number;
+      cashOutChargeFlat?: number;
+      active?: boolean;
+    }
+  ) => {
+    if (!requireAction(currentUser?.role === 'Owner', 'customize accounts (Owner only)')) return;
+    commitState((prev) => {
+      const target = prev.accounts.find((a) => a.code === accountCode);
+      if (!target) return prev;
+      const nextName = patch.name.trim() || target.name;
+      const nextAccounts = prev.accounts.map((a) =>
+        a.code === accountCode
+          ? {
+              ...a,
+              name: nextName,
+              channel: patch.channel !== undefined ? patch.channel : a.channel,
+              walletType: patch.walletType !== undefined ? patch.walletType : a.walletType,
+              cashOutChargePercent:
+                patch.cashOutChargePercent !== undefined
+                  ? Math.max(0, Number(patch.cashOutChargePercent) || 0)
+                  : a.cashOutChargePercent,
+              cashOutChargeFlat:
+                patch.cashOutChargeFlat !== undefined
+                  ? Math.max(0, Number(patch.cashOutChargeFlat) || 0)
+                  : a.cashOutChargeFlat,
+              active: patch.active !== undefined ? patch.active : a.active,
+            }
+          : a
+      );
+      const nextJournals = prev.journalEntries.map((j) => ({
+        ...j,
+        lines: j.lines.map((l) =>
+          l.accountCode === accountCode ? { ...l, accountName: nextName } : l
+        ),
+      }));
+      return {
+        ...prev,
+        accounts: nextAccounts,
+        journalEntries: nextJournals,
+      };
+    });
+    showToast(`Account ${accountCode} updated`);
+  };
+
+  const handleOwnerCustomizeExpense = (
+    expId: string,
+    updated: {
+      date: string;
+      category: string;
+      amount: number;
+      paymentAccountCode: string;
+      description: string;
+      reference: string;
+      recurring: boolean;
+      recurrenceCycle?: 'Weekly' | 'Monthly';
+    }
+  ) => {
+    if (!requireAction(currentUser?.role === 'Owner', 'customize expense entries (Owner only)')) return;
+    commitState((prev) => {
+      const oldExp = prev.expenses.find((e) => e.id === expId);
+      if (!oldExp) return prev;
+      const payAcc = prev.accounts.find((a) => a.code === updated.paymentAccountCode);
+      const expCode =
+        updated.category === 'Electricity' ||
+        updated.category === 'Water' ||
+        updated.category === 'Gas' ||
+        updated.category === 'Rent' ||
+        updated.category === 'Internet'
+          ? '5030'
+          : updated.category === 'Maintenance' || updated.category === 'Transport'
+          ? '5040'
+          : '5050';
+      const expAcc = prev.accounts.find((a) => a.code === expCode);
+      if (!payAcc || !expAcc) return prev;
+
+      const dateIso = dateInputToIso(updated.date);
+      const baseMs = new Date(dateIso).getTime();
+      const nextDueDate = updated.recurring
+        ? new Date(
+            (Number.isNaN(baseMs) ? Date.now() : baseMs) +
+              (updated.recurrenceCycle === 'Weekly' ? 7 : 30) * 86400000
+          ).toISOString()
+        : undefined;
+
+      const amt = Math.max(0, Number(updated.amount) || 0);
+      const nextExp: ExpenseRecord = {
+        ...oldExp,
+        date: dateIso,
+        category: updated.category,
+        amount: amt,
+        paymentAccountCode: updated.paymentAccountCode,
+        description: updated.description,
+        reference: updated.reference,
+        recurring: updated.recurring,
+        recurrenceCycle: updated.recurrenceCycle,
+        nextDueDate,
+      };
+
+      const matchJournal = (j: JournalEntry) =>
+        j.reference === expId ||
+        (j.category === 'Expense' &&
+          j.date === oldExp.date &&
+          j.description.includes(oldExp.description));
+
+      const existingJe = prev.journalEntries.find(matchJournal);
+      let nextJournals = prev.journalEntries.filter((j) => !matchJournal(j));
+      if (amt > 0) {
+        const rebuiltJe = buildJournalEntry({
+          id: existingJe?.id || `JE-${1001 + prev.journalEntries.length}`,
+          date: dateIso,
+          reference: expId,
+          description: `Expense (${updated.category}): ${updated.description} [${updated.reference}]`,
+          category: 'Expense',
+          createdBy: activeUserName,
+          lines: [
+            { accountCode: expAcc.code, accountName: expAcc.name, debit: amt, credit: 0 },
+            { accountCode: payAcc.code, accountName: payAcc.name, debit: 0, credit: amt },
+          ],
+        });
+        nextJournals = [rebuiltJe, ...nextJournals];
+      }
+      const nextAccounts = recalculateAccountBalancesFromJournals(prev.accounts, nextJournals);
+
+      let nextTasks = prev.tasks.filter((t) => !(t.autoGenerated && t.linkedRecordId === expId));
+      if (updated.recurring && nextDueDate) {
+        nextTasks = [
+          {
+            id: `TSK-${101 + prev.tasks.length}`,
+            title: `Recurring ${updated.category} Expense Due`,
+            description: updated.description,
+            category: 'Expense Due',
+            priority: 'Normal',
+            status: 'Pending',
+            dueAt: nextDueDate,
+            reminderMinutesBefore: 1440,
+            linkedRecordId: expId,
+            assignee: 'Owner',
+            autoGenerated: true,
+          },
+          ...nextTasks,
+        ];
+      }
+
+      const bb = createBlackBoxEvent(prev.blackBox, {
+        user: activeUserName,
+        role: currentUserRole,
+        action: 'EXPENSE_CUSTOMIZED_BY_OWNER',
+        module: 'Expenses',
+        recordId: expId,
+        summary: `Owner customized expense ${expId} (${updated.category}: ${prev.settings.currencySymbol} ${amt})`,
+        beforeValue: oldExp,
+        afterValue: nextExp,
+      });
+
+      return {
+        ...prev,
+        expenses: prev.expenses.map((e) => (e.id === expId ? nextExp : e)),
+        journalEntries: nextJournals,
+        accounts: nextAccounts,
+        tasks: nextTasks,
+        blackBox: [bb, ...prev.blackBox],
+      };
+    });
+    showToast(`Expense ${expId} updated`);
+  };
+
+  const handleOwnerDeleteExpense = (expId: string) => {
+    if (!requireAction(currentUser?.role === 'Owner', 'delete expense entries (Owner only)')) return;
+    commitState((prev) => {
+      const oldExp = prev.expenses.find((e) => e.id === expId);
+      if (!oldExp) return prev;
+      const matchJournal = (j: JournalEntry) =>
+        j.reference === expId ||
+        (j.category === 'Expense' &&
+          j.date === oldExp.date &&
+          j.description.includes(oldExp.description));
+      const nextJournals = prev.journalEntries.filter((j) => !matchJournal(j));
+      const nextAccounts = recalculateAccountBalancesFromJournals(prev.accounts, nextJournals);
+
+      const bb = createBlackBoxEvent(prev.blackBox, {
+        user: activeUserName,
+        role: currentUserRole,
+        action: 'EXPENSE_DELETED_BY_OWNER',
+        module: 'Expenses',
+        recordId: expId,
+        summary: `Owner deleted expense ${expId} (${oldExp.category} · ${prev.settings.currencySymbol} ${oldExp.amount})`,
+        beforeValue: oldExp,
+      });
+
+      return {
+        ...prev,
+        expenses: prev.expenses.filter((e) => e.id !== expId),
+        journalEntries: nextJournals,
+        accounts: nextAccounts,
+        tasks: prev.tasks.filter((t) => !(t.autoGenerated && t.linkedRecordId === expId)),
+        blackBox: [bb, ...prev.blackBox],
+      };
+    });
+    showToast(`Expense ${expId} deleted`);
+  };
+
+  const handleOwnerCustomizePayroll = (
+    recId: string,
+    updated: {
+      date: string;
+      type: PayrollRecord['type'];
+      grossAmount: number;
+      deductionAmount: number;
+      paymentAccountCode: string;
+      note: string;
+    }
+  ) => {
+    if (!requireAction(currentUser?.role === 'Owner', 'customize payroll entries (Owner only)')) return;
+    commitState((prev) => {
+      const oldRec = prev.payrollRecords.find((r) => r.id === recId);
+      if (!oldRec) return prev;
+      const payAcc = prev.accounts.find((a) => a.code === updated.paymentAccountCode);
+      const salaryExpAcc = prev.accounts.find((a) => a.code === '5020');
+      if (!payAcc || !salaryExpAcc) return prev;
+
+      const gross = Math.max(0, Number(updated.grossAmount) || 0);
+      const ded = Math.max(0, Number(updated.deductionAmount) || 0);
+      const netPaid = Math.max(0, Number((gross - ded).toFixed(2)));
+      const dateIso = dateInputToIso(updated.date);
+
+      const nextRec: PayrollRecord = {
+        ...oldRec,
+        date: dateIso,
+        type: updated.type,
+        grossAmount: gross,
+        deductionAmount: ded,
+        netPaid,
+        paymentAccountCode: updated.paymentAccountCode,
+        note: updated.note,
+      };
+
+      const nextEmployees = prev.employees.map((e) => {
+        if (e.id !== oldRec.employeeId) return e;
+        let adv = e.advanceBalance;
+        adv = oldRec.type === 'Advance' ? adv - oldRec.netPaid : adv + oldRec.deductionAmount;
+        adv = updated.type === 'Advance' ? adv + netPaid : adv - ded;
+        return { ...e, advanceBalance: Math.max(0, Number(adv.toFixed(2))) };
+      });
+
+      const existingJe = prev.journalEntries.find((j) => j.reference === recId);
+      let nextJournals = prev.journalEntries.filter((j) => j.reference !== recId);
+      if (netPaid > 0) {
+        const rebuiltJe = buildJournalEntry({
+          id: existingJe?.id || `JE-${1001 + prev.journalEntries.length}`,
+          date: dateIso,
+          reference: recId,
+          description: `Payroll (${updated.type}): ${oldRec.employeeName}`,
+          category: 'Payroll',
+          createdBy: activeUserName,
+          lines: [
+            { accountCode: salaryExpAcc.code, accountName: salaryExpAcc.name, debit: netPaid, credit: 0 },
+            { accountCode: payAcc.code, accountName: payAcc.name, debit: 0, credit: netPaid },
+          ],
+        });
+        nextJournals = [rebuiltJe, ...nextJournals];
+      }
+      const nextAccounts = recalculateAccountBalancesFromJournals(prev.accounts, nextJournals);
+
+      const bb = createBlackBoxEvent(prev.blackBox, {
+        user: activeUserName,
+        role: currentUserRole,
+        action: 'PAYROLL_CUSTOMIZED_BY_OWNER',
+        module: 'Employees',
+        recordId: recId,
+        summary: `Owner customized payroll ${recId} (${oldRec.employeeName}: ${prev.settings.currencySymbol} ${netPaid})`,
+        beforeValue: oldRec,
+        afterValue: nextRec,
+      });
+
+      return {
+        ...prev,
+        payrollRecords: prev.payrollRecords.map((r) => (r.id === recId ? nextRec : r)),
+        employees: nextEmployees,
+        journalEntries: nextJournals,
+        accounts: nextAccounts,
+        blackBox: [bb, ...prev.blackBox],
+      };
+    });
+    showToast(`Payroll ${recId} updated`);
+  };
+
+  const handleOwnerDeletePayroll = (recId: string) => {
+    if (!requireAction(currentUser?.role === 'Owner', 'delete payroll entries (Owner only)')) return;
+    commitState((prev) => {
+      const oldRec = prev.payrollRecords.find((r) => r.id === recId);
+      if (!oldRec) return prev;
+      const nextEmployees = prev.employees.map((e) => {
+        if (e.id !== oldRec.employeeId) return e;
+        const adv =
+          oldRec.type === 'Advance'
+            ? e.advanceBalance - oldRec.netPaid
+            : e.advanceBalance + oldRec.deductionAmount;
+        return { ...e, advanceBalance: Math.max(0, Number(adv.toFixed(2))) };
+      });
+      const nextJournals = prev.journalEntries.filter((j) => j.reference !== recId);
+      const nextAccounts = recalculateAccountBalancesFromJournals(prev.accounts, nextJournals);
+
+      const bb = createBlackBoxEvent(prev.blackBox, {
+        user: activeUserName,
+        role: currentUserRole,
+        action: 'PAYROLL_DELETED_BY_OWNER',
+        module: 'Employees',
+        recordId: recId,
+        summary: `Owner deleted payroll ${recId} (${oldRec.employeeName})`,
+        beforeValue: oldRec,
+      });
+
+      return {
+        ...prev,
+        payrollRecords: prev.payrollRecords.filter((r) => r.id !== recId),
+        employees: nextEmployees,
+        journalEntries: nextJournals,
+        accounts: nextAccounts,
+        blackBox: [bb, ...prev.blackBox],
+      };
+    });
+    showToast(`Payroll ${recId} deleted`);
+  };
+
+  const handleOwnerAdjustOpeningBalance = (params: {
+    draft: OpeningBalanceDraft;
+    balanceWithOpeningEquity: boolean;
+  }) => {
+    if (!requireAction(currentUser?.role === 'Owner', 're-edit Opening Balance (Owner only)')) return;
+    const { draft } = params;
+    commitState((prev) => {
+      const prevDraft = prev.openingBalance;
+      const wasFinalized = prevDraft.status === 'finalized';
+      const asOfIso = `${draft.asOfDate}T08:00:00.000Z`;
+      const journalId = prevDraft.finalizedJournalId || `JE-OPEN-${1001 + prev.journalEntries.length}`;
+
+      const draftCodes = new Set(draft.cashAndBanks.map((cb) => cb.accountCode));
+      const nonOpeningJournals = prev.journalEntries.filter(
+        (j) => j.id !== prevDraft.finalizedJournalId && j.category !== 'Opening Balance'
+      );
+      const nextAccounts: Account[] = prev.accounts.filter((acc) => {
+        if (!isMoneySourceAccount(acc) || draftCodes.has(acc.code)) return true;
+        const usedInNonOpening = nonOpeningJournals.some((j) =>
+          j.lines.some((l) => l.accountCode === acc.code)
+        );
+        return usedInNonOpening;
+      });
+      for (const cb of draft.cashAndBanks) {
+        const channel = cb.channel || inferMoneyChannel(cb.accountName);
+        const isWallet = channel === 'E-Wallet';
+        const isActive = cb.maintain !== false;
+        const walletType = isWallet ? cb.walletType?.trim() || undefined : undefined;
+        const cashOutChargePercent = isWallet
+          ? Math.max(0, Number(cb.cashOutChargePercent) || 0)
+          : undefined;
+        const cashOutChargeFlat = isWallet
+          ? Math.max(0, Number(cb.cashOutChargeFlat) || 0)
+          : undefined;
+        const idx = nextAccounts.findIndex((a) => a.code === cb.accountCode);
+        if (idx >= 0) {
+          nextAccounts[idx] = {
+            ...nextAccounts[idx],
+            name: cb.accountName,
+            channel,
+            active: isActive,
+            walletType,
+            cashOutChargePercent,
+            cashOutChargeFlat,
+          };
+        } else {
+          nextAccounts.push({
+            code: cb.accountCode,
+            name: cb.accountName,
+            type: 'Asset',
+            balance: 0,
+            channel,
+            active: isActive,
+            walletType,
+            cashOutChargePercent,
+            cashOutChargeFlat,
+          });
+        }
+      }
+
+      const lines: JournalLine[] = [];
+      let totalDebit = 0;
+      let totalCredit = 0;
+      const pushLine = (code: string, fallbackName: string, debit: number, credit: number) => {
+        if (debit <= 0 && credit <= 0) return;
+        const acc = nextAccounts.find((a) => a.code === code);
+        lines.push({
+          accountCode: code,
+          accountName: acc?.name || fallbackName,
+          debit: Number(debit.toFixed(2)),
+          credit: Number(credit.toFixed(2)),
+        });
+        totalDebit += debit;
+        totalCredit += credit;
+      };
+
+      for (const cb of draft.cashAndBanks) {
+        if (cb.balance > 0) pushLine(cb.accountCode, cb.accountName, cb.balance, 0);
+      }
+      const retailArTotal = draft.retailDues.reduce((s, r) => s + r.amount, 0);
+      if (retailArTotal > 0) pushLine('1100', 'Accounts Receivable - Retail', retailArTotal, 0);
+      const corpArTotal = draft.corporateDues.reduce((s, c) => s + c.amount, 0);
+      if (corpArTotal > 0) pushLine('1110', 'Accounts Receivable - Corporate', corpArTotal, 0);
+      const stockVal = draft.chemicalStocks.reduce((s, ch) => s + ch.qty * ch.unitCost, 0);
+      if (stockVal > 0) pushLine('1200', 'Chemical & Consumables Inventory', stockVal, 0);
+      const otherAssetsVal = draft.otherAssets.reduce((s, oa) => s + oa.value, 0);
+      if (otherAssetsVal > 0) pushLine('1300', 'Machinery, Equipment & Deposits', otherAssetsVal, 0);
+      const staffAdvVal = draft.employeeBalances.reduce((s, e) => s + e.advanceGiven, 0);
+      if (staffAdvVal > 0) pushLine('1400', 'Staff Advances Receivable', staffAdvVal, 0);
+
+      const custAdvVal = draft.customerAdvances.reduce((s, c) => s + c.amount, 0);
+      if (custAdvVal > 0) pushLine('2100', 'Customer Advances', 0, custAdvVal);
+      const supDueVal = draft.supplierDues.reduce((s, sp) => s + sp.amount, 0);
+      if (supDueVal > 0) pushLine('2010', 'Accounts Payable - Suppliers', 0, supDueVal);
+      const loansVal = draft.loansAndLiabilities.reduce((s, l) => s + l.amount, 0);
+      if (loansVal > 0) pushLine('2200', 'Business Loans Payable', 0, loansVal);
+      const empSalDueVal = draft.employeeBalances.reduce((s, e) => s + e.salaryDue, 0);
+      if (empSalDueVal > 0) pushLine('2300', 'Salaries & Wages Payable', 0, empSalDueVal);
+      if (draft.ownerCapitalAmount > 0) {
+        pushLine('3010', 'Owner Capital', 0, draft.ownerCapitalAmount);
+      }
+
+      const diff = Number((totalDebit - totalCredit).toFixed(2));
+      if (Math.abs(diff) >= 0.01) {
+        if (diff > 0) {
+          pushLine('3040', 'Opening Balance Equity', 0, diff);
+        } else {
+          pushLine('3040', 'Opening Balance Equity', Math.abs(diff), 0);
+        }
+      }
+
+      let nextJournals = nonOpeningJournals;
+      if (lines.length >= 2) {
+        const openingEntry: JournalEntry = {
+          ...buildJournalEntry({
+            id: journalId,
+            date: asOfIso,
+            reference: 'OPEN-BAL',
+            description: `Opening Balances & Capital as of ${draft.asOfDate} (Owner Adjusted)`,
+            category: 'Opening Balance',
+            createdBy: activeUserName,
+            lines,
+          }),
+          isOpening: true,
+        };
+        nextJournals = [...nonOpeningJournals, openingEntry];
+      }
+
+      const updatedAccounts = recalculateAccountBalancesFromJournals(nextAccounts, nextJournals);
+
+      // Delta-adjust sub-ledger balances so operational activity is preserved
+      const nextCustomers = prev.customers.map((c) => {
+        const prevDue = wasFinalized
+          ? prevDraft.retailDues.find((d) => d.customerId === c.id)?.amount || 0
+          : 0;
+        const newDue = draft.retailDues.find((d) => d.customerId === c.id)?.amount || 0;
+        const prevAdv = wasFinalized
+          ? prevDraft.customerAdvances.find((a) => a.customerId === c.id)?.amount || 0
+          : 0;
+        const newAdv = draft.customerAdvances.find((a) => a.customerId === c.id)?.amount || 0;
+        return {
+          ...c,
+          outstandingBalance: Math.max(0, Number((c.outstandingBalance + (newDue - prevDue)).toFixed(2))),
+          advanceBalance: Math.max(0, Number((c.advanceBalance + (newAdv - prevAdv)).toFixed(2))),
+        };
+      });
+
+      const nextCorps = prev.corporateCustomers.map((corp) => {
+        const prevDue = wasFinalized
+          ? prevDraft.corporateDues.find((d) => d.corporateId === corp.id)?.amount || 0
+          : 0;
+        const newDue = draft.corporateDues.find((d) => d.corporateId === corp.id)?.amount || 0;
+        return {
+          ...corp,
+          outstandingBalance: Math.max(
+            0,
+            Number((corp.outstandingBalance + (newDue - prevDue)).toFixed(2))
+          ),
+        };
+      });
+
+      const openingCorpMovements: CorporateMovement[] = [];
+      draft.corporatePendingItems.forEach((item, idx) => {
+        const corp = prev.corporateCustomers.find((c) => c.id === item.corporateId);
+        const prod = corp?.products.find((p) => p.id === item.productId);
+        const srv = corp?.services.find((s) => s.id === item.serviceId);
+        if (!corp || !prod || !srv) return;
+        const rate =
+          corp.prices.find((p) => p.productId === prod.id && p.serviceId === srv.id)?.price ?? 0;
+        if (item.alreadyReceivedTotal > 0 || item.alreadyDeliveredTotal > 0 || item.pendingQty > 0) {
+          openingCorpMovements.push({
+            id: `CMOV-OPEN-${Date.now()}-${idx}`,
+            orderId: `OPEN-${idx + 1}`,
+            corporateId: corp.id,
+            date: asOfIso,
+            event: 'Received',
+            productId: prod.id,
+            productName: prod.name,
+            serviceId: srv.id,
+            serviceName: srv.name,
+            qtyDelta: item.pendingQty,
+            pendingAfter: item.pendingQty,
+            unitPriceSnapshot: rate,
+            billedQty: item.pendingQty,
+            reason: `Opening balance (Prior Recv: ${item.alreadyReceivedTotal}, Prior Deliv: ${item.alreadyDeliveredTotal}, Already Billed: ${prev.settings.currencySymbol} ${item.alreadyBilledAmount})`,
+            user: activeUserName,
+            isOpening: true,
+          });
+        }
+      });
+      const nextMovements = recomputeCorporateMovementsPending([
+        ...openingCorpMovements,
+        ...prev.corporateMovements.filter((m) => !m.isOpening),
+      ]);
+
+      const nextSuppliers = prev.suppliers.map((sup) => {
+        const prevDue = wasFinalized
+          ? prevDraft.supplierDues.find((d) => d.supplierId === sup.id)?.amount || 0
+          : 0;
+        const newDue = draft.supplierDues.find((d) => d.supplierId === sup.id)?.amount || 0;
+        return {
+          ...sup,
+          dueBalance: Math.max(0, Number((sup.dueBalance + (newDue - prevDue)).toFixed(2))),
+        };
+      });
+
+      const nextChemicals = prev.chemicals.map((ch) => {
+        const prevEntry = wasFinalized
+          ? prevDraft.chemicalStocks.find((s) => s.chemicalId === ch.id)
+          : undefined;
+        const newEntry = draft.chemicalStocks.find((s) => s.chemicalId === ch.id);
+        if (!newEntry) return ch;
+        const prevQty = prevEntry?.qty || 0;
+        return {
+          ...ch,
+          currentQty: Math.max(0, Number((ch.currentQty + (newEntry.qty - prevQty)).toFixed(2))),
+          purchaseCost: newEntry.unitCost,
+        };
+      });
+
+      const nextEmployees = prev.employees.map((e) => {
+        const prevEb = wasFinalized
+          ? prevDraft.employeeBalances.find((x) => x.employeeId === e.id)
+          : undefined;
+        const newEb = draft.employeeBalances.find((x) => x.employeeId === e.id);
+        const salDelta = (newEb?.salaryDue || 0) - (prevEb?.salaryDue || 0);
+        const advDelta = (newEb?.advanceGiven || 0) - (prevEb?.advanceGiven || 0);
+        return {
+          ...e,
+          salaryDue: Math.max(0, Number((e.salaryDue + salDelta).toFixed(2))),
+          advanceBalance: Math.max(0, Number((e.advanceBalance + advDelta).toFixed(2))),
+        };
+      });
+
+      const openingOrders: Order[] = draft.pendingRetailOrders.map((po, idx) => {
+        const cust = prev.customers.find((c) => c.id === po.customerId);
+        return {
+          id: po.id || `OPEN-ORD-${idx + 1}`,
+          customerId: po.customerId,
+          customerName: cust?.name || 'Retail Customer',
+          createdAt: asOfIso,
+          expectedDeliveryAt: asOfIso,
+          deliveryOptionId: prev.deliveryOptions[0]?.id || 'del-reg',
+          deliveryOptionName: prev.deliveryOptions[0]?.name || 'Regular',
+          stage: po.stage,
+          physicallyReceived: true,
+          stageHistory: [
+            { stage: po.stage, timestamp: asOfIso, user: activeUserName, note: 'Opening pending order' },
+          ],
+          lines: [
+            {
+              id: `open-ol-${idx}`,
+              productId: prev.products[0]?.id || 'prod-shirt',
+              productName: 'Opening Pending Items',
+              serviceId: prev.services[0]?.id || 'srv-wash',
+              serviceName: 'Laundry',
+              quantityOrdered: po.pieceCount,
+              quantityReceived: po.pieceCount,
+              quantityDelivered: 0,
+              quantityRewash: 0,
+              unitPrice: po.pieceCount > 0 ? Number((po.estimatedValue / po.pieceCount).toFixed(2)) : 0,
+              discount: 0,
+            },
+          ],
+          exceptions: [],
+          orderDiscount: 0,
+          additionalCharge: 0,
+          addAdditionalToOrder: false,
+          totalAmount: po.estimatedValue,
+          paidAmount: po.paidAmount,
+          notes: 'Opening pending order (excluded from operational sales)',
+          isOpening: true,
+        };
+      });
+      const nextOrders = [...openingOrders, ...prev.orders.filter((o) => !o.isOpening)];
+
+      const baseFormats = prev.idFormats || DEFAULT_ID_FORMATS;
+      const nextIdFormats = {
+        ...baseFormats,
+        customer: {
+          ...baseFormats.customer,
+          nextNumber: Math.max(baseFormats.customer.nextNumber, (draft.lastIds.customerLastNum || 0) + 1),
+        },
+        retailOrder: {
+          ...baseFormats.retailOrder,
+          nextNumber: Math.max(baseFormats.retailOrder.nextNumber, (draft.lastIds.retailOrderLastNum || 0) + 1),
+        },
+        corporateOrder: {
+          ...baseFormats.corporateOrder,
+          nextNumber: Math.max(baseFormats.corporateOrder.nextNumber, (draft.lastIds.corporateOrderLastNum || 0) + 1),
+        },
+        retailInvoice: {
+          ...baseFormats.retailInvoice,
+          nextNumber: Math.max(baseFormats.retailInvoice.nextNumber, (draft.lastIds.retailInvoiceLastNum || 0) + 1),
+        },
+        corporateInvoice: {
+          ...baseFormats.corporateInvoice,
+          nextNumber: Math.max(baseFormats.corporateInvoice.nextNumber, (draft.lastIds.corporateInvoiceLastNum || 0) + 1),
+        },
+      };
+
+      const bb = createBlackBoxEvent(prev.blackBox, {
+        user: activeUserName,
+        role: currentUserRole,
+        action: 'OPENING_BALANCE_ADJUSTED_BY_OWNER',
+        module: 'Opening Balance',
+        recordId: journalId,
+        summary: `Owner adjusted Opening Balance as of ${draft.asOfDate}`,
+        beforeValue: prevDraft,
+        afterValue: draft,
+      });
+
+      return {
+        ...prev,
+        idFormats: nextIdFormats,
+        openingBalance: {
+          ...draft,
+          status: 'finalized',
+          finalizedAt: prevDraft.finalizedAt || new Date().toISOString(),
+          finalizedJournalId: journalId,
+        },
+        accounts: updatedAccounts,
+        journalEntries: nextJournals,
+        customers: nextCustomers,
+        corporateCustomers: nextCorps,
+        corporateMovements: nextMovements,
+        suppliers: nextSuppliers,
+        chemicals: nextChemicals,
+        employees: nextEmployees,
+        orders: nextOrders,
+        blackBox: [bb, ...prev.blackBox],
+      };
+    });
+    showToast('Opening Balance updated by Owner');
+  };
+
   // --- NAVIGATION & QUICK SEARCH ---
 
   const allNavItems: Array<{
@@ -4597,6 +6555,7 @@ export default function App() {
           {activeSection === 'orders' && allowedSections.includes('orders') && (
             <OrdersView
               state={state}
+              isOwner={currentUser.role === 'Owner'}
               initialOpenCreate={openOrderIntakeFlag && canCreateOrders}
               canEditIssuedIds={
                 currentUser.role === 'Owner' || activePerms.actions.canPostAccounting
@@ -4606,7 +6565,10 @@ export default function App() {
                 handleCreateOrder(params);
               }}
               onRenameOrderId={(oldId, newId) => handleRenameIssuedId('order', oldId, newId)}
-              onDeleteOrder={handleDeleteOrder}
+              onDeleteOrder={
+                currentUser.role === 'Owner' ? handleOwnerDeleteOrder : handleDeleteOrder
+              }
+              onOwnerCustomizeOrder={handleOwnerCustomizeOrder}
               onGoToAccounting={() => setActiveSection('accounting')}
               onRequestDelete={setDeleteRequest}
               onAdvanceStage={handleAdvanceOrderStage}
@@ -4629,10 +6591,12 @@ export default function App() {
           {activeSection === 'customers' && allowedSections.includes('customers') && (
             <CustomersView
               state={state}
+              isOwner={currentUser.role === 'Owner'}
               canEditIssuedIds={
                 currentUser.role === 'Owner' || activePerms.actions.canPostAccounting
               }
               onAddCustomer={handleAddCustomer}
+              onOwnerUpdateCustomer={handleOwnerUpdateCustomer}
               onRenameCustomerId={(oldId, newId) => handleRenameIssuedId('customer', oldId, newId)}
               onDeleteCustomer={handleDeleteCustomer}
               onDeactivateCustomer={handleDeactivateCustomer}
@@ -4649,13 +6613,19 @@ export default function App() {
           {activeSection === 'corporate' && allowedSections.includes('corporate') && (
             <CorporateView
               state={state}
+              isOwner={currentUser.role === 'Owner'}
               onCreateCorporate={handleCreateCorporate}
               onUpdateCorporateBillingBasis={handleUpdateCorporateBillingBasis}
+              onOwnerUpdateCorporateProfile={handleOwnerUpdateCorporateProfile}
               onAddCorporateProduct={handleAddCorporateProduct}
               onAddCorporateService={handleAddCorporateService}
               onUpsertCorporatePrice={handleUpsertCorporatePrice}
               onLogCorporateMovement={handleLogCorporateMovement}
+              onOwnerCustomizeCorporateMovement={handleOwnerCustomizeCorporateMovement}
+              onOwnerDeleteCorporateMovement={handleOwnerDeleteCorporateMovement}
               onGenerateCorporateInvoice={handleGenerateCorporateInvoice}
+              onOwnerCustomizeInvoice={handleOwnerCustomizeInvoice}
+              onOwnerDeleteInvoice={handleOwnerDeleteInvoice}
               onCollectCorporatePayment={handleCollectCorporatePayment}
               onOpenInvoice={(invId) => {
                 if (!allowedSections.includes('documents')) {
@@ -4710,12 +6680,17 @@ export default function App() {
           {activeSection === 'accounting' && allowedSections.includes('accounting') && (
             <AccountingView
               state={state}
+              isOwner={currentUser.role === 'Owner'}
               initialSubTab={accountingInitialTab}
               onPostOwnerDraw={handlePostOwnerDraw}
               onPostCashIn={handlePostCashIn}
               onPostTransfer={handlePostTransfer}
               onPostManualJournal={handlePostManualJournal}
               onPostSuddenAdjustment={handlePostSuddenMoneyAdjustment}
+              onOwnerCustomizeJournal={handleOwnerCustomizeJournal}
+              onOwnerDeleteJournal={handleOwnerDeleteJournal}
+              onOwnerAdjustAccountBalance={handleOwnerAdjustAccountBalance}
+              onOwnerUpdateAccount={handleOwnerUpdateAccount}
               onReverseJournal={handleReverseJournal}
               onAddAccount={handleAddAccount}
               onDeleteAccount={handleDeleteAccount}
@@ -4727,12 +6702,16 @@ export default function App() {
           {activeSection === 'opening-balance' && allowedSections.includes('opening-balance') && (
             <OpeningBalanceView
               state={state}
+              isOwner={currentUser.role === 'Owner'}
               canPostAccounting={
                 currentUser.role === 'Owner' || activePerms.actions.canPostAccounting
               }
               onSaveDraft={handleSaveOpeningDraft}
               onFinalize={handleFinalizeOpeningBalance}
+              onOwnerAdjustFinalized={handleOwnerAdjustOpeningBalance}
               onPostAdjustment={handlePostOpeningAdjustment}
+              onOwnerCustomizeJournal={handleOwnerCustomizeJournal}
+              onOwnerDeleteJournal={handleOwnerDeleteJournal}
               onInlineAddCustomer={(data) => {
                 const next = generateNextSmartId(state, 'customer');
                 handleAddCustomer(
@@ -4784,11 +6763,16 @@ export default function App() {
           {activeSection === 'employees' && allowedSections.includes('employees') && (
             <EmployeesExpensesView
               state={state}
+              isOwner={currentUser.role === 'Owner'}
               onAddEmployee={handleAddEmployee}
               onDeleteEmployee={handleDeleteEmployee}
               onDeactivateEmployee={handleDeactivateEmployee}
               onPostPayroll={handlePostPayroll}
+              onOwnerCustomizePayroll={handleOwnerCustomizePayroll}
+              onOwnerDeletePayroll={handleOwnerDeletePayroll}
               onPostExpense={handlePostExpense}
+              onOwnerCustomizeExpense={handleOwnerCustomizeExpense}
+              onOwnerDeleteExpense={handleOwnerDeleteExpense}
               onAddExpenseCategory={(cat) => {
                 if (
                   !requireAction(
@@ -4815,6 +6799,7 @@ export default function App() {
           {activeSection === 'documents' && allowedSections.includes('documents') && (
             <DocumentsPrintView
               state={state}
+              isOwner={currentUser.role === 'Owner'}
               initialMode={docViewTarget.mode}
               initialId={docViewTarget.id}
               canEditIssuedIds={
@@ -4822,6 +6807,9 @@ export default function App() {
               }
               onRecordPrint={handleRecordPrint}
               onRenameInvoiceId={(oldId, newId) => handleRenameIssuedId('invoice', oldId, newId)}
+              onOwnerCreateCustomInvoice={handleOwnerCreateCustomInvoice}
+              onOwnerCustomizeInvoice={handleOwnerCustomizeInvoice}
+              onOwnerDeleteInvoice={handleOwnerDeleteInvoice}
               onRequestDelete={setDeleteRequest}
               onGoToAccounting={() => setActiveSection('accounting')}
             />

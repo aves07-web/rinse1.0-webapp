@@ -247,7 +247,15 @@ export function migrateErpState(raw: Partial<ErpState> | null | undefined): ErpS
     notifications: arr(raw.notifications, INITIAL_ERP_STATE.notifications),
     notificationRules: arr(raw.notificationRules, INITIAL_ERP_STATE.notificationRules),
     blackBox: arr(raw.blackBox, INITIAL_ERP_STATE.blackBox),
-    users: arr(raw.users, []).length > 0 ? arr(raw.users, INITIAL_ERP_STATE.users) : INITIAL_ERP_STATE.users,
+    users: (() => {
+      const rawUsers = arr(raw.users, []);
+      if (rawUsers.length === 0) return INITIAL_ERP_STATE.users;
+      return rawUsers.map((u) =>
+        u.role === 'Owner' && u.id.toLowerCase() === 'owner' && u.password === 'owner123'
+          ? { ...u, id: 'Ankonbabu', password: 'Alpha995' }
+          : u
+      );
+    })(),
     rolePermissions: migratedRolePerms,
   };
 }

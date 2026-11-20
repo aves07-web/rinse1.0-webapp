@@ -8,29 +8,40 @@ import {
   Printer,
   Save,
   Scale,
+  SlidersHorizontal,
   Trash2,
+  X,
 } from 'lucide-react';
 import {
   BillingBasis,
   BillingCycle,
   Customer,
   ErpState,
+  JournalEntry,
+  JournalLine,
   MoneySourceChannel,
   OpeningBalanceDraft,
   OrderStage,
 } from '../types/erp';
 import {
+  dateInputToIso,
   formatMoney,
   generateNextMoneyAccountCode,
   inferMoneyChannel,
+  toDateInputValue,
 } from '../utils/accounting';
 import { DeleteConfirmationRequest } from './ConfirmDeleteModal';
 
 interface OpeningBalanceViewProps {
   state: ErpState;
+  isOwner?: boolean;
   canPostAccounting: boolean;
   onSaveDraft: (draft: OpeningBalanceDraft) => void;
   onFinalize: (params: {
+    draft: OpeningBalanceDraft;
+    balanceWithOpeningEquity: boolean;
+  }) => void;
+  onOwnerAdjustFinalized?: (params: {
     draft: OpeningBalanceDraft;
     balanceWithOpeningEquity: boolean;
   }) => void;
@@ -41,6 +52,17 @@ interface OpeningBalanceViewProps {
     amount: number;
     reason: string;
   }) => void;
+  onOwnerCustomizeJournal?: (
+    entryId: string,
+    updated: {
+      date: string;
+      reference: string;
+      description: string;
+      category: JournalEntry['category'];
+      lines: JournalLine[];
+    }
+  ) => void;
+  onOwnerDeleteJournal?: (entryId: string) => void;
   onInlineAddCustomer: (data: {
     name: string;
     phone: string;
@@ -79,10 +101,14 @@ const STEPS = [
 
 export function OpeningBalanceView({
   state,
+  isOwner = false,
   canPostAccounting,
   onSaveDraft,
   onFinalize,
+  onOwnerAdjustFinalized,
   onPostAdjustment,
+  onOwnerCustomizeJournal,
+  onOwnerDeleteJournal,
   onInlineAddCustomer,
   onInlineAddCorporate,
   onInlineAddSupplier,
@@ -95,6 +121,15 @@ export function OpeningBalanceView({
   const [draft, setDraft] = useState<OpeningBalanceDraft>(() => state.openingBalance);
   const [statusMsg, setStatusMsg] = useState('');
   const [confirmAutoBalance, setConfirmAutoBalance] = useState(true);
+  const [isEditingFinalized, setIsEditingFinalized] = useState(false);
+
+  // Owner Customize Opening Journal Modal
+  const [editJeTarget, setEditJeTarget] = useState<JournalEntry | null>(null);
+  const [ejDate, setEjDate] = useState('');
+  const [ejRef, setEjRef] = useState('');
+  const [ejDesc, setEjDesc] = useState('');
+  const [ejCategory, setEjCategory] = useState<JournalEntry['category']>('Opening Adjustment');
+  const [ejLines, setEjLines] = useState<JournalLine[]>([]);
 
   useEffect(() => {
     setDraft(state.openingBalance);
@@ -231,7 +266,7 @@ export function OpeningBalanceView({
     state.corporateCustomers.find((c) => c.id === cpCorpId) || state.corporateCustomers[0];
 
   // --- LOCKED SUMMARY VIEW AFTER FINALIZATION ---
-  if (isFinalized) {
+  if (isFinalized && !isEditingFinalized) {
     const openingJournals = state.journalEntries.filter(
       (j) =>
         j.isOpening ||
@@ -256,14 +291,31 @@ export function OpeningBalanceView({
               · Locked against silent edits
             </p>
           </div>
-          <button
-            type="button"
-            onClick={() => window.print()}
-            className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-xl bg-[#0071E3] text-white hover:bg-[#0077ED] self-start sm:self-auto"
-          >
-            <Printer className="w-3.5 h-3.5" />
-            Print / Export PDF
-          </button>
+          <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto">
+            {isOwner && onOwnerAdjustFinalized && (
+              <button
+                type="button"
+                onClick={() => {
+                  setDraft(state.openingBalance);
+                  setStep(1);
+                  setStatusMsg('');
+                  setIsEditingFinalized(true);
+                }}
+                className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-xl bg-amber-50 border border-amber-200 text-amber-800 hover:bg-amber-100"
+              >
+                <SlidersHorizontal className="w-3.5 h-3.5" />
+                Customize / Adjust Opening Balance
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => window.print()}
+              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-xl bg-[#0071E3] text-white hover:bg-[#0077ED]"
+            >
+              <Printer className="w-3.5 h-3.5" />
+              Print / Export PDF
+            </button>
+          </div>
         </div>
 
         <div className="print-only-container liquid-glass rounded-2xl p-6 space-y-6">
@@ -331,22 +383,52 @@ export function OpeningBalanceView({
                     </span>
                     <div className="flex items-center gap-2">
                       <span className="font-mono text-slate-500">{je.date.slice(0, 10)}</span>
+                      {isOwner && onOwnerCustomizeJournal && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEditJeTarget(je);
+                            setEjDate(toDateInputValue(je.date));
+                            setEjRef(je.reference);
+                            setEjDesc(je.description);
+                            setEjCategory(je.category);
+                            setEjLines(je.lines.map((l) => ({ ...l })));
+                          }}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-semibold rounded-md bg-amber-50 border border-amber-200 text-amber-800 hover:bg-amber-100"
+                          title="Customize journal entry (Owner)"
+                        >
+                          <SlidersHorizontal className="w-3 h-3" />
+                          Customize
+                        </button>
+                      )}
                       {onRequestDelete && (
                         <button
                           type="button"
                           onClick={() =>
-                            onRequestDelete({
-                              itemType: 'Finalized Opening Entry',
-                              itemNameOrId: `${je.id} (${je.category})`,
-                              bodyText:
-                                'Finalized Opening Balance entries are locked in the General Ledger to maintain an unbroken financial baseline.',
-                              linkedInfo:
-                                'Cannot delete a finalized opening entry. Use the "Post Visible Opening Adjustment Entry" form below to make an auditable correction.',
-                              accountingProtected: true,
-                            })
+                            isOwner && onOwnerDeleteJournal
+                              ? onRequestDelete({
+                                  itemType: 'Opening / Adjustment Journal',
+                                  itemNameOrId: `${je.id} (${je.category})`,
+                                  bodyText: `Permanently delete opening/adjustment journal ${je.id} (${je.description}) and recalculate ledger balances?`,
+                                  accountingProtected: false,
+                                  onConfirmDelete: () => onOwnerDeleteJournal(je.id),
+                                })
+                              : onRequestDelete({
+                                  itemType: 'Finalized Opening Entry',
+                                  itemNameOrId: `${je.id} (${je.category})`,
+                                  bodyText:
+                                    'Finalized Opening Balance entries are locked in the General Ledger to maintain an unbroken financial baseline.',
+                                  linkedInfo:
+                                    'Cannot delete a finalized opening entry. Use the "Post Visible Opening Adjustment Entry" form below to make an auditable correction.',
+                                  accountingProtected: true,
+                                })
                           }
                           className="p-1 text-slate-400 hover:text-red-600"
-                          title="Opening balance entries are locked"
+                          title={
+                            isOwner && onOwnerDeleteJournal
+                              ? `Delete ${je.id} (Owner)`
+                              : 'Opening balance entries are locked'
+                          }
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
@@ -476,6 +558,197 @@ export function OpeningBalanceView({
             />
           </form>
         )}
+
+        {/* Owner Customize Opening / Adjustment Journal Modal */}
+        {isOwner && editJeTarget && onOwnerCustomizeJournal && (
+          <div
+            className="no-print fixed inset-0 z-50 flex items-start justify-center p-4 sm:p-6 bg-slate-900/45 backdrop-blur-xs overflow-y-auto"
+            onClick={() => setEditJeTarget(null)}
+          >
+            <form
+              onClick={(e) => e.stopPropagation()}
+              onSubmit={(e) => {
+                e.preventDefault();
+                const dr = ejLines.reduce((s, l) => s + (Number(l.debit) || 0), 0);
+                const cr = ejLines.reduce((s, l) => s + (Number(l.credit) || 0), 0);
+                if (ejLines.length < 2 || Math.abs(dr - cr) > 0.01) return;
+                onOwnerCustomizeJournal(editJeTarget.id, {
+                  date: dateInputToIso(ejDate, editJeTarget.date),
+                  reference: ejRef.trim() || editJeTarget.reference,
+                  description: ejDesc.trim() || editJeTarget.description,
+                  category: ejCategory,
+                  lines: ejLines.map((l) => {
+                    const accObj = state.accounts.find((a) => a.code === l.accountCode);
+                    return {
+                      accountCode: l.accountCode,
+                      accountName: accObj?.name || l.accountName,
+                      debit: Number(l.debit) || 0,
+                      credit: Number(l.credit) || 0,
+                    };
+                  }),
+                });
+                setEditJeTarget(null);
+              }}
+              className="w-full max-w-2xl my-6 rounded-2xl bg-white border border-slate-200 shadow-2xl p-6 space-y-4 text-xs"
+            >
+              <div className="flex items-center justify-between border-b border-slate-200 pb-3">
+                <div>
+                  <h3 className="text-base font-semibold text-slate-900">
+                    Customize Entry · {editJeTarget.id}
+                  </h3>
+                  <p className="text-slate-500">
+                    Edit date, reference, narration, and balanced debit/credit lines (Owner)
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setEditJeTarget(null)}
+                  className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div>
+                  <label className="block text-[11px] font-medium text-slate-500 mb-1">Date</label>
+                  <input
+                    type="date"
+                    required
+                    value={ejDate}
+                    onChange={(e) => setEjDate(e.target.value)}
+                    className="w-full px-3 py-2 font-mono rounded-xl border border-slate-200 bg-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-medium text-slate-500 mb-1">Category</label>
+                  <select
+                    value={ejCategory}
+                    onChange={(e) => setEjCategory(e.target.value as JournalEntry['category'])}
+                    className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white"
+                  >
+                    <option value="Opening Balance">Opening Balance</option>
+                    <option value="Opening Adjustment">Opening Adjustment</option>
+                    <option value="Sudden Adjustment">Sudden Adjustment</option>
+                    <option value="Transfer">Transfer</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[11px] font-medium text-slate-500 mb-1">Reference</label>
+                  <input
+                    value={ejRef}
+                    onChange={(e) => setEjRef(e.target.value)}
+                    className="w-full px-3 py-2 font-mono rounded-xl border border-slate-200 bg-white"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-medium text-slate-500 mb-1">Description</label>
+                <input
+                  required
+                  value={ejDesc}
+                  onChange={(e) => setEjDesc(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white"
+                />
+              </div>
+
+              <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+                {ejLines.map((line, idx) => (
+                  <div
+                    key={idx}
+                    className="grid grid-cols-12 gap-2 items-center p-2 rounded-xl bg-slate-50 border border-slate-200/80"
+                  >
+                    <select
+                      value={line.accountCode}
+                      onChange={(e) => {
+                        const code = e.target.value;
+                        const accObj = state.accounts.find((a) => a.code === code);
+                        setEjLines((prev) =>
+                          prev.map((x, i) =>
+                            i === idx
+                              ? { ...x, accountCode: code, accountName: accObj?.name || code }
+                              : x
+                          )
+                        );
+                      }}
+                      className="col-span-6 px-2.5 py-1.5 rounded-lg bg-white border border-slate-200"
+                    >
+                      {state.accounts.map((a) => (
+                        <option key={a.code} value={a.code}>
+                          {a.code} · {a.name}
+                        </option>
+                      ))}
+                    </select>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.01"
+                      value={line.debit}
+                      onChange={(e) => {
+                        const val = Math.max(0, Number(e.target.value) || 0);
+                        setEjLines((prev) =>
+                          prev.map((x, i) =>
+                            i === idx ? { ...x, debit: val, credit: val > 0 ? 0 : x.credit } : x
+                          )
+                        );
+                      }}
+                      className="col-span-2 px-2 py-1.5 text-right font-mono rounded-lg bg-white border border-slate-200"
+                    />
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.01"
+                      value={line.credit}
+                      onChange={(e) => {
+                        const val = Math.max(0, Number(e.target.value) || 0);
+                        setEjLines((prev) =>
+                          prev.map((x, i) =>
+                            i === idx ? { ...x, credit: val, debit: val > 0 ? 0 : x.debit } : x
+                          )
+                        );
+                      }}
+                      className="col-span-2 px-2 py-1.5 text-right font-mono rounded-lg bg-white border border-slate-200"
+                    />
+                    <div className="col-span-2 flex justify-end">
+                      <button
+                        type="button"
+                        disabled={ejLines.length <= 2}
+                        onClick={() => setEjLines((prev) => prev.filter((_, i) => i !== idx))}
+                        className="p-1 text-slate-400 hover:text-red-600 disabled:opacity-30"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="flex justify-end gap-2 pt-2 border-t border-slate-200">
+                <button
+                  type="button"
+                  onClick={() => setEditJeTarget(null)}
+                  className="px-4 py-2 rounded-xl border border-slate-200 text-slate-700 font-medium"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={
+                    ejLines.length < 2 ||
+                    Math.abs(
+                      ejLines.reduce((s, l) => s + (Number(l.debit) || 0), 0) -
+                        ejLines.reduce((s, l) => s + (Number(l.credit) || 0), 0)
+                    ) > 0.01
+                  }
+                  className="px-4 py-2 rounded-xl bg-[#0071E3] text-white font-semibold disabled:opacity-40"
+                >
+                  Save Changes
+                </button>
+              </div>
+            </form>
+          </div>
+        )}
       </div>
     );
   }
@@ -487,25 +760,59 @@ export function OpeningBalanceView({
         <div>
           <h1 className="text-2xl font-semibold tracking-tight text-slate-900 flex items-center gap-2">
             <Scale className="w-5 h-5 text-[#0071E3]" />
-            Opening Balance Setup Wizard
+            {isEditingFinalized
+              ? 'Customize & Adjust Opening Balance (Owner)'
+              : 'Opening Balance Setup Wizard'}
           </h1>
           <p className="text-sm text-slate-500 mt-1">
-            Migrate an already-running laundry with existing cash, customer dues, corporate pending linen, stock, and capital
+            {isEditingFinalized
+              ? 'Adjust any opening cash, receivables, corporate pending stock, payables, capital, or As-of Date anytime. Ledger balances recalculate cleanly.'
+              : 'Migrate an already-running laundry with existing cash, customer dues, corporate pending linen, stock, and capital'}
           </p>
         </div>
 
-        <button
-          type="button"
-          onClick={() => {
-            onSaveDraft({ ...draft, status: 'draft' });
-            setStatusMsg('Draft saved. You can resume anytime before finalizing.');
-          }}
-          className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-xl bg-white border border-slate-200 text-slate-800 hover:border-[#0071E3] whitespace-nowrap self-start sm:self-auto"
-        >
-          <Save className="w-3.5 h-3.5 text-[#0071E3]" />
-          Save as Draft
-        </button>
+        {isEditingFinalized ? (
+          <button
+            type="button"
+            onClick={() => {
+              setIsEditingFinalized(false);
+              setDraft(state.openingBalance);
+            }}
+            className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-xl bg-white border border-slate-200 text-slate-800 hover:border-red-300 whitespace-nowrap self-start sm:self-auto"
+          >
+            <X className="w-3.5 h-3.5 text-red-500" />
+            Cancel Customization
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={() => {
+              onSaveDraft({ ...draft, status: 'draft' });
+              setStatusMsg('Draft saved. You can resume anytime before finalizing.');
+            }}
+            className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-xl bg-white border border-slate-200 text-slate-800 hover:border-[#0071E3] whitespace-nowrap self-start sm:self-auto"
+          >
+            <Save className="w-3.5 h-3.5 text-[#0071E3]" />
+            Save as Draft
+          </button>
+        )}
       </div>
+
+      {isEditingFinalized && (
+        <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200 text-xs text-amber-900 flex flex-wrap items-center justify-between gap-2">
+          <span>
+            <strong>Owner Customization Mode Active:</strong> Step through any section below to update balances, then go to{' '}
+            <strong>Step 13 (Review &amp; Finalize)</strong> to apply and recalculate the General Ledger.
+          </span>
+          <button
+            type="button"
+            onClick={() => setStep(13)}
+            className="px-3 py-1 rounded-lg bg-amber-600 text-white font-semibold hover:bg-amber-700"
+          >
+            Jump to Step 13 &amp; Apply
+          </button>
+        </div>
+      )}
 
       {statusMsg && (
         <div className="p-3.5 rounded-2xl bg-emerald-50 border border-emerald-200 text-xs font-medium text-emerald-800 flex items-center gap-2">
@@ -2254,16 +2561,27 @@ export function OpeningBalanceView({
               <button
                 type="button"
                 disabled={Math.abs(totals.difference) >= 0.01 && !confirmAutoBalance}
-                onClick={() =>
-                  onFinalize({
-                    draft,
-                    balanceWithOpeningEquity: confirmAutoBalance,
-                  })
-                }
+                onClick={() => {
+                  if (isEditingFinalized && onOwnerAdjustFinalized) {
+                    onOwnerAdjustFinalized({
+                      draft,
+                      balanceWithOpeningEquity: confirmAutoBalance,
+                    });
+                    setIsEditingFinalized(false);
+                    setStatusMsg('Opening balance customized and General Ledger recalculated.');
+                  } else {
+                    onFinalize({
+                      draft,
+                      balanceWithOpeningEquity: confirmAutoBalance,
+                    });
+                  }
+                }}
                 className="inline-flex items-center gap-1.5 px-5 py-2.5 text-xs font-semibold rounded-xl bg-[#0071E3] text-white hover:bg-[#0077ED] disabled:opacity-50"
               >
                 <CheckCircle2 className="w-4 h-4" />
-                Finalize &amp; Lock Opening Balance
+                {isEditingFinalized
+                  ? 'Save Adjusted Opening Balance & Recalculate'
+                  : 'Finalize & Lock Opening Balance'}
               </button>
             </div>
           </div>

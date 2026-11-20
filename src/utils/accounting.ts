@@ -168,6 +168,49 @@ export function applyJournalToAccounts(accounts: Account[], entry: JournalEntry)
   });
 }
 
+export function recalculateAccountBalancesFromJournals(
+  accounts: Account[],
+  journalEntries: JournalEntry[]
+): Account[] {
+  const balances = new Map<string, number>();
+  for (const acc of accounts) {
+    balances.set(acc.code, 0);
+  }
+  const typeMap = new Map<string, AccountType>(accounts.map((a) => [a.code, a.type]));
+  for (const entry of journalEntries) {
+    for (const line of entry.lines) {
+      const accType = typeMap.get(line.accountCode);
+      if (!accType) continue;
+      const cur = balances.get(line.accountCode) || 0;
+      const delta = isDebitNormal(accType)
+        ? line.debit - line.credit
+        : line.credit - line.debit;
+      balances.set(line.accountCode, Number((cur + delta).toFixed(2)));
+    }
+  }
+  return accounts.map((acc) => ({
+    ...acc,
+    balance: balances.get(acc.code) ?? 0,
+  }));
+}
+
+export function toDateInputValue(isoStr?: string): string {
+  if (!isoStr) return new Date().toISOString().slice(0, 10);
+  const d = new Date(isoStr);
+  if (Number.isNaN(d.getTime())) return new Date().toISOString().slice(0, 10);
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+export function dateInputToIso(dateStr?: string, fallbackIso?: string): string {
+  if (!dateStr || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+    return fallbackIso || new Date().toISOString();
+  }
+  return `${dateStr}T12:00:00.000Z`;
+}
+
 export function buildJournalEntry(params: {
   id: string;
   date: string;

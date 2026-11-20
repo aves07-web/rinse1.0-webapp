@@ -52,13 +52,6 @@ export function LoginView({
     onLoginSuccess(matched);
   };
 
-  const quickFill = (u: UserAccount) => {
-    setSelectedRole(u.role);
-    setUserId(u.id);
-    setPassword(u.password);
-    setError('');
-  };
-
   return (
     <div className="min-h-screen flex items-center justify-center p-4 sm:p-8">
       <div className="w-full max-w-md space-y-6">
@@ -132,7 +125,7 @@ export function LoginView({
                   autoComplete="username"
                   value={userId}
                   onChange={(e) => setUserId(e.target.value)}
-                  placeholder="e.g., owner, manager, counter, floor"
+                  placeholder="Enter your User ID"
                   className="w-full pl-10 pr-3.5 py-2.5 text-sm rounded-xl bg-white/90 border border-slate-200 focus:outline-none focus:border-[#0071E3]"
                 />
               </div>
@@ -181,30 +174,6 @@ export function LoginView({
               Sign In as {selectedRole}
             </button>
           </form>
-
-          {/* Quick-fill Staff Accounts Reference */}
-          <div className="pt-4 border-t border-slate-200/70 space-y-2">
-            <p className="text-[11px] font-medium text-slate-500">
-              Configured Workstation Accounts (Click to auto-fill)
-            </p>
-            <div className="grid grid-cols-2 gap-2">
-              {users
-                .filter((u) => u.active)
-                .map((u) => (
-                  <button
-                    key={u.id}
-                    type="button"
-                    onClick={() => quickFill(u)}
-                    className="text-left p-2.5 rounded-xl bg-white/70 border border-slate-200/80 hover:border-[#0071E3] transition-colors"
-                  >
-                    <p className="text-xs font-semibold text-slate-900 truncate">{u.role}</p>
-                    <p className="text-[11px] font-mono text-slate-500 mt-0.5 truncate">
-                      {u.id} / {u.password}
-                    </p>
-                  </button>
-                ))}
-            </div>
-          </div>
         </div>
       </div>
     </div>

@@ -254,9 +254,9 @@ export const INITIAL_ERP_STATE: ErpState = {
   blackBox: [],
   users: [
     {
-      id: 'owner',
+      id: 'Ankonbabu',
       displayName: 'Business Owner',
-      password: 'owner123',
+      password: 'Alpha995',
       role: 'Owner',
       active: true,
       createdAt: nowIso,
