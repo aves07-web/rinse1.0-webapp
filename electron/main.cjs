@@ -39,11 +39,10 @@ async function createDesktopWindow() {
   });
 
   httpServer = started.server;
-  const iconPath = path.join(
-    appRoot,
-    'build',
-    process.platform === 'win32' ? 'icon.ico' : 'icon.png'
-  );
+  const iconName = process.platform === 'win32' ? 'icon.ico' : 'icon.png';
+  const primaryIconPath = path.join(appRoot, 'electron', 'assets', iconName);
+  const fallbackIconPath = path.join(appRoot, 'build', iconName);
+  const iconPath = fs.existsSync(primaryIconPath) ? primaryIconPath : fallbackIconPath;
 
   mainWindow = new BrowserWindow({
     title: 'Rinse',
