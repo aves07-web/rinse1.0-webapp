@@ -100,6 +100,8 @@ interface CorporateViewProps {
       advanceCounterTo?: number;
       issuedAt?: string;
       dueDate?: string;
+      customDiscountType?: 'percent' | 'amount';
+      customDiscountValue?: number;
       approvedZeroPriceLines?: Array<{ productName: string; serviceName: string; quantity: number }>;
     }
   ) => void;
@@ -235,6 +237,10 @@ export function CorporateView({
   >(undefined);
   const [highlightedMovementIds, setHighlightedMovementIds] = useState<Set<string>>(new Set());
   const [billingRateError, setBillingRateError] = useState('');
+  const [customDiscountType, setCustomDiscountType] = useState<'percent' | 'amount'>('percent');
+  const [customDiscountValue, setCustomDiscountValue] = useState<string>(() =>
+    String(state.corporateCustomers[0]?.discountPct ?? 0)
+  );
 
   // Owner Customize Corporate Profile & Balance Modal
   const [custCorpOpen, setCustCorpOpen] = useState(false);
@@ -368,6 +374,18 @@ export function CorporateView({
   }, [corpMovements, activeCorp]);
 
   const unbilledTotal = unbilledItems.reduce((s, i) => s + i.lineTotal, 0);
+
+  useEffect(() => {
+    setCustomDiscountType('percent');
+    setCustomDiscountValue(String(activeCorp?.discountPct ?? 0));
+  }, [activeCorp?.id, activeCorp?.discountPct]);
+
+  const parsedCustomDiscVal = Math.max(0, Number(customDiscountValue) || 0);
+  const corpBillDiscountAmount =
+    customDiscountType === 'amount'
+      ? Number(Math.min(unbilledTotal, parsedCustomDiscVal).toFixed(2))
+      : Number(((unbilledTotal * Math.min(100, parsedCustomDiscVal)) / 100).toFixed(2));
+  const corpBillNetTotal = Number(Math.max(0, unbilledTotal - corpBillDiscountAmount).toFixed(2));
 
   const corpInvoices = activeCorp
     ? state.invoices.filter((inv) => inv.corporateId === activeCorp.id)
@@ -1327,6 +1345,72 @@ export function CorporateView({
                           </tbody>
                         </table>
 
+                        <div className="p-4 rounded-xl bg-slate-50/90 border border-slate-200/80 flex flex-col lg:flex-row lg:items-center justify-between gap-4 text-xs">
+                          <div className="space-y-1">
+                            <p className="font-semibold text-slate-800">
+                              Custom Discount (Applied After Private Rates)
+                            </p>
+                            <p className="text-[11px] text-slate-500">
+                              Any billing user can set a custom percentage or flat discount for this invoice
+                              {activeCorp.discountPct > 0
+                                ? ` · Contract default: ${activeCorp.discountPct}%`
+                                : ''}
+                            </p>
+                          </div>
+
+                          <div className="flex flex-wrap items-center gap-3">
+                            <div className="inline-flex p-0.5 rounded-lg bg-slate-200/80">
+                              <button
+                                type="button"
+                                onClick={() => setCustomDiscountType('percent')}
+                                className={`px-2.5 py-1 text-[11px] font-semibold rounded-md transition-colors ${
+                                  customDiscountType === 'percent'
+                                    ? 'bg-white text-slate-900 shadow-xs'
+                                    : 'text-slate-600'
+                                }`}
+                              >
+                                % Percent
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setCustomDiscountType('amount')}
+                                className={`px-2.5 py-1 text-[11px] font-semibold rounded-md transition-colors ${
+                                  customDiscountType === 'amount'
+                                    ? 'bg-white text-slate-900 shadow-xs'
+                                    : 'text-slate-600'
+                                }`}
+                              >
+                                {sym} Flat
+                              </button>
+                            </div>
+
+                            <div className="flex items-center gap-1.5">
+                              <input
+                                type="number"
+                                min={0}
+                                max={customDiscountType === 'percent' ? 100 : unbilledTotal}
+                                step="0.01"
+                                value={customDiscountValue}
+                                onChange={(e) => setCustomDiscountValue(e.target.value)}
+                                aria-label="Custom billing discount"
+                                className="w-24 px-2.5 py-1.5 text-xs font-mono text-right rounded-lg bg-white border border-slate-200"
+                              />
+                              <span className="font-mono text-slate-500">
+                                {customDiscountType === 'percent' ? '%' : sym}
+                              </span>
+                            </div>
+
+                            <div className="text-right font-mono tabular-nums pl-2 border-l border-slate-200">
+                              <p className="text-[11px] text-slate-500">
+                                Discount: -{formatMoney(corpBillDiscountAmount, sym)}
+                              </p>
+                              <p className="text-sm font-semibold text-[#0071E3]">
+                                Net Total: {formatMoney(corpBillNetTotal, sym)}
+                              </p>
+                            </div>
+                          </div>
+                        </div>
+
                         <div className="flex flex-wrap items-center justify-end gap-3 pt-3 border-t border-slate-200/70">
                           <input
                             type="text"
@@ -1646,16 +1730,74 @@ export function CorporateView({
                 </div>
               </div>
 
-              <div className="p-3 rounded-xl bg-white/80 border border-slate-200/80 flex items-center justify-between tabular-nums">
-                <span className="text-slate-600">
-                  {unbilledItems.length} unbilled line(s)
-                </span>
-                <span className="font-mono font-semibold text-slate-900">
-                  {formatMoney(
-                    unbilledTotal - (unbilledTotal * (activeCorp.discountPct || 0)) / 100,
-                    sym
-                  )}
-                </span>
+              <div className="p-3 rounded-xl bg-slate-50 border border-slate-200/80 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <label className="font-medium text-slate-700">
+                    Custom Discount (After Private Rate)
+                  </label>
+                  <div className="inline-flex p-0.5 rounded-lg bg-slate-200/80">
+                    <button
+                      type="button"
+                      onClick={() => setCustomDiscountType('percent')}
+                      className={`px-2 py-0.5 text-[11px] font-semibold rounded-md ${
+                        customDiscountType === 'percent'
+                          ? 'bg-white text-slate-900 shadow-xs'
+                          : 'text-slate-600'
+                      }`}
+                    >
+                      %
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setCustomDiscountType('amount')}
+                      className={`px-2 py-0.5 text-[11px] font-semibold rounded-md ${
+                        customDiscountType === 'amount'
+                          ? 'bg-white text-slate-900 shadow-xs'
+                          : 'text-slate-600'
+                      }`}
+                    >
+                      {sym}
+                    </button>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    min={0}
+                    max={customDiscountType === 'percent' ? 100 : unbilledTotal}
+                    step="0.01"
+                    value={customDiscountValue}
+                    onChange={(e) => setCustomDiscountValue(e.target.value)}
+                    placeholder="0"
+                    className="w-full px-3 py-1.5 font-mono rounded-lg bg-white border border-slate-200"
+                  />
+                  <span className="text-slate-500 font-mono shrink-0">
+                    {customDiscountType === 'percent' ? '%' : sym}
+                  </span>
+                </div>
+              </div>
+
+              <div className="p-3 rounded-xl bg-white/80 border border-slate-200/80 space-y-1.5 tabular-nums">
+                <div className="flex items-center justify-between text-slate-600">
+                  <span>{unbilledItems.length} unbilled line(s) (Private Rate Subtotal)</span>
+                  <span className="font-mono">{formatMoney(unbilledTotal, sym)}</span>
+                </div>
+                <div className="flex items-center justify-between text-emerald-700">
+                  <span>
+                    Custom Discount (
+                    {customDiscountType === 'percent'
+                      ? `${Math.min(100, parsedCustomDiscVal)}%`
+                      : 'Flat'}
+                    )
+                  </span>
+                  <span className="font-mono">-{formatMoney(corpBillDiscountAmount, sym)}</span>
+                </div>
+                <div className="flex items-center justify-between pt-1.5 border-t border-slate-200/70 font-semibold text-slate-900">
+                  <span>Final Invoice Total</span>
+                  <span className="font-mono text-[#0071E3]">
+                    {formatMoney(corpBillNetTotal, sym)}
+                  </span>
+                </div>
               </div>
             </div>
 
@@ -1682,9 +1824,13 @@ export function CorporateView({
                         : undefined,
                     issuedAt: invIssueDate,
                     dueDate: invDueDate,
+                    customDiscountType,
+                    customDiscountValue: parsedCustomDiscVal,
                     approvedZeroPriceLines: approvedCorpZeroLines,
                   });
                   setApprovedCorpZeroLines(undefined);
+                  setCustomDiscountType('percent');
+                  setCustomDiscountValue(String(activeCorp.discountPct ?? 0));
                   setInvoiceDialogOpen(false);
                 }}
                 className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-xl btn-primary"

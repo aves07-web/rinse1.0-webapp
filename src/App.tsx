@@ -2017,6 +2017,8 @@ export default function App() {
       advanceCounterTo?: number;
       issuedAt?: string;
       dueDate?: string;
+      customDiscountType?: 'percent' | 'amount';
+      customDiscountValue?: number;
       approvedZeroPriceLines?: Array<{ productName: string; serviceName: string; quantity: number }>;
     }
   ) => {
@@ -2069,9 +2071,19 @@ export default function App() {
         };
       });
 
-      const subtotal = lines.reduce((s, l) => s + l.total, 0);
-      const discountTotal = Number(((subtotal * corp.discountPct) / 100).toFixed(2));
-      const grandTotal = Number((subtotal - discountTotal).toFixed(2));
+      const subtotal = Number(lines.reduce((s, l) => s + l.total, 0).toFixed(2));
+      let discountTotal = 0;
+      if (options?.customDiscountType === 'amount') {
+        discountTotal = Number(
+          Math.min(subtotal, Math.max(0, Number(options.customDiscountValue) || 0)).toFixed(2)
+        );
+      } else if (options?.customDiscountType === 'percent') {
+        const pct = Math.min(100, Math.max(0, Number(options.customDiscountValue) || 0));
+        discountTotal = Number(((subtotal * pct) / 100).toFixed(2));
+      } else {
+        discountTotal = Number(((subtotal * corp.discountPct) / 100).toFixed(2));
+      }
+      const grandTotal = Number(Math.max(0, subtotal - discountTotal).toFixed(2));
 
       const newInvoice: Invoice = {
         id: invoiceId,
@@ -2093,7 +2105,11 @@ export default function App() {
         paidAmount: 0,
         dueAmount: grandTotal,
         paymentTerms: 'Net 7 Days',
-        termsAndConditions: `Corporate ${corp.billingBasis} statement for ${periodLabel}.`,
+        termsAndConditions: `Corporate ${corp.billingBasis} statement for ${periodLabel}.${
+          discountTotal > 0
+            ? ` Custom discount applied: ${prev.settings.currencySymbol} ${discountTotal.toFixed(2)}.`
+            : ''
+        }`,
         reprintCount: 0,
         logoSnapshotDataUrl: prev.settings.companyLogoDataUrl,
         logoSizeSnapshot: prev.settings.companyLogoSize || 'Medium',
