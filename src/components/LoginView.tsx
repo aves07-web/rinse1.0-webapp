@@ -1,5 +1,6 @@
 import { useState } from 'react';
-import { Eye, EyeOff, Lock, Shield, UserCheck } from 'lucide-react';
+import type { User } from 'firebase/auth';
+import { Cloud, CloudOff, Eye, EyeOff, Lock, Shield, UserCheck } from 'lucide-react';
 import rinseLogo from '../assets/images/rinse_logo_1795028808300.jpg';
 import { UserAccount, UserRole } from '../types/erp';
 
@@ -8,6 +9,12 @@ interface LoginViewProps {
   companyTagline: string;
   users: UserAccount[];
   onLoginSuccess: (user: UserAccount) => void;
+  firebaseAuthReady?: boolean;
+  firebaseUser?: User | null;
+  firestoreStatus?: 'disconnected' | 'connecting' | 'synced' | 'unauthorized' | 'error';
+  firestoreStatusMessage?: string;
+  onGoogleSignIn?: () => Promise<void>;
+  onGoogleSignOut?: () => Promise<void>;
 }
 
 const ROLES: UserRole[] = ['Owner', 'Manager', 'Counter Staff', 'Floor Operator'];
@@ -17,12 +24,20 @@ export function LoginView({
   companyTagline,
   users,
   onLoginSuccess,
+  firebaseAuthReady = false,
+  firebaseUser = null,
+  firestoreStatus = 'disconnected',
+  firestoreStatusMessage = '',
+  onGoogleSignIn,
+  onGoogleSignOut,
 }: LoginViewProps) {
   const [selectedRole, setSelectedRole] = useState<UserRole>('Owner');
   const [userId, setUserId] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
+  const [googleBusy, setGoogleBusy] = useState(false);
+  const [googleError, setGoogleError] = useState('');
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -50,6 +65,19 @@ export function LoginView({
     }
 
     onLoginSuccess(matched);
+  };
+
+  const handleGoogleConnect = async () => {
+    if (!onGoogleSignIn) return;
+    setGoogleBusy(true);
+    setGoogleError('');
+    try {
+      await onGoogleSignIn();
+    } catch (err) {
+      setGoogleError(err instanceof Error ? err.message : 'Google sign-in failed.');
+    } finally {
+      setGoogleBusy(false);
+    }
   };
 
   return (
@@ -174,6 +202,68 @@ export function LoginView({
               Sign In as {selectedRole}
             </button>
           </form>
+
+          {onGoogleSignIn && (
+            <div className="pt-4 border-t border-slate-200/70 space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-semibold text-slate-700 inline-flex items-center gap-1.5">
+                  {firebaseUser && firestoreStatus === 'synced' ? (
+                    <Cloud className="w-3.5 h-3.5 text-emerald-600" />
+                  ) : (
+                    <CloudOff className="w-3.5 h-3.5 text-slate-400" />
+                  )}
+                  Cloud Real-Time Sync (Firestore)
+                </span>
+                {firebaseUser && onGoogleSignOut && (
+                  <button
+                    type="button"
+                    onClick={() => void onGoogleSignOut()}
+                    className="text-[11px] font-medium text-slate-500 hover:text-red-600"
+                  >
+                    Disconnect
+                  </button>
+                )}
+              </div>
+
+              {!firebaseAuthReady ? (
+                <p className="text-[11px] text-slate-500">Checking cloud session...</p>
+              ) : firebaseUser ? (
+                <div
+                  className={`p-2.5 rounded-xl border text-[11px] space-y-1 ${
+                    firestoreStatus === 'synced'
+                      ? 'bg-emerald-50/80 border-emerald-200 text-emerald-800'
+                      : firestoreStatus === 'unauthorized' || firestoreStatus === 'error'
+                        ? 'bg-amber-50 border-amber-200 text-amber-800'
+                        : 'bg-slate-50 border-slate-200 text-slate-700'
+                  }`}
+                >
+                  <p className="font-medium truncate">
+                    {firebaseUser.email || firebaseUser.displayName}
+                  </p>
+                  <p className="opacity-90">
+                    {firestoreStatusMessage ||
+                      (firestoreStatus === 'synced'
+                        ? 'Live multi-user Firestore sync active.'
+                        : 'Connecting to Firestore...')}
+                  </p>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => void handleGoogleConnect()}
+                  disabled={googleBusy}
+                  className="w-full py-2 px-3.5 text-xs font-semibold rounded-xl bg-white border border-slate-200 text-slate-700 hover:bg-slate-50 transition-colors inline-flex items-center justify-center gap-2 disabled:opacity-60"
+                >
+                  <Cloud className="w-3.5 h-3.5 text-[#0071E3]" />
+                  {googleBusy ? 'Connecting Google Sync...' : 'Connect Cloud Sync with Google'}
+                </button>
+              )}
+
+              {googleError && (
+                <p className="text-[11px] text-red-600 font-medium">{googleError}</p>
+              )}
+            </div>
+          )}
         </div>
       </div>
     </div>

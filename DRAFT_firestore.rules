@@ -1,0 +1,351 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 4.1: Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Pillar 3: Reusable Hardened Primitives ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isEmailVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidEmailDocId(id) {
+      return id is string && id.size() >= 3 && id.size() <= 254 && id.matches('^[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isBootstrappedAdmin() {
+      return isEmailVerified()
+        && request.auth.token.email is string
+        && request.auth.token.email == 'itsdevilsaddress@gmail.com';
+    }
+
+    function isAdmin() {
+      return isBootstrappedAdmin()
+        || (isEmailVerified() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)));
+    }
+
+    function isInvitedEmail() {
+      return isEmailVerified()
+        && request.auth.token.email is string
+        && request.auth.token.email.size() >= 3
+        && request.auth.token.email.size() <= 254
+        && exists(/databases/$(database)/documents/workspace_invites/$(request.auth.token.email));
+    }
+
+    function isWorkspacePrimaryMember() {
+      return isEmailVerified()
+        && exists(/databases/$(database)/documents/workspace_config/primary)
+        && (
+          request.auth.uid in get(/databases/$(database)/documents/workspace_config/primary).data.memberUids
+          || get(/databases/$(database)/documents/workspace_config/primary).data.ownerUid == request.auth.uid
+        );
+    }
+
+    // --- Pillar 2 & 5: Standalone Validation Blueprints ---
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'displayName', 'photoURL', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid)
+        && data.uid == request.auth.uid
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 254
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120
+        && (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() <= 1000))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    function isValidAdminRecord(data) {
+      return data.keys().hasAll(['uid', 'email', 'grantedBy', 'createdAt'])
+        && data.keys().hasOnly(['uid', 'email', 'grantedBy', 'createdAt'])
+        && isValidId(data.uid)
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 254
+        && isValidId(data.grantedBy)
+        && data.grantedBy == request.auth.uid
+        && data.createdAt is timestamp
+        && data.createdAt == request.time;
+    }
+
+    function isValidWorkspaceConfig(data) {
+      return data.keys().hasAll(['workspaceId', 'ownerUid', 'ownerEmail', 'memberUids', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['workspaceId', 'ownerUid', 'ownerEmail', 'memberUids', 'createdAt', 'updatedAt'])
+        && data.workspaceId == 'primary'
+        && isValidId(data.ownerUid)
+        && data.ownerEmail is string && data.ownerEmail.size() >= 3 && data.ownerEmail.size() <= 254
+        && data.memberUids is list
+        && data.memberUids.size() >= 1 && data.memberUids.size() <= 50
+        && data.memberUids[0] is string && isValidId(data.memberUids[0])
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    function isValidWorkspaceInvite(data) {
+      return data.keys().hasAll(['email', 'invitedByUid', 'roleNote', 'createdAt'])
+        && data.keys().hasOnly(['email', 'invitedByUid', 'roleNote', 'createdAt'])
+        && isValidEmailDocId(data.email)
+        && isValidId(data.invitedByUid)
+        && data.invitedByUid == request.auth.uid
+        && data.roleNote is string && data.roleNote.size() <= 80
+        && data.createdAt is timestamp
+        && data.createdAt == request.time;
+    }
+
+    function isValidRinseSection(section) {
+      return section is string
+        && section.size() >= 1 && section.size() <= 32
+        && section in [
+          'meta',
+          'settings',
+          'security',
+          'catalogue',
+          'customers',
+          'corporate',
+          'orders',
+          'invoices',
+          'accounting',
+          'inventory',
+          'employees',
+          'tasks',
+          'blackbox'
+        ];
+    }
+
+    function isValidRinseStateDoc(data) {
+      return data.keys().hasAll([
+          'section',
+          'chunkIndex',
+          'totalChunks',
+          'ownerUid',
+          'memberUids',
+          'payload',
+          'syncRevision',
+          'originClientId',
+          'updatedByUid',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'section',
+          'chunkIndex',
+          'totalChunks',
+          'ownerUid',
+          'memberUids',
+          'payload',
+          'syncRevision',
+          'originClientId',
+          'updatedByUid',
+          'updatedAt'
+        ])
+        && isValidRinseSection(data.section)
+        && data.chunkIndex is int && data.chunkIndex >= 0 && data.chunkIndex <= 100
+        && data.totalChunks is int && data.totalChunks >= 1 && data.totalChunks <= 100
+        && isValidId(data.ownerUid)
+        && data.memberUids is list
+        && data.memberUids.size() >= 1 && data.memberUids.size() <= 50
+        && data.memberUids[0] is string && isValidId(data.memberUids[0])
+        && data.payload is map
+        && data.syncRevision is int && data.syncRevision >= 1
+        && isValidId(data.originClientId)
+        && isValidId(data.updatedByUid)
+        && data.updatedByUid == request.auth.uid
+        && data.updatedAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    // --- Collection Rules ---
+
+    // 1. User Profiles (PII isolated to self or admin)
+    match /users/{userId} {
+      allow get: if isEmailVerified() && isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if false;
+      allow create: if isEmailVerified()
+        && isValidId(userId)
+        && isOwner(userId)
+        && isValidUserProfile(incoming())
+        && incoming().createdAt == request.time;
+      allow update: if isEmailVerified()
+        && isValidId(userId)
+        && isValidUserProfile(incoming())
+        && (isOwner(userId) || isAdmin())
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().diff(existing()).affectedKeys().hasOnly(['email', 'displayName', 'photoURL', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    // 2. Trusted Admins (atomic first-owner bootstrap or admin-granted only)
+    match /admins/{userId} {
+      allow get: if isEmailVerified() && isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if false;
+      allow create: if isEmailVerified()
+        && isValidId(userId)
+        && isValidAdminRecord(incoming())
+        && (
+          isAdmin()
+          || (
+            isOwner(userId)
+            && incoming().uid == request.auth.uid
+            && !exists(/databases/$(database)/documents/workspace_config/primary)
+            && existsAfter(/databases/$(database)/documents/workspace_config/primary)
+            && getAfter(/databases/$(database)/documents/workspace_config/primary).data.ownerUid == request.auth.uid
+          )
+        );
+      allow update, delete: if false;
+    }
+
+    // 3. Primary Workspace Ownership & Member Registry
+    match /workspace_config/{workspaceId} {
+      allow get: if isEmailVerified()
+        && workspaceId == 'primary'
+        && (
+          isAdmin()
+          || request.auth.uid in existing().memberUids
+          || existing().ownerUid == request.auth.uid
+          || isInvitedEmail()
+        );
+      allow list: if false;
+      allow create: if isEmailVerified()
+        && workspaceId == 'primary'
+        && isValidWorkspaceConfig(incoming())
+        && incoming().createdAt == request.time
+        && incoming().ownerUid == request.auth.uid
+        && request.auth.uid in incoming().memberUids
+        && (
+          isBootstrappedAdmin()
+          || !exists(/databases/$(database)/documents/workspace_config/primary)
+        );
+      allow update: if isEmailVerified()
+        && workspaceId == 'primary'
+        && isValidWorkspaceConfig(incoming())
+        && incoming().workspaceId == existing().workspaceId
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().ownerEmail == existing().ownerEmail
+        && incoming().createdAt == existing().createdAt
+        && (
+          (
+            (isAdmin() || existing().ownerUid == request.auth.uid)
+            && incoming().diff(existing()).affectedKeys().hasOnly(['memberUids', 'updatedAt'])
+          )
+          || (
+            isInvitedEmail()
+            && incoming().diff(existing()).affectedKeys().hasOnly(['memberUids', 'updatedAt'])
+            && request.auth.uid in incoming().memberUids
+            && incoming().memberUids.hasAll(existing().memberUids)
+            && incoming().memberUids.size() == existing().memberUids.size() + 1
+          )
+        );
+      allow delete: if false;
+    }
+
+    // 4. Workspace Invites (Admin creates/deletes, invited email can read own invite)
+    match /workspace_invites/{inviteEmail} {
+      allow get: if isEmailVerified()
+        && isValidEmailDocId(inviteEmail)
+        && (isAdmin() || request.auth.token.email == inviteEmail);
+      allow list: if isEmailVerified()
+        && (
+          isBootstrappedAdmin()
+          || resource.data.invitedByUid == request.auth.uid
+          || resource.data.email == request.auth.token.email
+        );
+      allow create: if isEmailVerified()
+        && isValidEmailDocId(inviteEmail)
+        && isAdmin()
+        && isValidWorkspaceInvite(incoming())
+        && incoming().email == inviteEmail
+        && incoming().createdAt == request.time;
+      allow update: if false;
+      allow delete: if isEmailVerified() && isValidEmailDocId(inviteEmail) && isAdmin();
+    }
+
+    // 5. Partitioned Rinse ERP State (writeBatch + onSnapshot real-time multi-user sync)
+    match /rinse_state/{docId} {
+      allow get: if isEmailVerified()
+        && isValidId(docId)
+        && (
+          isAdmin()
+          || request.auth.uid in existing().memberUids
+          || existing().ownerUid == request.auth.uid
+          || isWorkspacePrimaryMember()
+        );
+      // Pillar 8: Zero get()/exists() in allow list; client must filter via memberUids/ownerUid unless bootstrapped admin
+      allow list: if isEmailVerified()
+        && (
+          isBootstrappedAdmin()
+          || request.auth.uid in resource.data.memberUids
+          || resource.data.ownerUid == request.auth.uid
+        );
+      allow create: if isEmailVerified()
+        && isValidId(docId)
+        && isValidRinseStateDoc(incoming())
+        && (
+          isAdmin()
+          || isWorkspacePrimaryMember()
+          || (
+            incoming().ownerUid == request.auth.uid
+            && request.auth.uid in incoming().memberUids
+            && !exists(/databases/$(database)/documents/workspace_config/primary)
+          )
+        );
+      allow update: if isEmailVerified()
+        && isValidId(docId)
+        && isValidRinseStateDoc(incoming())
+        && incoming().ownerUid == existing().ownerUid
+        && (
+          (
+            (isAdmin() || request.auth.uid in existing().memberUids || isWorkspacePrimaryMember())
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'section',
+              'chunkIndex',
+              'totalChunks',
+              'memberUids',
+              'payload',
+              'syncRevision',
+              'originClientId',
+              'updatedByUid',
+              'updatedAt'
+            ])
+          )
+          || (
+            isInvitedEmail()
+            && incoming().diff(existing()).affectedKeys().hasOnly(['memberUids', 'updatedByUid', 'updatedAt'])
+            && incoming().section == existing().section
+            && incoming().chunkIndex == existing().chunkIndex
+            && incoming().totalChunks == existing().totalChunks
+            && incoming().payload == existing().payload
+            && incoming().syncRevision == existing().syncRevision
+            && incoming().originClientId == existing().originClientId
+            && request.auth.uid in incoming().memberUids
+            && incoming().memberUids.hasAll(existing().memberUids)
+            && incoming().memberUids.size() == existing().memberUids.size() + 1
+          )
+        );
+      allow delete: if isEmailVerified()
+        && isValidId(docId)
+        && (isAdmin() || request.auth.uid in existing().memberUids || isWorkspacePrimaryMember());
+    }
+  }
+}

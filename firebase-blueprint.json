@@ -1,0 +1,233 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Private Google-authenticated user profile for Rinse cloud sync",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 254
+        },
+        "displayName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "photoURL": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "displayName", "createdAt", "updatedAt"]
+    },
+    "AdminRecord": {
+      "title": "AdminRecord",
+      "description": "Trusted administrator marker document",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 254
+        },
+        "grantedBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "grantedBy", "createdAt"]
+    },
+    "WorkspaceConfig": {
+      "title": "WorkspaceConfig",
+      "description": "Master workspace ownership and authorized member UID list",
+      "type": "object",
+      "properties": {
+        "workspaceId": {
+          "type": "string",
+          "enum": ["primary"],
+          "maxLength": 32
+        },
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerEmail": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 254
+        },
+        "memberUids": {
+          "type": "array",
+          "description": "Authorized Firebase Auth UIDs (bounded <= 50)"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["workspaceId", "ownerUid", "ownerEmail", "memberUids", "createdAt", "updatedAt"]
+    },
+    "WorkspaceInvite": {
+      "title": "WorkspaceInvite",
+      "description": "Google email invite allowing a team member to join the Rinse workspace",
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 254
+        },
+        "invitedByUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "roleNote": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["email", "invitedByUid", "roleNote", "createdAt"]
+    },
+    "RinseStateSection": {
+      "title": "RinseStateSection",
+      "description": "Partitioned ERP state document inside rinse_state synced atomically via writeBatch and onSnapshot",
+      "type": "object",
+      "properties": {
+        "section": {
+          "type": "string",
+          "enum": [
+            "meta",
+            "settings",
+            "security",
+            "catalogue",
+            "customers",
+            "corporate",
+            "orders",
+            "invoices",
+            "accounting",
+            "inventory",
+            "employees",
+            "tasks",
+            "blackbox"
+          ],
+          "maxLength": 32
+        },
+        "chunkIndex": {
+          "type": "integer",
+          "description": "Zero-based chunk index for partitioned sections"
+        },
+        "totalChunks": {
+          "type": "integer",
+          "description": "Total chunk count for this section"
+        },
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "memberUids": {
+          "type": "array",
+          "description": "Authorized member UIDs mirroring workspace membership"
+        },
+        "payload": {
+          "type": "object",
+          "description": "Native structured ERP section data"
+        },
+        "syncRevision": {
+          "type": "integer",
+          "description": "Monotonic sync revision counter"
+        },
+        "originClientId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "updatedByUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "section",
+        "chunkIndex",
+        "totalChunks",
+        "ownerUid",
+        "memberUids",
+        "payload",
+        "syncRevision",
+        "originClientId",
+        "updatedByUid",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Private Google-authenticated user profile documents"
+    },
+    "/admins/{userId}": {
+      "schema": { "$ref": "#/entities/AdminRecord" },
+      "description": "Trusted administrator marker documents"
+    },
+    "/workspace_config/{workspaceId}": {
+      "schema": { "$ref": "#/entities/WorkspaceConfig" },
+      "description": "Primary Rinse workspace ownership and member registry"
+    },
+    "/workspace_invites/{inviteEmail}": {
+      "schema": { "$ref": "#/entities/WorkspaceInvite" },
+      "description": "Authorized team email invites managed by workspace admins"
+    },
+    "/rinse_state/{docId}": {
+      "schema": { "$ref": "#/entities/RinseStateSection" },
+      "description": "Partitioned ERP state sections synced via writeBatch and onSnapshot"
+    }
+  }
+}

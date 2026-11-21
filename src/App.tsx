@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { onAuthStateChanged, type User } from 'firebase/auth';
 import {
   BarChart3,
   Bell,
@@ -6,6 +7,8 @@ import {
   Building2,
   CalendarClock,
   CheckCircle2,
+  Cloud,
+  CloudOff,
   FlaskConical,
   LayoutDashboard,
   LogOut,
@@ -24,6 +27,16 @@ import {
   WalletCards,
   X,
 } from 'lucide-react';
+import { auth, signInWithGoogle, signOutFirebase } from './firebase';
+import {
+  ensureWorkspaceAccess,
+  FIRESTORE_MIGRATED_KEY,
+  migrateLocalStorageToFirestoreIfNeeded,
+  saveStateToFirestoreBatch,
+  STATIC_STATE_KEY,
+  subscribeRinseState,
+  type WorkspaceContext,
+} from './services/firestoreSync';
 import { AccountingView } from './components/AccountingView';
 import { AnalyticsView } from './components/AnalyticsView';
 import { BlackBoxView } from './components/BlackBoxView';
@@ -241,12 +254,26 @@ export default function App() {
   );
   const syncedRevisionRef = useRef<number>(1);
   const isRemoteUpdateRef = useRef<boolean>(false);
+  const dirtyForFirestoreRef = useRef<boolean>(false);
+  const firestoreDocIdsRef = useRef<string[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
   const [onlineUsers, setOnlineUsers] = useState<OnlinePresenceUser[]>([]);
   const [githubStatus, setGithubStatus] = useState<GitHubSyncStatus | null>(null);
   const [backendMode, setBackendMode] = useState<'unknown' | 'server' | 'static'>('unknown');
 
-  const STATIC_STATE_KEY = 'rinse_static_erp_state_v2';
+  // Firebase Auth & Firestore real-time sync state
+  const [firebaseAuthReady, setFirebaseAuthReady] = useState(false);
+  const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
+  const [workspaceContext, setWorkspaceContext] = useState<WorkspaceContext | null>(null);
+  const [firestoreStatus, setFirestoreStatus] = useState<
+    'disconnected' | 'connecting' | 'synced' | 'unauthorized' | 'error'
+  >('disconnected');
+  const [firestoreStatusMessage, setFirestoreStatusMessage] = useState('');
+  const [firestoreFatalError, setFirestoreFatalError] = useState<Error | null>(null);
+
+  if (firestoreFatalError) {
+    throw firestoreFatalError;
+  }
 
   const refreshGitHubStatus = useCallback(async () => {
     try {
@@ -261,7 +288,7 @@ export default function App() {
     }
   }, []);
 
-  // Load persisted state from server on mount (or localStorage on static hosts like GitHub Pages)
+  // Load persisted state from server on mount (or localStorage backup on static hosts like GitHub Pages)
   useEffect(() => {
     let active = true;
     fetch('/api/state')
@@ -278,6 +305,7 @@ export default function App() {
         if (data && data.settings && Array.isArray(data.accounts)) {
           const migrated = migrateErpState(data);
           isRemoteUpdateRef.current = true;
+          dirtyForFirestoreRef.current = false;
           syncedRevisionRef.current = migrated.syncRevision ?? 1;
           setState(migrated);
         }
@@ -292,6 +320,7 @@ export default function App() {
             const parsed = JSON.parse(raw) as Partial<ErpState>;
             if (parsed && parsed.settings && Array.isArray(parsed.accounts)) {
               isRemoteUpdateRef.current = true;
+              dirtyForFirestoreRef.current = false;
               setState(migrateErpState(parsed));
             }
           }
@@ -306,6 +335,123 @@ export default function App() {
       active = false;
     };
   }, [refreshGitHubStatus]);
+
+  // Listen for Firebase Auth session changes
+  useEffect(() => {
+    const unsubscribeAuth = onAuthStateChanged(auth, (user) => {
+      setFirebaseUser(user);
+      setFirebaseAuthReady(true);
+      if (!user) {
+        setWorkspaceContext(null);
+        setFirestoreStatus('disconnected');
+        setFirestoreStatusMessage('');
+      }
+    });
+    return () => unsubscribeAuth();
+  }, []);
+
+  // On authenticated startup: migrate real localStorage records via writeBatch (never seed demo data), then attach onSnapshot
+  useEffect(() => {
+    if (!firebaseAuthReady || !firebaseUser) return;
+
+    let cancelled = false;
+    let unsubscribeSnapshot: (() => void) | null = null;
+
+    const startFirestoreSync = async () => {
+      setFirestoreStatus('connecting');
+      setFirestoreStatusMessage('Connecting to Firestore...');
+      try {
+        const access = await ensureWorkspaceAccess(firebaseUser);
+        if (cancelled) return;
+
+        if (!access.authorized) {
+          setWorkspaceContext(null);
+          setFirestoreStatus('unauthorized');
+          setFirestoreStatusMessage(access.reason);
+          return;
+        }
+
+        setWorkspaceContext(access.context);
+
+        // 1. Check localStorage first: migrate real business records via writeBatch once, leaving backup untouched
+        const migrationResult = await migrateLocalStorageToFirestoreIfNeeded({
+          user: firebaseUser,
+          workspace: access.context,
+          originClientId: clientIdRef.current,
+        });
+        if (cancelled) return;
+
+        if (migrationResult.migrated && migrationResult.state) {
+          isRemoteUpdateRef.current = true;
+          dirtyForFirestoreRef.current = false;
+          syncedRevisionRef.current = migrationResult.syncRevision ?? syncedRevisionRef.current;
+          firestoreDocIdsRef.current = migrationResult.docIds ?? [];
+          setState(migrationResult.state);
+          showToast('Local records migrated to Firestore cloud sync (local backup kept).');
+        }
+
+        // 2. Subscribe to rinse_state via onSnapshot for live multi-user sync
+        unsubscribeSnapshot = subscribeRinseState({
+          user: firebaseUser,
+          workspace: access.context,
+          onSnapshotState: (remote) => {
+            if (cancelled) return;
+            firestoreDocIdsRef.current = remote.docIds;
+            setFirestoreStatus('synced');
+            setFirestoreStatusMessage('Live multi-user sync active');
+
+            const isSelfEcho =
+              remote.originClientId === clientIdRef.current.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128) &&
+              remote.syncRevision <= syncedRevisionRef.current;
+            if (isSelfEcho) {
+              return;
+            }
+
+            isRemoteUpdateRef.current = true;
+            dirtyForFirestoreRef.current = false;
+            syncedRevisionRef.current = Math.max(syncedRevisionRef.current, remote.syncRevision);
+            setState(remote.state);
+            setLoadedFromServer(true);
+
+            try {
+              if (window.localStorage.getItem(FIRESTORE_MIGRATED_KEY) === 'true') {
+                window.localStorage.setItem(STATIC_STATE_KEY, JSON.stringify(remote.state));
+              }
+            } catch {
+              // ignore storage quota
+            }
+          },
+          onEmpty: () => {
+            if (cancelled) return;
+            // Never seed default or demo data when Firestore is empty
+            setFirestoreStatus('synced');
+            setFirestoreStatusMessage('Connected · Ready for business records');
+          },
+          onError: (err) => {
+            if (cancelled) return;
+            setFirestoreStatus('error');
+            setFirestoreStatusMessage(err.message);
+            setFirestoreFatalError(err);
+          },
+        });
+      } catch (err) {
+        if (cancelled) return;
+        const wrapped = err instanceof Error ? err : new Error(String(err));
+        setFirestoreStatus('error');
+        setFirestoreStatusMessage(wrapped.message);
+        setFirestoreFatalError(wrapped);
+      }
+    };
+
+    void startFirestoreSync();
+
+    return () => {
+      cancelled = true;
+      if (unsubscribeSnapshot) {
+        unsubscribeSnapshot();
+      }
+    };
+  }, [firebaseAuthReady, firebaseUser?.uid, showToast]);
 
   // Connect WebSocket for live multi-user sync across connected browsers
   const currentUserRef = useRef(currentUser);
@@ -422,7 +568,7 @@ export default function App() {
     };
   }, [backendMode]);
 
-  // Persist state atomically to server (or localStorage on static hosts) when modified locally
+  // Persist real local edits to Firestore (via writeBatch), localStorage backup, and optional Node server
   const saveTimerRef = useRef<number | null>(null);
   useEffect(() => {
     if (!loadedFromServer) return;
@@ -430,17 +576,53 @@ export default function App() {
       isRemoteUpdateRef.current = false;
       return;
     }
+    if (!dirtyForFirestoreRef.current) {
+      return;
+    }
+
     if (backendMode === 'static') {
       try {
-        window.localStorage.setItem(STATIC_STATE_KEY, JSON.stringify(state));
+        const migratedDone = window.localStorage.getItem(FIRESTORE_MIGRATED_KEY) === 'true';
+        if (!firebaseUser || migratedDone) {
+          window.localStorage.setItem(STATIC_STATE_KEY, JSON.stringify(state));
+        }
       } catch {
         // ignore storage quota/blocked
       }
-      return;
     }
-    if (backendMode !== 'server') return;
+
     if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
     saveTimerRef.current = window.setTimeout(async () => {
+      dirtyForFirestoreRef.current = false;
+
+      if (firebaseUser && workspaceContext) {
+        const nextRev = syncedRevisionRef.current + 1;
+        syncedRevisionRef.current = nextRev;
+        try {
+          const updatedDocIds = await saveStateToFirestoreBatch({
+            state: {
+              ...state,
+              syncRevision: nextRev,
+              lastUpdatedAt: new Date().toISOString(),
+              lastUpdatedBy: activeUserName,
+            },
+            user: firebaseUser,
+            workspace: workspaceContext,
+            syncRevision: nextRev,
+            originClientId: clientIdRef.current,
+            knownDocIds: firestoreDocIdsRef.current,
+          });
+          firestoreDocIdsRef.current = updatedDocIds;
+          setFirestoreStatus('synced');
+        } catch (err) {
+          const wrapped = err instanceof Error ? err : new Error(String(err));
+          setFirestoreStatus('error');
+          setFirestoreStatusMessage(wrapped.message);
+          setFirestoreFatalError(wrapped);
+        }
+      }
+
+      if (backendMode !== 'server') return;
       try {
         const res = await fetch('/api/state', {
           method: 'PUT',
@@ -476,10 +658,11 @@ export default function App() {
     return () => {
       if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
     };
-  }, [state, loadedFromServer, backendMode, activeUserName, showToast]);
+  }, [state, loadedFromServer, backendMode, activeUserName, showToast, firebaseUser, workspaceContext]);
 
   const commitState = useCallback(
     (updater: (prev: ErpState) => ErpState, recordUndo = false) => {
+      dirtyForFirestoreRef.current = true;
       setState((prev) => {
         if (recordUndo) {
           setUndoStack((u) => [prev, ...u.slice(0, 14)]);
@@ -578,6 +761,7 @@ export default function App() {
 
       if (generated.length === 0) return prev;
 
+      dirtyForFirestoreRef.current = true;
       if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
         try {
           new Notification(generated[0].title, { body: generated[0].message });
@@ -6247,6 +6431,36 @@ export default function App() {
 
   const currentNavLabel = navItems.find((n) => n.id === activeSection)?.label || 'Dashboard';
 
+  const handleGoogleSignIn = useCallback(async () => {
+    await signInWithGoogle();
+  }, []);
+
+  const handleGoogleSignOut = useCallback(async () => {
+    await signOutFirebase();
+    showToast('Disconnected Google Cloud Sync.');
+  }, [showToast]);
+
+  const handleForceFirestoreSync = useCallback(async () => {
+    if (!firebaseUser || !workspaceContext) return;
+    const nextRev = syncedRevisionRef.current + 1;
+    syncedRevisionRef.current = nextRev;
+    const docIds = await saveStateToFirestoreBatch({
+      state: {
+        ...state,
+        syncRevision: nextRev,
+        lastUpdatedAt: new Date().toISOString(),
+        lastUpdatedBy: activeUserName,
+      },
+      user: firebaseUser,
+      workspace: workspaceContext,
+      syncRevision: nextRev,
+      originClientId: clientIdRef.current,
+      knownDocIds: firestoreDocIdsRef.current,
+    });
+    firestoreDocIdsRef.current = docIds;
+    showToast('Synced ledger to Firestore rinse_state via writeBatch.');
+  }, [firebaseUser, workspaceContext, state, activeUserName, showToast]);
+
   // Require login when no active user session exists
   if (!currentUser) {
     return (
@@ -6255,6 +6469,12 @@ export default function App() {
         companyTagline={state.settings.companyTagline}
         users={state.users}
         onLoginSuccess={handleLoginSuccess}
+        firebaseAuthReady={firebaseAuthReady}
+        firebaseUser={firebaseUser}
+        firestoreStatus={firestoreStatus}
+        firestoreStatusMessage={firestoreStatusMessage}
+        onGoogleSignIn={handleGoogleSignIn}
+        onGoogleSignOut={handleGoogleSignOut}
       />
     );
   }
@@ -6457,6 +6677,45 @@ export default function App() {
             </button>
 
             <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => {
+                  if (!firebaseUser) {
+                    void handleGoogleSignIn().catch((err) => {
+                      showToast(err instanceof Error ? err.message : 'Google sign-in canceled');
+                    });
+                  } else if (allowedSections.includes('settings')) {
+                    setActiveSection('settings');
+                  }
+                }}
+                title={
+                  firebaseUser
+                    ? firestoreStatusMessage || `Cloud Sync (${firestoreStatus})`
+                    : 'Connect Google Cloud Sync'
+                }
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl border text-xs font-medium transition-colors whitespace-nowrap ${
+                  firestoreStatus === 'synced'
+                    ? 'bg-emerald-50/90 border-emerald-200 text-emerald-700 hover:bg-emerald-100/80'
+                    : firestoreStatus === 'unauthorized' || firestoreStatus === 'error'
+                      ? 'bg-amber-50 border-amber-200 text-amber-800'
+                      : 'bg-white/80 border-slate-200/80 text-slate-600 hover:bg-white'
+                }`}
+              >
+                {firestoreStatus === 'synced' ? (
+                  <Cloud className="w-3.5 h-3.5 text-emerald-600" />
+                ) : (
+                  <CloudOff className="w-3.5 h-3.5 text-slate-400" />
+                )}
+                <span className="hidden md:inline">
+                  {firestoreStatus === 'synced'
+                    ? 'Cloud Live'
+                    : firestoreStatus === 'connecting'
+                      ? 'Syncing...'
+                      : firestoreStatus === 'unauthorized'
+                        ? 'Needs Invite'
+                        : 'Connect Cloud'}
+                </span>
+              </button>
               <button
                 onClick={() => setNotificationsOpen(true)}
                 className="relative inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white/80 border border-slate-200/80 text-xs font-medium text-slate-700 hover:bg-white transition-colors whitespace-nowrap"
@@ -6877,29 +7136,47 @@ export default function App() {
                 if (!requireAction(activePerms.actions.canManageBackups, 'trigger system backups')) {
                   return;
                 }
-                const res = await fetch('/api/backup', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify(state),
-                });
-                if (res.ok) {
-                  const data = await res.json();
-                  commitState((prev) => ({
-                    ...prev,
-                    settings: { ...prev.settings, lastBackupAt: data.lastBackupAt },
-                  }));
+                if (backendMode === 'server') {
+                  try {
+                    const res = await fetch('/api/backup', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify(state),
+                    });
+                    if (res.ok) {
+                      const data = await res.json();
+                      commitState((prev) => ({
+                        ...prev,
+                        settings: { ...prev.settings, lastBackupAt: data.lastBackupAt },
+                      }));
+                      return;
+                    }
+                  } catch {
+                    // fallback to updating backup timestamp locally & in Firestore
+                  }
                 }
+                commitState((prev) => ({
+                  ...prev,
+                  settings: { ...prev.settings, lastBackupAt: new Date().toISOString() },
+                }));
               }}
               onRestoreState={async (restored: ErpState) => {
                 if (!requireAction(activePerms.actions.canManageBackups, 'restore system backups')) {
                   return;
                 }
                 const migrated = migrateErpState(restored);
-                await fetch('/api/restore', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ state: migrated }),
-                });
+                if (backendMode === 'server') {
+                  try {
+                    await fetch('/api/restore', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ state: migrated }),
+                    });
+                  } catch {
+                    // continue restoring to local/Firestore state
+                  }
+                }
+                dirtyForFirestoreRef.current = true;
                 setState(migrated);
               }}
               onCreateUser={handleCreateUser}
@@ -6912,12 +7189,19 @@ export default function App() {
               onRefreshGitHubStatus={refreshGitHubStatus}
               onApplyPulledState={(pulledState) => {
                 const migrated = migrateErpState(pulledState);
-                isRemoteUpdateRef.current = true;
+                dirtyForFirestoreRef.current = true;
                 if (typeof migrated.syncRevision === 'number') {
                   syncedRevisionRef.current = migrated.syncRevision;
                 }
                 setState(migrated);
               }}
+              firebaseUser={firebaseUser}
+              workspaceContext={workspaceContext}
+              firestoreStatus={firestoreStatus}
+              firestoreStatusMessage={firestoreStatusMessage}
+              onGoogleSignIn={handleGoogleSignIn}
+              onGoogleSignOut={handleGoogleSignOut}
+              onForceFirestoreSync={handleForceFirestoreSync}
             />
           )}
         </main>
