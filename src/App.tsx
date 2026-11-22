@@ -163,6 +163,30 @@ function safeNotificationPermission(): NotificationPermission | 'unsupported' {
   return 'unsupported';
 }
 
+function isTransientOfflineFirestoreError(err: unknown): boolean {
+  const raw = err instanceof Error ? err.message : String(err || '');
+  let inner = raw;
+  try {
+    const parsed = JSON.parse(raw) as { error?: string };
+    if (parsed && typeof parsed.error === 'string') {
+      inner = parsed.error;
+    }
+  } catch {
+    // not JSON-wrapped
+  }
+  const msg = `${raw} ${inner}`.toLowerCase();
+  if (msg.includes('permission-denied') || msg.includes('missing or insufficient permissions')) {
+    return false;
+  }
+  return (
+    msg.includes('client is offline') ||
+    msg.includes('unavailable') ||
+    msg.includes('network-request-failed') ||
+    msg.includes('could not reach cloud firestore') ||
+    msg.includes('failed to fetch')
+  );
+}
+
 export default function App() {
   const [state, setState] = useState<ErpState>(INITIAL_ERP_STATE);
   const [loadedFromServer, setLoadedFromServer] = useState(false);
@@ -356,8 +380,24 @@ export default function App() {
 
     let cancelled = false;
     let unsubscribeSnapshot: (() => void) | null = null;
+    let retryTimer: number | null = null;
+
+    const scheduleRetry = () => {
+      if (cancelled || retryTimer !== null || typeof window === 'undefined') return;
+      retryTimer = window.setTimeout(() => {
+        retryTimer = null;
+        if (!cancelled) {
+          void startFirestoreSync();
+        }
+      }, 15000);
+    };
 
     const startFirestoreSync = async () => {
+      if (cancelled) return;
+      if (unsubscribeSnapshot) {
+        unsubscribeSnapshot();
+        unsubscribeSnapshot = null;
+      }
       setFirestoreStatus('connecting');
       setFirestoreStatusMessage('Connecting to Firestore...');
       try {
@@ -429,6 +469,12 @@ export default function App() {
           },
           onError: (err) => {
             if (cancelled) return;
+            if (isTransientOfflineFirestoreError(err)) {
+              setFirestoreStatus('error');
+              setFirestoreStatusMessage('Cloud sync offline — working locally; retrying automatically.');
+              scheduleRetry();
+              return;
+            }
             setFirestoreStatus('error');
             setFirestoreStatusMessage(err.message);
             setFirestoreFatalError(err);
@@ -437,16 +483,42 @@ export default function App() {
       } catch (err) {
         if (cancelled) return;
         const wrapped = err instanceof Error ? err : new Error(String(err));
+        if (isTransientOfflineFirestoreError(wrapped)) {
+          setFirestoreStatus('error');
+          setFirestoreStatusMessage('Cloud sync offline — working locally; retrying automatically.');
+          scheduleRetry();
+          return;
+        }
         setFirestoreStatus('error');
         setFirestoreStatusMessage(wrapped.message);
         setFirestoreFatalError(wrapped);
       }
     };
 
+    const handleOnline = () => {
+      if (!cancelled) {
+        if (retryTimer !== null && typeof window !== 'undefined') {
+          window.clearTimeout(retryTimer);
+          retryTimer = null;
+        }
+        void startFirestoreSync();
+      }
+    };
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener('online', handleOnline);
+    }
+
     void startFirestoreSync();
 
     return () => {
       cancelled = true;
+      if (retryTimer !== null && typeof window !== 'undefined') {
+        window.clearTimeout(retryTimer);
+      }
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('online', handleOnline);
+      }
       if (unsubscribeSnapshot) {
         unsubscribeSnapshot();
       }
@@ -616,9 +688,15 @@ export default function App() {
           setFirestoreStatus('synced');
         } catch (err) {
           const wrapped = err instanceof Error ? err : new Error(String(err));
-          setFirestoreStatus('error');
-          setFirestoreStatusMessage(wrapped.message);
-          setFirestoreFatalError(wrapped);
+          if (isTransientOfflineFirestoreError(wrapped)) {
+            dirtyForFirestoreRef.current = true;
+            setFirestoreStatus('error');
+            setFirestoreStatusMessage('Cloud sync offline — saved locally; waiting to reconnect.');
+          } else {
+            setFirestoreStatus('error');
+            setFirestoreStatusMessage(wrapped.message);
+            setFirestoreFatalError(wrapped);
+          }
         }
       }
 

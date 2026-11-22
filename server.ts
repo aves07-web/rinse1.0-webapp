@@ -693,6 +693,10 @@ export async function startServer(options: StartServerOptions = {}) {
         res.status(404).json({ error: 'API route not found' });
         return;
       }
+      if (path.extname(req.path)) {
+        res.status(404).end();
+        return;
+      }
       res.sendFile(distIndexPath);
     });
   };
