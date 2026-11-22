@@ -86,6 +86,8 @@ export interface RemoteStateSnapshot {
   syncRevision: number;
   originClientId: string;
   docIds: string[];
+  sectionHashes: Record<string, string>;
+  businessJson: string;
 }
 
 function normalizeId(raw: string): string {
@@ -459,6 +461,51 @@ function serializeErpStateToSections(state: ErpState): SerializedSectionDoc[] {
   return docs;
 }
 
+function normalizeSectionPayloadForHash(
+  section: RinseSectionName,
+  payload: Record<string, unknown>
+): Record<string, unknown> {
+  if (section === 'meta') {
+    const rest = { ...payload };
+    delete rest.lastUpdatedAt;
+    delete rest.lastUpdatedBy;
+    return rest;
+  }
+  return payload;
+}
+
+export function serializeStateSectionHashes(state: ErpState): {
+  docs: SerializedSectionDoc[];
+  sectionHashes: Record<string, string>;
+  businessJson: string;
+} {
+  const docs = serializeErpStateToSections(state);
+  const sectionHashes: Record<string, string> = {};
+  const entries: Array<[string, string]> = [];
+
+  for (const d of docs) {
+    const normalizedPayload = normalizeSectionPayloadForHash(d.section, d.payload);
+    const hashJson = JSON.stringify(normalizedPayload);
+    sectionHashes[d.docId] = hashJson;
+    entries.push([d.docId, hashJson]);
+  }
+
+  entries.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  return {
+    docs,
+    sectionHashes,
+    businessJson: JSON.stringify(entries),
+  };
+}
+
+export function computeBusinessStateHash(state: ErpState): string {
+  return serializeStateSectionHashes(state).businessJson;
+}
+
+export function computeSectionHashes(state: ErpState): Record<string, string> {
+  return serializeStateSectionHashes(state).sectionHashes;
+}
+
 function assembleErpStateFromDocs(
   rawDocs: Array<{ id: string; data: Record<string, unknown> }>
 ): RemoteStateSnapshot | null {
@@ -651,11 +698,16 @@ function assembleErpStateFromDocs(
     accounts: partial.accounts || INITIAL_ERP_STATE.accounts,
   };
 
+  const finalState = migrateErpState(hydratedInput);
+  const { sectionHashes, businessJson } = serializeStateSectionHashes(finalState);
+
   return {
-    state: migrateErpState(hydratedInput),
+    state: finalState,
     syncRevision: maxRevision,
     originClientId: metaOriginClientId,
     docIds,
+    sectionHashes,
+    businessJson,
   };
 }
 
@@ -677,26 +729,35 @@ export async function ensureWorkspaceAccess(
   const isBootstrappedAdmin = email === BOOTSTRAPPED_ADMIN_EMAIL.toLowerCase();
   const userDocPath = `${USERS_COLLECTION}/${user.uid}`;
 
-  // 1. Upsert private user profile
+  // 1. Upsert private user profile only when fields actually changed (avoids startup write quota burn)
   try {
     const userRef = doc(db, USERS_COLLECTION, user.uid);
     const userSnap = await getDoc(userRef);
+    const nextDisplayName = (user.displayName || email.split('@')[0] || 'User').slice(0, 120);
+    const nextPhotoUrl = user.photoURL ? user.photoURL.slice(0, 1000) : '';
     if (!userSnap.exists()) {
       await setDoc(userRef, {
         uid: user.uid,
         email,
-        displayName: (user.displayName || email.split('@')[0] || 'User').slice(0, 120),
-        ...(user.photoURL ? { photoURL: user.photoURL.slice(0, 1000) } : {}),
+        displayName: nextDisplayName,
+        ...(nextPhotoUrl ? { photoURL: nextPhotoUrl } : {}),
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
     } else {
-      await updateDoc(userRef, {
-        email,
-        displayName: (user.displayName || email.split('@')[0] || 'User').slice(0, 120),
-        ...(user.photoURL ? { photoURL: user.photoURL.slice(0, 1000) } : {}),
-        updatedAt: serverTimestamp(),
-      });
+      const existingProfile = userSnap.data();
+      const profileChanged =
+        existingProfile.email !== email ||
+        existingProfile.displayName !== nextDisplayName ||
+        (existingProfile.photoURL || '') !== nextPhotoUrl;
+      if (profileChanged) {
+        await updateDoc(userRef, {
+          email,
+          displayName: nextDisplayName,
+          ...(nextPhotoUrl ? { photoURL: nextPhotoUrl } : {}),
+          updatedAt: serverTimestamp(),
+        });
+      }
     }
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, userDocPath);
@@ -866,7 +927,7 @@ export async function ensureWorkspaceAccess(
 }
 
 /**
- * Atomically writes the full ErpState into partitioned rinse_state documents via writeBatch.
+ * Atomically writes only the changed partitioned rinse_state documents via writeBatch.
  * Cleans up any previously known overflow chunk documents that are no longer needed.
  */
 export async function saveStateToFirestoreBatch(params: {
@@ -876,11 +937,41 @@ export async function saveStateToFirestoreBatch(params: {
   syncRevision: number;
   originClientId: string;
   knownDocIds?: string[];
-}): Promise<string[]> {
-  const { state, user, workspace, syncRevision, originClientId, knownDocIds = [] } = params;
-  const serializedDocs = serializeErpStateToSections(state);
-  const nextDocIdSet = new Set(serializedDocs.map((d) => d.docId));
+  lastSyncedDocs?: Record<string, string>;
+  forceAll?: boolean;
+}): Promise<{
+  docIds: string[];
+  sectionHashes: Record<string, string>;
+  businessJson: string;
+  writtenCount: number;
+}> {
+  const {
+    state,
+    user,
+    workspace,
+    syncRevision,
+    originClientId,
+    knownDocIds = [],
+    lastSyncedDocs,
+    forceAll = false,
+  } = params;
+  const { docs: serializedDocs, sectionHashes, businessJson } = serializeStateSectionHashes(state);
+  const nextDocIds = serializedDocs.map((d) => d.docId);
+  const nextDocIdSet = new Set(nextDocIds);
   const staleDocIds = knownDocIds.filter((id) => !nextDocIdSet.has(id));
+
+  const docsToWrite = serializedDocs.filter(
+    (item) => forceAll || !lastSyncedDocs || lastSyncedDocs[item.docId] !== sectionHashes[item.docId]
+  );
+
+  if (docsToWrite.length === 0 && staleDocIds.length === 0) {
+    return {
+      docIds: nextDocIds,
+      sectionHashes,
+      businessJson,
+      writtenCount: 0,
+    };
+  }
 
   const safeMemberUids = Array.from(
     new Set([workspace.ownerUid, ...workspace.memberUids, user.uid].filter(Boolean))
@@ -892,7 +983,7 @@ export async function saveStateToFirestoreBatch(params: {
     | { kind: 'set'; docId: string; data: Record<string, unknown> }
     | { kind: 'delete'; docId: string };
 
-  const ops: BatchOp[] = serializedDocs.map((item) => ({
+  const ops: BatchOp[] = docsToWrite.map((item) => ({
     kind: 'set',
     docId: item.docId,
     data: {
@@ -931,7 +1022,12 @@ export async function saveStateToFirestoreBatch(params: {
     handleFirestoreError(err, OperationType.WRITE, RINSE_STATE_COLLECTION);
   }
 
-  return serializedDocs.map((d) => d.docId);
+  return {
+    docIds: nextDocIds,
+    sectionHashes,
+    businessJson,
+    writtenCount: ops.length,
+  };
 }
 
 /**
@@ -946,7 +1042,14 @@ export async function migrateLocalStorageToFirestoreIfNeeded(params: {
   user: User;
   workspace: WorkspaceContext;
   originClientId: string;
-}): Promise<{ migrated: boolean; state?: ErpState; docIds?: string[]; syncRevision?: number }> {
+}): Promise<{
+  migrated: boolean;
+  state?: ErpState;
+  docIds?: string[];
+  sectionHashes?: Record<string, string>;
+  businessJson?: string;
+  syncRevision?: number;
+}> {
   if (typeof window === 'undefined') return { migrated: false };
 
   let alreadyMigrated = false;
@@ -982,12 +1085,13 @@ export async function migrateLocalStorageToFirestoreIfNeeded(params: {
     lastUpdatedBy: migratedState.lastUpdatedBy || 'LocalStorage Migration',
   };
 
-  const docIds = await saveStateToFirestoreBatch({
+  const batchResult = await saveStateToFirestoreBatch({
     state: stateToUpload,
     user: params.user,
     workspace: params.workspace,
     syncRevision: nextRevision,
     originClientId: params.originClientId,
+    forceAll: true,
   });
 
   try {
@@ -1000,7 +1104,9 @@ export async function migrateLocalStorageToFirestoreIfNeeded(params: {
   return {
     migrated: true,
     state: stateToUpload,
-    docIds,
+    docIds: batchResult.docIds,
+    sectionHashes: batchResult.sectionHashes,
+    businessJson: batchResult.businessJson,
     syncRevision: nextRevision,
   };
 }

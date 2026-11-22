@@ -102,18 +102,26 @@ function EChartBox({ option, height = 310, onInit, onChartClick }: EChartBoxProp
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
-    const chart = echarts.init(el);
-    chartRef.current = chart;
-    onInit?.(chart);
+    let chart: echarts.ECharts | null = null;
+    let ro: ResizeObserver | null = null;
+    try {
+      chart = echarts.init(el);
+      chartRef.current = chart;
+      onInit?.(chart);
 
-    const ro = new ResizeObserver(() => {
-      chart.resize();
-    });
-    ro.observe(el);
+      if (typeof ResizeObserver !== 'undefined') {
+        ro = new ResizeObserver(() => {
+          chart?.resize();
+        });
+        ro.observe(el);
+      }
+    } catch (err) {
+      console.error('Chart initialization failed:', err);
+    }
 
     return () => {
-      ro.disconnect();
-      chart.dispose();
+      ro?.disconnect();
+      chart?.dispose();
       chartRef.current = null;
     };
   }, []);

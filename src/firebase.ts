@@ -21,7 +21,7 @@ function createFirestoreClient(): Firestore {
   try {
     return initializeFirestore(
       app,
-      { experimentalAutoDetectLongPolling: true },
+      { experimentalForceLongPolling: true },
       firebaseConfig.firestoreDatabaseId
     );
   } catch {
