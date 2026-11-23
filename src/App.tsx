@@ -826,9 +826,8 @@ export default function App() {
     []
   );
 
-  // Automated Notification Rules Scanner (strictly local on background timer so idle never consumes Firestore write quota)
-  const runAutomatedRuleScan = useCallback((markDirty: unknown = false) => {
-    const shouldPersist = markDirty === true;
+  // Automated Notification Rules Scanner (strictly local alerts so idle scans never mark Firestore dirty or increment Rev #)
+  const runAutomatedRuleScan = useCallback(() => {
     setState((prev) => {
       const generated: NotificationItem[] = [];
       const nowMs = Date.now();
@@ -914,9 +913,6 @@ export default function App() {
 
       if (generated.length === 0) return prev;
 
-      if (shouldPersist) {
-        dirtyForFirestoreRef.current = true;
-      }
       if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
         try {
           new Notification(generated[0].title, { body: generated[0].message });
@@ -936,7 +932,7 @@ export default function App() {
   useEffect(() => {
     if (!currentUser) return;
     const id = window.setInterval(() => {
-      runAutomatedRuleScan(false);
+      runAutomatedRuleScan();
     }, 300_000);
     return () => window.clearInterval(id);
   }, [currentUser, runAutomatedRuleScan]);

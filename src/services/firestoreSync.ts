@@ -461,17 +461,41 @@ function serializeErpStateToSections(state: ErpState): SerializedSectionDoc[] {
   return docs;
 }
 
+const HASH_EXCLUDED_KEYS = new Set([
+  'lastUpdatedAt',
+  'lastUpdatedBy',
+  'syncRevision',
+  'alerts',
+  'notifications',
+  'lastBackupAt',
+  'autoBackup',
+  'autoBackupEnabled',
+  'auditLogs',
+]);
+
+function stripHashExcludedKeys(value: unknown): unknown {
+  if (value === null || value === undefined || typeof value !== 'object') {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => stripHashExcludedKeys(item));
+  }
+  const out: Record<string, unknown> = {};
+  for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+    if (HASH_EXCLUDED_KEYS.has(key)) continue;
+    out[key] = stripHashExcludedKeys(val);
+  }
+  return out;
+}
+
 function normalizeSectionPayloadForHash(
   section: RinseSectionName,
   payload: Record<string, unknown>
 ): Record<string, unknown> {
-  if (section === 'meta') {
-    const rest = { ...payload };
-    delete rest.lastUpdatedAt;
-    delete rest.lastUpdatedBy;
-    return rest;
+  if (section === 'blackbox') {
+    return {};
   }
-  return payload;
+  return stripHashExcludedKeys(payload) as Record<string, unknown>;
 }
 
 export function serializeStateSectionHashes(state: ErpState): {
@@ -487,6 +511,8 @@ export function serializeStateSectionHashes(state: ErpState): {
     const normalizedPayload = normalizeSectionPayloadForHash(d.section, d.payload);
     const hashJson = JSON.stringify(normalizedPayload);
     sectionHashes[d.docId] = hashJson;
+    if (d.section === 'blackbox') continue;
+    if (d.section === 'tasks' && d.chunkIndex > 0) continue;
     entries.push([d.docId, hashJson]);
   }
 
