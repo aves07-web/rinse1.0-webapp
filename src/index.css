@@ -177,6 +177,8 @@
   padding: 12mm;
   background-color: #ffffff !important;
   color: #0f172a !important;
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
 }
 
 .a4-invoice-table thead {

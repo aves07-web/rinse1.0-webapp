@@ -105,7 +105,6 @@ export function A4InvoiceDocument({
             <th className="py-2 px-2">Service</th>
             <th className="py-2 px-2 text-right">Qty</th>
             <th className="py-2 px-2 text-right">Unit Price</th>
-            <th className="py-2 px-2 text-right">Discount</th>
             <th className="py-2 px-2 text-right">Line Total</th>
           </tr>
         </thead>
@@ -118,9 +117,6 @@ export function A4InvoiceDocument({
               <td className="py-2.5 px-2 text-right font-mono">
                 {formatMoney(line.unitPrice, sym)}
               </td>
-              <td className="py-2.5 px-2 text-right font-mono">
-                {formatMoney(line.discount, sym)}
-              </td>
               <td className="py-2.5 px-2 text-right font-mono font-semibold">
                 {formatMoney(line.total, sym)}
               </td>
@@ -132,32 +128,32 @@ export function A4InvoiceDocument({
       {/* Totals + Terms + Signature Block kept together */}
       <div className="a4-signature-keep">
         <div className="flex justify-end border-t border-slate-200 pt-4">
-          <div className="w-64 space-y-1.5 text-xs tabular-nums">
-            <div className="flex justify-between text-slate-600">
+          <div className="w-72 space-y-1.5 text-xs tabular-nums">
+            <div className="flex justify-between items-center px-2.5 py-1 rounded-md bg-violet-50 text-violet-700 font-semibold">
               <span>Subtotal</span>
               <span className="font-mono">{formatMoney(invoice.subtotal, sym)}</span>
             </div>
             {invoice.extraCharges > 0 && (
-              <div className="flex justify-between text-slate-600">
+              <div className="flex justify-between items-center px-2.5 py-0.5 text-slate-600">
                 <span>Additional Charges</span>
                 <span className="font-mono">{formatMoney(invoice.extraCharges, sym)}</span>
               </div>
             )}
-            {invoice.discountTotal > 0 && (
-              <div className="flex justify-between text-slate-600">
+            {Number(invoice.discountTotal) > 0 && (
+              <div className="flex justify-between items-center px-2.5 py-1 rounded-md bg-emerald-50 text-emerald-700 font-semibold">
                 <span>Discount</span>
                 <span className="font-mono">-{formatMoney(invoice.discountTotal, sym)}</span>
               </div>
             )}
-            <div className="flex justify-between text-sm font-bold text-slate-900 pt-2 border-t border-[#0071E3]">
+            <div className="flex justify-between items-center text-sm font-bold px-2.5 py-1.5 rounded-md bg-blue-50 text-[#0071E3] border-t-2 border-[#0071E3]">
               <span>Grand Total</span>
               <span className="font-mono">{formatMoney(invoice.grandTotal, sym)}</span>
             </div>
-            <div className="flex justify-between text-slate-700">
+            <div className="flex justify-between items-center px-2.5 pt-0.5 text-slate-700">
               <span>Paid Amount</span>
               <span className="font-mono">{formatMoney(invoice.paidAmount, sym)}</span>
             </div>
-            <div className="flex justify-between font-semibold text-slate-900">
+            <div className="flex justify-between items-center px-2.5 font-semibold text-slate-900">
               <span>Balance Due</span>
               <span className="font-mono">{formatMoney(invoice.dueAmount, sym)}</span>
             </div>

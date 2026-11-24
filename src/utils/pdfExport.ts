@@ -213,10 +213,9 @@ export async function exportInvoiceToA4Pdf(invoice: Invoice, settings: AppSettin
     doc.setFontSize(8.5);
     doc.setTextColor(51, 65, 85);
     doc.text('Product', margin + 2, curY + 5);
-    doc.text('Service', margin + 62, curY + 5);
-    doc.text('Qty', margin + 114, curY + 5, { align: 'right' });
-    doc.text('Unit Price', margin + 139, curY + 5, { align: 'right' });
-    doc.text('Discount', margin + 162, curY + 5, { align: 'right' });
+    doc.text('Service', margin + 72, curY + 5);
+    doc.text('Qty', margin + 128, curY + 5, { align: 'right' });
+    doc.text('Unit Price', margin + 156, curY + 5, { align: 'right' });
     doc.text('Total', pageWidth - margin - 2, curY + 5, { align: 'right' });
     return curY + 9;
   };
@@ -225,8 +224,8 @@ export async function exportInvoiceToA4Pdf(invoice: Invoice, settings: AppSettin
 
   // Items rows with clean page break & repeated header
   for (const line of invoice.lines) {
-    const prodLines = doc.splitTextToSize(line.productName || '-', 56);
-    const srvLines = doc.splitTextToSize(line.serviceName || '-', 42);
+    const prodLines = doc.splitTextToSize(line.productName || '-', 66);
+    const srvLines = doc.splitTextToSize(line.serviceName || '-', 48);
     const rowLines = Math.max(prodLines.length, srvLines.length);
     const rowHeight = Math.max(6.5, rowLines * 4 + 2.5);
 
@@ -241,11 +240,10 @@ export async function exportInvoiceToA4Pdf(invoice: Invoice, settings: AppSettin
     doc.setTextColor(15, 23, 42);
     doc.text(prodLines, margin + 2, y + 4);
     doc.setTextColor(71, 85, 105);
-    doc.text(srvLines, margin + 62, y + 4);
+    doc.text(srvLines, margin + 72, y + 4);
     doc.setTextColor(15, 23, 42);
-    doc.text(String(line.quantity), margin + 114, y + 4, { align: 'right' });
-    doc.text(formatMoney(line.unitPrice, sym), margin + 139, y + 4, { align: 'right' });
-    doc.text(formatMoney(line.discount, sym), margin + 162, y + 4, { align: 'right' });
+    doc.text(String(line.quantity), margin + 128, y + 4, { align: 'right' });
+    doc.text(formatMoney(line.unitPrice, sym), margin + 156, y + 4, { align: 'right' });
     doc.setFont('helvetica', 'bold');
     doc.text(formatMoney(line.total, sym), pageWidth - margin - 2, y + 4, { align: 'right' });
 
@@ -258,7 +256,7 @@ export async function exportInvoiceToA4Pdf(invoice: Invoice, settings: AppSettin
   // Keep Totals + Terms + Signatures together so signature block never sits alone
   const termsText = invoice.termsAndConditions || settings.invoiceTerms || '';
   const termsLines = doc.splitTextToSize(termsText, contentWidth);
-  const footerHeight = 42 + termsLines.length * 3.8 + 26;
+  const footerHeight = 46 + termsLines.length * 3.8 + 26;
 
   if (y + footerHeight > pageHeight - margin) {
     doc.addPage();
@@ -266,34 +264,67 @@ export async function exportInvoiceToA4Pdf(invoice: Invoice, settings: AppSettin
   }
 
   y += 5;
-  const totalsX = pageWidth - margin - 66;
-  const rowStep = 5.2;
+  const totalsWidth = 72;
+  const totalsX = pageWidth - margin - totalsWidth;
+  const rowStep = 6;
 
-  const drawTotalRow = (label: string, val: string, bold = false) => {
+  const drawTotalRow = (
+    label: string,
+    val: string,
+    opts?: {
+      bold?: boolean;
+      fontSize?: number;
+      textRgb?: [number, number, number];
+      fillRgb?: [number, number, number];
+      topBorderRgb?: [number, number, number];
+    }
+  ) => {
+    const bold = opts?.bold ?? false;
+    const fontSize = opts?.fontSize ?? (bold ? 9.5 : 8.5);
+    const [r, g, b] = opts?.textRgb ?? (bold ? [15, 23, 42] : [71, 85, 105]);
+    if (opts?.fillRgb) {
+      doc.setFillColor(opts.fillRgb[0], opts.fillRgb[1], opts.fillRgb[2]);
+      doc.roundedRect(totalsX, y - 4, totalsWidth, 5.6, 1, 1, 'F');
+    }
+    if (opts?.topBorderRgb) {
+      doc.setDrawColor(opts.topBorderRgb[0], opts.topBorderRgb[1], opts.topBorderRgb[2]);
+      doc.setLineWidth(0.45);
+      doc.line(totalsX, y - 4, pageWidth - margin, y - 4);
+    }
     doc.setFont('helvetica', bold ? 'bold' : 'normal');
-    doc.setFontSize(bold ? 9.5 : 8.5);
-    doc.setTextColor(bold ? 15 : 71, bold ? 23 : 85, bold ? 42 : 105);
-    doc.text(label, totalsX, y);
-    doc.text(val, pageWidth - margin, y, { align: 'right' });
+    doc.setFontSize(fontSize);
+    doc.setTextColor(r, g, b);
+    doc.text(label, totalsX + 2, y);
+    doc.text(val, pageWidth - margin - 2, y, { align: 'right' });
     y += rowStep;
   };
 
-  drawTotalRow('Subtotal', formatMoney(invoice.subtotal, sym));
+  drawTotalRow('Subtotal', formatMoney(invoice.subtotal, sym), {
+    bold: true,
+    textRgb: [109, 40, 217],
+    fillRgb: [245, 243, 255],
+  });
   if (invoice.extraCharges > 0) {
     drawTotalRow('Additional Charges', formatMoney(invoice.extraCharges, sym));
   }
-  if (invoice.discountTotal > 0) {
-    drawTotalRow('Discount', `-${formatMoney(invoice.discountTotal, sym)}`);
+  if (Number(invoice.discountTotal) > 0) {
+    drawTotalRow('Discount', `-${formatMoney(invoice.discountTotal, sym)}`, {
+      bold: true,
+      textRgb: [5, 150, 105],
+      fillRgb: [236, 253, 245],
+    });
   }
 
-  doc.setDrawColor(0, 113, 227);
-  doc.setLineWidth(0.35);
-  doc.line(totalsX, y - 2, pageWidth - margin, y - 2);
-  y += 2;
-
-  drawTotalRow('Grand Total', formatMoney(invoice.grandTotal, sym), true);
+  y += 0.8;
+  drawTotalRow('Grand Total', formatMoney(invoice.grandTotal, sym), {
+    bold: true,
+    fontSize: 9.5,
+    textRgb: [0, 113, 227],
+    fillRgb: [239, 246, 255],
+    topBorderRgb: [0, 113, 227],
+  });
   drawTotalRow('Paid Amount', formatMoney(invoice.paidAmount, sym));
-  drawTotalRow('Balance Due', formatMoney(invoice.dueAmount, sym), true);
+  drawTotalRow('Balance Due', formatMoney(invoice.dueAmount, sym), { bold: true });
 
   y += 5;
   doc.setDrawColor(226, 232, 240);

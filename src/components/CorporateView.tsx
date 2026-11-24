@@ -1400,10 +1400,15 @@ export function CorporateView({
                               </span>
                             </div>
 
-                            <div className="text-right font-mono tabular-nums pl-2 border-l border-slate-200">
-                              <p className="text-[11px] text-slate-500">
-                                Discount: -{formatMoney(corpBillDiscountAmount, sym)}
+                            <div className="text-right font-mono tabular-nums pl-2 border-l border-slate-200 space-y-0.5">
+                              <p className="text-[11px] font-medium text-violet-700">
+                                Subtotal: {formatMoney(unbilledTotal, sym)}
                               </p>
+                              {corpBillDiscountAmount > 0 && (
+                                <p className="text-[11px] font-medium text-emerald-700">
+                                  Discount: -{formatMoney(corpBillDiscountAmount, sym)}
+                                </p>
+                              )}
                               <p className="text-sm font-semibold text-[#0071E3]">
                                 Net Total: {formatMoney(corpBillNetTotal, sym)}
                               </p>
@@ -1778,23 +1783,25 @@ export function CorporateView({
               </div>
 
               <div className="p-3 rounded-xl bg-white/80 border border-slate-200/80 space-y-1.5 tabular-nums">
-                <div className="flex items-center justify-between text-slate-600">
+                <div className="flex items-center justify-between text-violet-700 font-medium">
                   <span>{unbilledItems.length} unbilled line(s) (Private Rate Subtotal)</span>
                   <span className="font-mono">{formatMoney(unbilledTotal, sym)}</span>
                 </div>
-                <div className="flex items-center justify-between text-emerald-700">
-                  <span>
-                    Custom Discount (
-                    {customDiscountType === 'percent'
-                      ? `${Math.min(100, parsedCustomDiscVal)}%`
-                      : 'Flat'}
-                    )
-                  </span>
-                  <span className="font-mono">-{formatMoney(corpBillDiscountAmount, sym)}</span>
-                </div>
-                <div className="flex items-center justify-between pt-1.5 border-t border-slate-200/70 font-semibold text-slate-900">
+                {corpBillDiscountAmount > 0 && (
+                  <div className="flex items-center justify-between text-emerald-700 font-medium">
+                    <span>
+                      Custom Discount (
+                      {customDiscountType === 'percent'
+                        ? `${Math.min(100, parsedCustomDiscVal)}%`
+                        : 'Flat'}
+                      )
+                    </span>
+                    <span className="font-mono">-{formatMoney(corpBillDiscountAmount, sym)}</span>
+                  </div>
+                )}
+                <div className="flex items-center justify-between pt-1.5 border-t border-slate-200/70 font-semibold text-[#0071E3]">
                   <span>Final Invoice Total</span>
-                  <span className="font-mono text-[#0071E3]">
+                  <span className="font-mono">
                     {formatMoney(corpBillNetTotal, sym)}
                   </span>
                 </div>
