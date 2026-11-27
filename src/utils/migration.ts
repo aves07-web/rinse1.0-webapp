@@ -213,6 +213,14 @@ export function migrateErpState(raw: Partial<ErpState> | null | undefined): ErpS
         raw.settings.expenseCategories,
         INITIAL_ERP_STATE.settings.expenseCategories
       ),
+      staffRoles: arr(
+        raw.settings.staffRoles,
+        INITIAL_ERP_STATE.settings.staffRoles || []
+      ),
+      quantityDiscountRules: arr(
+        raw.settings.quantityDiscountRules,
+        INITIAL_ERP_STATE.settings.quantityDiscountRules || []
+      ),
     },
     idFormats: {
       ...DEFAULT_ID_FORMATS,
@@ -234,6 +242,10 @@ export function migrateErpState(raw: Partial<ErpState> | null | undefined): ErpS
     orders: arr(raw.orders, INITIAL_ERP_STATE.orders),
     corporateCustomers: migratedCorp,
     corporateMovements: arr(raw.corporateMovements, INITIAL_ERP_STATE.corporateMovements),
+    corporateRewashRecords: arr(
+      raw.corporateRewashRecords,
+      INITIAL_ERP_STATE.corporateRewashRecords
+    ),
     suppliers: arr(raw.suppliers, INITIAL_ERP_STATE.suppliers),
     chemicals: arr(raw.chemicals, INITIAL_ERP_STATE.chemicals),
     stockMovements: arr(raw.stockMovements, INITIAL_ERP_STATE.stockMovements),
@@ -241,6 +253,7 @@ export function migrateErpState(raw: Partial<ErpState> | null | undefined): ErpS
     journalEntries: arr(raw.journalEntries, INITIAL_ERP_STATE.journalEntries),
     employees: arr(raw.employees, INITIAL_ERP_STATE.employees),
     payrollRecords: arr(raw.payrollRecords, INITIAL_ERP_STATE.payrollRecords),
+    staffFines: arr(raw.staffFines, INITIAL_ERP_STATE.staffFines),
     expenses: arr(raw.expenses, INITIAL_ERP_STATE.expenses),
     invoices: arr(raw.invoices, INITIAL_ERP_STATE.invoices),
     tasks: arr(raw.tasks, INITIAL_ERP_STATE.tasks),

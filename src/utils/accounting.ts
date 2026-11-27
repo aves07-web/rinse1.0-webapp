@@ -18,6 +18,111 @@ export function formatMoney(amount: number, symbol = 'Tk'): string {
   return amount < 0 ? `-${symbol} ${formatted}` : `${symbol} ${formatted}`;
 }
 
+export function computeLineNetAmount(
+  quantity: number,
+  unitPrice: number,
+  discount: number
+): { gross: number; discount: number; net: number; discountPct: number } {
+  const safeQty = Math.max(0, Number(quantity) || 0);
+  const safePrice = Math.max(0, Number(unitPrice) || 0);
+  const gross = Number((safeQty * safePrice).toFixed(2));
+  const clampedDisc = Number(Math.min(gross, Math.max(0, Number(discount) || 0)).toFixed(2));
+  const net = Number(Math.max(0, gross - clampedDisc).toFixed(2));
+  const discountPct = gross > 0 && clampedDisc > 0 ? Number(((clampedDisc / gross) * 100).toFixed(1)) : 0;
+  return { gross, discount: clampedDisc, net, discountPct };
+}
+
+export function derivePaymentModeLabel(
+  paidAmount: number,
+  grandTotal: number,
+  splits?: PaymentSplit[],
+  fallbackLabel?: string
+): string {
+  if (fallbackLabel?.trim()) return fallbackLabel.trim();
+  const paid = Math.max(0, Number(paidAmount) || 0);
+  if (paid <= 0) return grandTotal > 0 ? 'Credit / Unpaid' : 'N/A';
+  const activeSplits = (splits || []).filter((s) => Number(s.amount) > 0);
+  if (activeSplits.length > 0) {
+    const names = Array.from(
+      new Set(activeSplits.map((s) => (s.accountName || s.accountCode || '').trim()).filter(Boolean))
+    );
+    if (names.length > 0) return names.join(' + ');
+  }
+  return paid >= grandTotal ? 'Paid' : 'Partial Payment';
+}
+
+const ONES = [
+  '',
+  'One',
+  'Two',
+  'Three',
+  'Four',
+  'Five',
+  'Six',
+  'Seven',
+  'Eight',
+  'Nine',
+  'Ten',
+  'Eleven',
+  'Twelve',
+  'Thirteen',
+  'Fourteen',
+  'Fifteen',
+  'Sixteen',
+  'Seventeen',
+  'Eighteen',
+  'Nineteen',
+];
+const TENS = ['', '', 'Twenty', 'Thirty', 'Forty', 'Fifty', 'Sixty', 'Seven', 'Eighty', 'Ninety'];
+TENS[7] = 'Seventy';
+
+function wordsUnderThousand(n: number): string {
+  const num = Math.trunc(n);
+  if (num === 0) return '';
+  if (num < 20) return ONES[num];
+  if (num < 100) {
+    const ten = Math.floor(num / 10);
+    const rem = num % 10;
+    return rem ? `${TENS[ten]} ${ONES[rem]}` : TENS[ten];
+  }
+  const hundred = Math.floor(num / 100);
+  const rem = num % 100;
+  return rem ? `${ONES[hundred]} Hundred ${wordsUnderThousand(rem)}` : `${ONES[hundred]} Hundred`;
+}
+
+export function amountToWords(amount: number, currencyCode = 'BDT'): string {
+  const safe = Math.max(0, Number(amount) || 0);
+  const whole = Math.floor(safe + 1e-6);
+  const fraction = Math.round((safe - whole) * 100);
+
+  const unitLabel = currencyCode === 'BDT' ? 'Taka' : currencyCode === 'USD' ? 'Dollars' : currencyCode;
+  const subLabel = currencyCode === 'BDT' ? 'Paisa' : 'Cents';
+
+  const integerToWords = (num: number): string => {
+    if (num === 0) return 'Zero';
+    const scales = ['', 'Thousand', 'Million', 'Billion'];
+    const parts: string[] = [];
+    let rem = num;
+    let idx = 0;
+    while (rem > 0) {
+      const chunk = rem % 1000;
+      if (chunk > 0) {
+        const chunkWords = wordsUnderThousand(chunk);
+        parts.unshift(scales[idx] ? `${chunkWords} ${scales[idx]}` : chunkWords);
+      }
+      rem = Math.floor(rem / 1000);
+      idx += 1;
+    }
+    return parts.join(' ');
+  };
+
+  const wholeWords = `${integerToWords(whole)} ${unitLabel}`;
+  if (fraction > 0) {
+    return `${wholeWords} and ${integerToWords(fraction)} ${subLabel} Only`;
+  }
+  return `${wholeWords} Only`;
+}
+
 export function inferMoneyChannel(name: string, fallback?: MoneySourceChannel): MoneySourceChannel {
   const n = name.toLowerCase();
   if (

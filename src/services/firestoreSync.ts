@@ -4,6 +4,7 @@ import {
   deleteDoc,
   doc,
   getDoc,
+  getDocFromServer,
   getDocs,
   onSnapshot,
   query,
@@ -131,6 +132,7 @@ export function hasRealBusinessRecords(raw: Partial<ErpState> | null | undefined
     (Array.isArray(raw.customers) && raw.customers.length > 0) ||
     (Array.isArray(raw.corporateCustomers) && raw.corporateCustomers.length > 0) ||
     (Array.isArray(raw.corporateMovements) && raw.corporateMovements.length > 0) ||
+    (Array.isArray(raw.corporateRewashRecords) && raw.corporateRewashRecords.length > 0) ||
     (Array.isArray(raw.products) && raw.products.length > 0) ||
     (Array.isArray(raw.services) && raw.services.length > 0) ||
     (Array.isArray(raw.prices) && raw.prices.length > 0) ||
@@ -141,6 +143,7 @@ export function hasRealBusinessRecords(raw: Partial<ErpState> | null | undefined
     (Array.isArray(raw.journalEntries) && raw.journalEntries.length > 0) ||
     (Array.isArray(raw.employees) && raw.employees.length > 0) ||
     (Array.isArray(raw.payrollRecords) && raw.payrollRecords.length > 0) ||
+    (Array.isArray(raw.staffFines) && raw.staffFines.length > 0) ||
     (Array.isArray(raw.expenses) && raw.expenses.length > 0) ||
     (Array.isArray(raw.invoices) && raw.invoices.length > 0) ||
     (Array.isArray(raw.tasks) && raw.tasks.length > 0) ||
@@ -333,6 +336,7 @@ function serializeErpStateToSections(state: ErpState): SerializedSectionDoc[] {
         idx === 0
           ? {
               corporateCustomers: clean.corporateCustomers,
+              corporateRewashRecords: clean.corporateRewashRecords || [],
               corporateMovements: movements,
             }
           : { corporateMovements: movements },
@@ -421,6 +425,7 @@ function serializeErpStateToSections(state: ErpState): SerializedSectionDoc[] {
           ? {
               employees: clean.employees,
               payrollRecords: records,
+              staffFines: clean.staffFines || [],
               expenses: clean.expenses,
             }
           : { payrollRecords: records },
@@ -471,6 +476,7 @@ const HASH_EXCLUDED_KEYS = new Set([
   'autoBackup',
   'autoBackupEnabled',
   'auditLogs',
+  'blackBox',
 ]);
 
 function stripHashExcludedKeys(value: unknown): unknown {
@@ -621,8 +627,13 @@ function assembleErpStateFromDocs(
 
   const corpChunks = bySection.get('corporate');
   if (corpChunks) {
-    if (corpChunks[0] && Array.isArray(corpChunks[0].payload.corporateCustomers)) {
-      partial.corporateCustomers = corpChunks[0].payload.corporateCustomers as ErpState['corporateCustomers'];
+    if (corpChunks[0]) {
+      if (Array.isArray(corpChunks[0].payload.corporateCustomers)) {
+        partial.corporateCustomers = corpChunks[0].payload.corporateCustomers as ErpState['corporateCustomers'];
+      }
+      if (Array.isArray(corpChunks[0].payload.corporateRewashRecords)) {
+        partial.corporateRewashRecords = corpChunks[0].payload.corporateRewashRecords as ErpState['corporateRewashRecords'];
+      }
     }
     partial.corporateMovements = corpChunks.flatMap((c) =>
       Array.isArray(c.payload.corporateMovements)
@@ -679,6 +690,9 @@ function assembleErpStateFromDocs(
     if (employeeChunks[0]) {
       if (Array.isArray(employeeChunks[0].payload.employees)) {
         partial.employees = employeeChunks[0].payload.employees as ErpState['employees'];
+      }
+      if (Array.isArray(employeeChunks[0].payload.staffFines)) {
+        partial.staffFines = employeeChunks[0].payload.staffFines as ErpState['staffFines'];
       }
       if (Array.isArray(employeeChunks[0].payload.expenses)) {
         partial.expenses = employeeChunks[0].payload.expenses as ErpState['expenses'];
@@ -954,6 +968,8 @@ export async function ensureWorkspaceAccess(
 
 /**
  * Atomically writes only the changed partitioned rinse_state documents via writeBatch.
+ * Enforces a strict revision guard (rejects if remote syncRevision >= target or > localBaseRevision)
+ * and a business-hash kill-switch (never writes unless computeBusinessStateHash differs from lastSyncedJson).
  * Cleans up any previously known overflow chunk documents that are no longer needed.
  */
 export async function saveStateToFirestoreBatch(params: {
@@ -961,27 +977,107 @@ export async function saveStateToFirestoreBatch(params: {
   user: User;
   workspace: WorkspaceContext;
   syncRevision: number;
+  localBaseRevision?: number;
+  remoteSyncRevision?: number;
   originClientId: string;
   knownDocIds?: string[];
   lastSyncedDocs?: Record<string, string>;
+  lastSyncedJson?: string;
   forceAll?: boolean;
 }): Promise<{
   docIds: string[];
   sectionHashes: Record<string, string>;
   businessJson: string;
   writtenCount: number;
+  abortedReason?: 'unchanged-hash' | 'not-synced-yet' | 'stale-revision';
+  remoteRevision?: number;
 }> {
   const {
     state,
     user,
     workspace,
     syncRevision,
+    localBaseRevision,
+    remoteSyncRevision,
     originClientId,
     knownDocIds = [],
     lastSyncedDocs,
+    lastSyncedJson,
     forceAll = false,
   } = params;
   const { docs: serializedDocs, sectionHashes, businessJson } = serializeStateSectionHashes(state);
+
+  // Kill-switch #1: never allow a write unless business state hash differs from lastSyncedJsonRef
+  if (!forceAll) {
+    if (!lastSyncedJson) {
+      return {
+        docIds: knownDocIds,
+        sectionHashes: lastSyncedDocs || sectionHashes,
+        businessJson,
+        writtenCount: 0,
+        abortedReason: 'not-synced-yet',
+      };
+    }
+    if (businessJson === lastSyncedJson) {
+      return {
+        docIds: knownDocIds,
+        sectionHashes: lastSyncedDocs || sectionHashes,
+        businessJson,
+        writtenCount: 0,
+        abortedReason: 'unchanged-hash',
+      };
+    }
+  }
+
+  const safeRevision = Math.max(1, Math.trunc(syncRevision));
+  const effectiveBaseRev =
+    typeof localBaseRevision === 'number' ? Math.trunc(localBaseRevision) : safeRevision - 1;
+
+  // Kill-switch #2a: abort immediately if known incoming remote syncRevision is >= candidate revision or > localBaseRevision
+  if (
+    typeof remoteSyncRevision === 'number' &&
+    (remoteSyncRevision >= safeRevision ||
+      (typeof localBaseRevision === 'number' && remoteSyncRevision > effectiveBaseRev))
+  ) {
+    return {
+      docIds: knownDocIds,
+      sectionHashes: lastSyncedDocs || sectionHashes,
+      businessJson,
+      writtenCount: 0,
+      abortedReason: 'stale-revision',
+      remoteRevision: remoteSyncRevision,
+    };
+  }
+
+  // Kill-switch #2b: verify live remote meta.syncRevision before committing writeBatch so stale cached tabs cannot overwrite newer state
+  try {
+    const metaRef = doc(db, RINSE_STATE_COLLECTION, 'meta');
+    let metaSnap;
+    try {
+      metaSnap = await getDocFromServer(metaRef);
+    } catch {
+      metaSnap = await getDoc(metaRef);
+    }
+    if (metaSnap.exists()) {
+      const liveRemoteRev = Number(metaSnap.data()?.syncRevision ?? 1);
+      if (
+        liveRemoteRev >= safeRevision ||
+        (typeof localBaseRevision === 'number' && liveRemoteRev > effectiveBaseRev)
+      ) {
+        return {
+          docIds: knownDocIds,
+          sectionHashes: lastSyncedDocs || sectionHashes,
+          businessJson,
+          writtenCount: 0,
+          abortedReason: 'stale-revision',
+          remoteRevision: liveRemoteRev,
+        };
+      }
+    }
+  } catch {
+    // Allow fallback when offline or if meta lookup cannot reach cache/server; rules & queued checks still guard
+  }
+
   const nextDocIds = serializedDocs.map((d) => d.docId);
   const nextDocIdSet = new Set(nextDocIds);
   const staleDocIds = knownDocIds.filter((id) => !nextDocIdSet.has(id));
@@ -996,13 +1092,13 @@ export async function saveStateToFirestoreBatch(params: {
       sectionHashes,
       businessJson,
       writtenCount: 0,
+      abortedReason: 'unchanged-hash',
     };
   }
 
   const safeMemberUids = Array.from(
     new Set([workspace.ownerUid, ...workspace.memberUids, user.uid].filter(Boolean))
   ).slice(0, 50);
-  const safeRevision = Math.max(1, Math.trunc(syncRevision));
   const safeOriginId = normalizeId(originClientId);
 
   type BatchOp =
@@ -1116,6 +1212,7 @@ export async function migrateLocalStorageToFirestoreIfNeeded(params: {
     user: params.user,
     workspace: params.workspace,
     syncRevision: nextRevision,
+    localBaseRevision: 0,
     originClientId: params.originClientId,
     forceAll: true,
   });
@@ -1125,6 +1222,10 @@ export async function migrateLocalStorageToFirestoreIfNeeded(params: {
     window.localStorage.setItem(FIRESTORE_MIGRATED_KEY, 'true');
   } catch {
     // ignore storage restriction
+  }
+
+  if (batchResult.abortedReason === 'stale-revision') {
+    return { migrated: false };
   }
 
   return {

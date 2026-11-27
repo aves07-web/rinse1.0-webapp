@@ -19,8 +19,15 @@ import {
   OrderLine,
   OrderStage,
   PaymentSplit,
+  QuantityDiscountRule,
 } from '../types/erp';
-import { dateInputToIso, formatMoney, getMoneySourceAccounts, toDateInputValue } from '../utils/accounting';
+import {
+  computeLineNetAmount,
+  dateInputToIso,
+  formatMoney,
+  getMoneySourceAccounts,
+  toDateInputValue,
+} from '../utils/accounting';
 import {
   DEFAULT_ID_FORMATS,
   generateNextSmartId,
@@ -102,6 +109,7 @@ interface OrdersViewProps {
     paymentAccountCode: string,
     paymentSplits?: PaymentSplit[]
   ) => void;
+  onUpdateQuantityDiscountRules?: (rules: QuantityDiscountRule[]) => void;
   onAddMoneyAccount?: (params: QuickAddMoneyAccountParams) => string | null;
   onOpenDocument: (type: 'invoice' | 'token', id: string) => void;
 }
@@ -122,6 +130,7 @@ export function OrdersView({
   onAddException,
   onResolveException,
   onCollectOrderPayment,
+  onUpdateQuantityDiscountRules,
   onAddMoneyAccount,
   onOpenDocument,
 }: OrdersViewProps) {
@@ -176,6 +185,9 @@ export function OrdersView({
   const [initialSplits, setInitialSplits] = useState<PaymentSplit[]>(() => [
     { accountCode: defaultMoneyAccountCode, accountName: moneyAccounts[0]?.name, amount: 0 },
   ]);
+  const [autoApplyQtyRules, setAutoApplyQtyRules] = useState(true);
+  const [showRulesModal, setShowRulesModal] = useState(false);
+  const [rulesDraft, setRulesDraft] = useState<QuantityDiscountRule[]>([]);
 
   // Owner Customize Order Modal State
   const [customizeOrderOpen, setCustomizeOrderOpen] = useState(false);
@@ -282,6 +294,29 @@ export function OrdersView({
     { accountCode: defaultMoneyAccountCode, accountName: moneyAccounts[0]?.name, amount: 0 },
   ]);
 
+  const getAutoRuleDiscount = (productId: string, qty: number, unitPrice: number): number => {
+    const safeQty = Math.max(0, Number(qty) || 0);
+    const safePrice = Math.max(0, Number(unitPrice) || 0);
+    const gross = Number((safeQty * safePrice).toFixed(2));
+    if (gross <= 0) return 0;
+    const prod = state.products.find((p) => p.id === productId);
+    const prodType = (prod?.type || '').toLowerCase();
+    const rules = state.settings.quantityDiscountRules || [];
+    let bestDisc = 0;
+    for (const rule of rules) {
+      if (!rule.active) continue;
+      if (safeQty < rule.minQuantity) continue;
+      const cat = (rule.productCategory || 'ALL').trim().toLowerCase();
+      if (cat !== 'all' && cat !== '' && cat !== prodType) continue;
+      const candidate =
+        rule.discountType === 'percent'
+          ? (gross * Math.min(100, Math.max(0, Number(rule.discountValue) || 0))) / 100
+          : Math.max(0, Number(rule.discountValue) || 0);
+      if (candidate > bestDisc) bestDisc = candidate;
+    }
+    return computeLineNetAmount(safeQty, safePrice, bestDisc).discount;
+  };
+
   const updateDraftContextPrices = (nextCustId: string, nextDelId: string) => {
     setDraftLines((prev) =>
       prev.map((line) => {
@@ -291,18 +326,34 @@ export function OrdersView({
             cp.productId === line.productId &&
             cp.serviceId === line.serviceId
         );
+        const nextPrice = resolveDefaultUnitPrice(nextCustId, line.productId, line.serviceId, nextDelId);
+        const nextDisc = autoApplyQtyRules
+          ? getAutoRuleDiscount(line.productId, line.quantity, nextPrice)
+          : computeLineNetAmount(line.quantity, nextPrice, line.discount).discount;
         return {
           ...line,
-          unitPrice: resolveDefaultUnitPrice(nextCustId, line.productId, line.serviceId, nextDelId),
+          unitPrice: nextPrice,
+          discount: nextDisc,
           isCustomOrDefault: hasCustom ? 'Saved customer rate' : 'Retail default',
         };
       })
     );
   };
 
+  const draftItemDiscountTotal = useMemo(() => {
+    return Number(
+      draftLines
+        .reduce(
+          (s, l) => s + computeLineNetAmount(l.quantity, l.unitPrice, l.discount).discount,
+          0
+        )
+        .toFixed(2)
+    );
+  }, [draftLines]);
+
   const draftTotal = useMemo(() => {
     const lineSum = draftLines.reduce(
-      (s, l) => s + Math.max(0, l.quantity * l.unitPrice - l.discount),
+      (s, l) => s + computeLineNetAmount(l.quantity, l.unitPrice, l.discount).net,
       0
     );
     const extra = addAdditionalToOrder ? additionalCharge : 0;
@@ -652,13 +703,39 @@ export function OrdersView({
 
           {/* Line Items */}
           <div className="space-y-2.5">
-            <div className="flex items-center justify-between">
-              <h3 className="text-xs font-semibold text-slate-600">Order Lines (Pieces)</h3>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center gap-3">
+                <h3 className="text-xs font-semibold text-slate-600">Order Lines (Pieces)</h3>
+                <label className="inline-flex items-center gap-1.5 text-[11px] text-slate-600 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={autoApplyQtyRules}
+                    onChange={(e) => setAutoApplyQtyRules(e.target.checked)}
+                  />
+                  Auto-apply qty discount rules
+                </label>
+                {onUpdateQuantityDiscountRules && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setRulesDraft(
+                        (state.settings.quantityDiscountRules || []).map((r) => ({ ...r }))
+                      );
+                      setShowRulesModal(true);
+                    }}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium rounded-lg border border-slate-200 bg-white text-slate-700 hover:border-[#0071E3] hover:text-[#0071E3] whitespace-nowrap shrink-0"
+                  >
+                    <SlidersHorizontal className="w-3 h-3" />
+                    Bulk Rules ({(state.settings.quantityDiscountRules || []).filter((r) => r.active).length})
+                  </button>
+                )}
+              </div>
               <button
                 type="button"
                 onClick={() => {
                   const pId = activeProducts[0]?.id || '';
                   const sId = activeServices[0]?.id || '';
+                  const uPrice = resolveDefaultUnitPrice(customerId, pId, sId, deliveryOptionId);
                   setDraftLines((prev) => [
                     ...prev,
                     {
@@ -666,14 +743,14 @@ export function OrdersView({
                       productId: pId,
                       serviceId: sId,
                       quantity: 1,
-                      unitPrice: resolveDefaultUnitPrice(customerId, pId, sId, deliveryOptionId),
-                      discount: 0,
+                      unitPrice: uPrice,
+                      discount: autoApplyQtyRules ? getAutoRuleDiscount(pId, 1, uPrice) : 0,
                       saveAsCustomerPrice: false,
                       isCustomOrDefault: 'Retail default',
                     },
                   ]);
                 }}
-                className="inline-flex items-center gap-1 text-xs font-medium text-[#0071E3] hover:underline"
+                className="inline-flex items-center gap-1 text-xs font-medium text-[#0071E3] hover:underline whitespace-nowrap shrink-0"
               >
                 <Plus className="w-3.5 h-3.5" />
                 Add Line
@@ -684,6 +761,7 @@ export function OrdersView({
               const isHighlighted = highlightedLineKeys.has(line.key);
               const prodName = state.products.find((p) => p.id === line.productId)?.name || 'Item';
               const srvName = state.services.find((s) => s.id === line.serviceId)?.name || 'Service';
+              const lineCalc = computeLineNetAmount(line.quantity, line.unitPrice, line.discount);
               return (
               <div
                 key={line.key}
@@ -705,9 +783,14 @@ export function OrdersView({
                         line.serviceId,
                         deliveryOptionId
                       );
+                      const nextDisc = autoApplyQtyRules
+                        ? getAutoRuleDiscount(nextP, line.quantity, nextPrice)
+                        : computeLineNetAmount(line.quantity, nextPrice, line.discount).discount;
                       setDraftLines((prev) =>
                         prev.map((item, i) =>
-                          i === idx ? { ...item, productId: nextP, unitPrice: nextPrice } : item
+                          i === idx
+                            ? { ...item, productId: nextP, unitPrice: nextPrice, discount: nextDisc }
+                            : item
                         )
                       );
                     }}
@@ -724,7 +807,7 @@ export function OrdersView({
                   </select>
                 </div>
 
-                <div className="md:col-span-3">
+                <div className="md:col-span-2">
                   <label className="block text-[11px] text-slate-500 mb-1">Service</label>
                   <select
                     value={line.serviceId}
@@ -736,9 +819,14 @@ export function OrdersView({
                         nextS,
                         deliveryOptionId
                       );
+                      const nextDisc = autoApplyQtyRules
+                        ? getAutoRuleDiscount(line.productId, line.quantity, nextPrice)
+                        : computeLineNetAmount(line.quantity, nextPrice, line.discount).discount;
                       setDraftLines((prev) =>
                         prev.map((item, i) =>
-                          i === idx ? { ...item, serviceId: nextS, unitPrice: nextPrice } : item
+                          i === idx
+                            ? { ...item, serviceId: nextS, unitPrice: nextPrice, discount: nextDisc }
+                            : item
                         )
                       );
                     }}
@@ -762,9 +850,15 @@ export function OrdersView({
                     min={0}
                     value={line.quantity}
                     onChange={(e) => {
-                      const val = Number(e.target.value);
+                      const val = Math.max(0, Number(e.target.value));
                       setDraftLines((prev) =>
-                        prev.map((item, i) => (i === idx ? { ...item, quantity: val } : item))
+                        prev.map((item, i) => {
+                          if (i !== idx) return item;
+                          const nextDisc = autoApplyQtyRules
+                            ? getAutoRuleDiscount(item.productId, val, item.unitPrice)
+                            : computeLineNetAmount(val, item.unitPrice, item.discount).discount;
+                          return { ...item, quantity: val, discount: nextDisc };
+                        })
                       );
                       setHighlightedLineKeys((prev) => {
                         const next = new Set(prev);
@@ -772,7 +866,7 @@ export function OrdersView({
                         return next;
                       });
                     }}
-                    className={`w-full px-2.5 py-1.5 text-xs font-mono rounded-lg bg-white border ${
+                    className={`w-full px-2 py-1.5 text-xs font-mono rounded-lg bg-white border ${
                       isHighlighted && line.quantity <= 0 ? 'border-red-500 text-red-700' : 'border-slate-200'
                     }`}
                   />
@@ -780,17 +874,22 @@ export function OrdersView({
 
                 <div className="md:col-span-2">
                   <label className="block text-[11px] text-slate-500 mb-1">
-                    Unit ({sym}) · {line.isCustomOrDefault}
+                    Rate ({sym}) · {line.isCustomOrDefault}
                   </label>
                   <input
                     type="number"
                     step="0.5"
                     value={line.unitPrice}
                     onChange={(e) => {
+                      const nextPrice = Number(e.target.value);
                       setDraftLines((prev) =>
-                        prev.map((item, i) =>
-                          i === idx ? { ...item, unitPrice: Number(e.target.value) } : item
-                        )
+                        prev.map((item, i) => {
+                          if (i !== idx) return item;
+                          const nextDisc = autoApplyQtyRules
+                            ? getAutoRuleDiscount(item.productId, item.quantity, nextPrice)
+                            : computeLineNetAmount(item.quantity, nextPrice, item.discount).discount;
+                          return { ...item, unitPrice: nextPrice, discount: nextDisc };
+                        })
                       );
                       setIdFormError('');
                       setHighlightedLineKeys((prev) => {
@@ -805,24 +904,50 @@ export function OrdersView({
                   />
                 </div>
 
-                <div className="md:col-span-2 flex items-center gap-2 pb-1.5">
-                  <label className="inline-flex items-center gap-1.5 text-[11px] text-slate-600 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={line.saveAsCustomerPrice}
-                      onChange={(e) =>
-                        setDraftLines((prev) =>
-                          prev.map((item, i) =>
-                            i === idx ? { ...item, saveAsCustomerPrice: e.target.checked } : item
-                          )
-                        )
-                      }
-                    />
-                    Save rate for customer
+                <div className="md:col-span-2">
+                  <label className="block text-[11px] text-slate-500 mb-1">
+                    Disc ({sym}){lineCalc.discountPct > 0 ? ` · ${lineCalc.discountPct}%` : ''}
                   </label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={lineCalc.gross}
+                    step="0.5"
+                    value={line.discount}
+                    onChange={(e) => {
+                      const clamped = computeLineNetAmount(
+                        line.quantity,
+                        line.unitPrice,
+                        Math.max(0, Number(e.target.value))
+                      ).discount;
+                      setDraftLines((prev) =>
+                        prev.map((item, i) => (i === idx ? { ...item, discount: clamped } : item))
+                      );
+                    }}
+                    className="w-full px-2.5 py-1.5 text-xs font-mono rounded-lg bg-white border border-slate-200"
+                  />
                 </div>
 
-                <div className="md:col-span-1 text-right pb-1">
+                <div className="md:col-span-2 flex items-center justify-between gap-2 pb-1">
+                  <div className="min-w-0">
+                    <p className="text-[11px] font-mono tabular-nums font-semibold text-slate-900">
+                      {formatMoney(lineCalc.net, sym)}
+                    </p>
+                    <label className="inline-flex items-center gap-1 text-[10px] text-slate-500 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={line.saveAsCustomerPrice}
+                        onChange={(e) =>
+                          setDraftLines((prev) =>
+                            prev.map((item, i) =>
+                              i === idx ? { ...item, saveAsCustomerPrice: e.target.checked } : item
+                            )
+                          )
+                        }
+                      />
+                      Save rate
+                    </label>
+                  </div>
                   {draftLines.length > 1 && (
                     <button
                       type="button"
@@ -840,7 +965,7 @@ export function OrdersView({
                           removeLine();
                         }
                       }}
-                      className="p-1.5 text-slate-400 hover:text-red-600"
+                      className="p-1.5 text-slate-400 hover:text-red-600 shrink-0"
                       title="Delete order line"
                     >
                       <Trash2 className="w-3.5 h-3.5" />
@@ -920,6 +1045,11 @@ export function OrdersView({
             />
             <div className="flex items-center gap-4">
               <div className="text-right">
+                {draftItemDiscountTotal > 0 && (
+                  <p className="text-[11px] font-mono text-emerald-700 tabular-nums">
+                    Item Discounts: -{formatMoney(draftItemDiscountTotal, sym)}
+                  </p>
+                )}
                 <span className="text-xs text-slate-500">Order Total</span>
                 <p className="text-lg font-mono font-semibold text-slate-900 tabular-nums">
                   {formatMoney(draftTotal, sym)}
@@ -1764,7 +1894,13 @@ export function OrdersView({
                 </button>
               </div>
 
-              {custLines.map((line, i) => (
+              {custLines.map((line, i) => {
+                const lineCalc = computeLineNetAmount(
+                  line.quantityOrdered,
+                  line.unitPrice,
+                  line.discount
+                );
+                return (
                 <div
                   key={line.id}
                   className="grid grid-cols-1 md:grid-cols-12 gap-2 items-end p-2.5 rounded-xl bg-slate-50 border border-slate-200"
@@ -1792,7 +1928,7 @@ export function OrdersView({
                       ))}
                     </select>
                   </div>
-                  <div className="md:col-span-3">
+                  <div className="md:col-span-2">
                     <label className="block text-[10px] text-slate-500 mb-0.5">Service</label>
                     <select
                       value={line.serviceId}
@@ -1824,15 +1960,20 @@ export function OrdersView({
                       onChange={(e) => {
                         const q = Math.max(0, Number(e.target.value));
                         setCustLines((prev) =>
-                          prev.map((row, idx) =>
-                            idx === i
-                              ? {
-                                  ...row,
-                                  quantityOrdered: q,
-                                  quantityReceived: custPhysicallyReceived ? q : 0,
-                                }
-                              : row
-                          )
+                          prev.map((row, idx) => {
+                            if (idx !== i) return row;
+                            const clampedDisc = computeLineNetAmount(
+                              q,
+                              row.unitPrice,
+                              row.discount
+                            ).discount;
+                            return {
+                              ...row,
+                              quantityOrdered: q,
+                              quantityReceived: custPhysicallyReceived ? q : 0,
+                              discount: clampedDisc,
+                            };
+                          })
                         );
                       }}
                       className="w-full px-2 py-1.5 text-xs font-mono rounded-lg bg-white border border-slate-200"
@@ -1845,51 +1986,70 @@ export function OrdersView({
                       min={0}
                       step="0.5"
                       value={line.unitPrice}
-                      onChange={(e) =>
+                      onChange={(e) => {
+                        const price = Math.max(0, Number(e.target.value));
                         setCustLines((prev) =>
-                          prev.map((row, idx) =>
-                            idx === i ? { ...row, unitPrice: Math.max(0, Number(e.target.value)) } : row
-                          )
-                        )
-                      }
+                          prev.map((row, idx) => {
+                            if (idx !== i) return row;
+                            const clampedDisc = computeLineNetAmount(
+                              row.quantityOrdered,
+                              price,
+                              row.discount
+                            ).discount;
+                            return { ...row, unitPrice: price, discount: clampedDisc };
+                          })
+                        );
+                      }}
                       className="w-full px-2 py-1.5 text-xs font-mono rounded-lg bg-white border border-slate-200"
                     />
                   </div>
-                  <div className="md:col-span-1">
-                    <label className="block text-[10px] text-slate-500 mb-0.5">Disc.</label>
+                  <div className="md:col-span-2">
+                    <label className="block text-[10px] text-slate-500 mb-0.5">
+                      Disc ({sym}){lineCalc.discountPct > 0 ? ` · ${lineCalc.discountPct}%` : ''}
+                    </label>
                     <input
                       type="number"
                       min={0}
+                      max={lineCalc.gross}
                       step="0.5"
                       value={line.discount}
-                      onChange={(e) =>
+                      onChange={(e) => {
+                        const clamped = computeLineNetAmount(
+                          line.quantityOrdered,
+                          line.unitPrice,
+                          Math.max(0, Number(e.target.value))
+                        ).discount;
                         setCustLines((prev) =>
                           prev.map((row, idx) =>
-                            idx === i ? { ...row, discount: Math.max(0, Number(e.target.value)) } : row
+                            idx === i ? { ...row, discount: clamped } : row
                           )
-                        )
-                      }
+                        );
+                      }}
                       className="w-full px-2 py-1.5 text-xs font-mono rounded-lg bg-white border border-slate-200"
                     />
                   </div>
-                  <div className="md:col-span-1 text-right">
+                  <div className="md:col-span-1 flex items-center justify-end gap-1 pb-1">
+                    <span className="text-[11px] font-mono tabular-nums font-semibold text-slate-700">
+                      {formatMoney(lineCalc.net, sym)}
+                    </span>
                     {custLines.length > 1 && (
                       <button
                         type="button"
                         onClick={() => setCustLines((prev) => prev.filter((_, idx) => idx !== i))}
-                        className="p-1.5 text-red-500 hover:bg-red-50 rounded-lg"
+                        className="p-1 text-red-500 hover:bg-red-50 rounded-lg"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>
                     )}
                   </div>
                 </div>
-              ))}
+                );
+              })}
             </div>
 
             {(() => {
               const lineSub = custLines.reduce(
-                (s, l) => s + Math.max(0, l.quantityOrdered * l.unitPrice - l.discount),
+                (s, l) => s + computeLineNetAmount(l.quantityOrdered, l.unitPrice, l.discount).net,
                 0
               );
               const calcTotal = Math.max(
@@ -2000,6 +2160,202 @@ export function OrdersView({
               </div>
             </div>
           </form>
+        </div>
+      )}
+
+      {/* Quantity Discount Rules Configuration Modal */}
+      {showRulesModal && onUpdateQuantityDiscountRules && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/45 backdrop-blur-xs"
+          onClick={() => setShowRulesModal(false)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-2xl bg-white rounded-2xl border border-slate-200 p-6 space-y-4 text-xs"
+          >
+            <div className="flex items-center justify-between border-b border-slate-200 pb-3">
+              <div>
+                <h3 className="text-base font-semibold text-slate-900">
+                  Quantity &amp; Category Discount Rules
+                </h3>
+                <p className="text-slate-500">
+                  Auto-fills per-item discounts when quantity reaches threshold; you can always override any line manually.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowRulesModal(false)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-2 max-h-80 overflow-y-auto">
+              {rulesDraft.length === 0 && (
+                <p className="text-slate-500 py-4 text-center">
+                  No quantity discount rules yet. Click &ldquo;Add Rule&rdquo; to set up a threshold.
+                </p>
+              )}
+              {rulesDraft.map((rule, idx) => (
+                <div
+                  key={rule.id}
+                  className="grid grid-cols-1 sm:grid-cols-12 gap-2 items-end p-2.5 rounded-xl bg-slate-50 border border-slate-200"
+                >
+                  <div className="sm:col-span-3">
+                    <label className="block text-[10px] text-slate-500 mb-0.5">Rule Name</label>
+                    <input
+                      value={rule.name}
+                      onChange={(e) =>
+                        setRulesDraft((prev) =>
+                          prev.map((r, i) => (i === idx ? { ...r, name: e.target.value } : r))
+                        )
+                      }
+                      className="w-full px-2 py-1.5 rounded-lg bg-white border border-slate-200"
+                    />
+                  </div>
+                  <div className="sm:col-span-3">
+                    <label className="block text-[10px] text-slate-500 mb-0.5">Category</label>
+                    <input
+                      value={rule.productCategory || 'ALL'}
+                      onChange={(e) =>
+                        setRulesDraft((prev) =>
+                          prev.map((r, i) =>
+                            i === idx ? { ...r, productCategory: e.target.value } : r
+                          )
+                        )
+                      }
+                      placeholder="ALL or Bedding"
+                      className="w-full px-2 py-1.5 rounded-lg bg-white border border-slate-200"
+                    />
+                  </div>
+                  <div className="sm:col-span-2">
+                    <label className="block text-[10px] text-slate-500 mb-0.5">Min Qty</label>
+                    <input
+                      type="number"
+                      min={1}
+                      value={rule.minQuantity}
+                      onChange={(e) =>
+                        setRulesDraft((prev) =>
+                          prev.map((r, i) =>
+                            i === idx
+                              ? { ...r, minQuantity: Math.max(1, Number(e.target.value)) }
+                              : r
+                          )
+                        )
+                      }
+                      className="w-full px-2 py-1.5 font-mono rounded-lg bg-white border border-slate-200"
+                    />
+                  </div>
+                  <div className="sm:col-span-2">
+                    <label className="block text-[10px] text-slate-500 mb-0.5">Type &amp; Val</label>
+                    <div className="flex gap-1">
+                      <select
+                        value={rule.discountType}
+                        onChange={(e) =>
+                          setRulesDraft((prev) =>
+                            prev.map((r, i) =>
+                              i === idx
+                                ? { ...r, discountType: e.target.value as 'percent' | 'amount' }
+                                : r
+                            )
+                          )
+                        }
+                        className="px-1.5 py-1.5 rounded-lg bg-white border border-slate-200"
+                      >
+                        <option value="percent">%</option>
+                        <option value="amount">{sym}</option>
+                      </select>
+                      <input
+                        type="number"
+                        min={0}
+                        step="0.5"
+                        value={rule.discountValue}
+                        onChange={(e) =>
+                          setRulesDraft((prev) =>
+                            prev.map((r, i) =>
+                              i === idx
+                                ? { ...r, discountValue: Math.max(0, Number(e.target.value)) }
+                                : r
+                            )
+                          )
+                        }
+                        className="w-full px-2 py-1.5 font-mono rounded-lg bg-white border border-slate-200"
+                      />
+                    </div>
+                  </div>
+                  <div className="sm:col-span-2 flex items-center justify-end gap-2 pb-1">
+                    <label className="inline-flex items-center gap-1 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={rule.active}
+                        onChange={(e) =>
+                          setRulesDraft((prev) =>
+                            prev.map((r, i) =>
+                              i === idx ? { ...r, active: e.target.checked } : r
+                            )
+                          )
+                        }
+                      />
+                      Active
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setRulesDraft((prev) => prev.filter((_, i) => i !== idx))
+                      }
+                      className="p-1 text-red-500 hover:bg-red-50 rounded"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="flex items-center justify-between pt-3 border-t border-slate-200">
+              <button
+                type="button"
+                onClick={() =>
+                  setRulesDraft((prev) => [
+                    ...prev,
+                    {
+                      id: `qdr-${Date.now()}`,
+                      name: '10+ Pieces Discount',
+                      minQuantity: 10,
+                      discountType: 'percent',
+                      discountValue: 10,
+                      productCategory: 'ALL',
+                      active: true,
+                    },
+                  ])
+                }
+                className="inline-flex items-center gap-1 px-3 py-1.5 rounded-xl border border-slate-200 text-slate-700 font-medium hover:border-[#0071E3] hover:text-[#0071E3]"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                Add Rule
+              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowRulesModal(false)}
+                  className="px-3.5 py-2 rounded-xl border border-slate-200 text-slate-600 font-medium"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onUpdateQuantityDiscountRules(rulesDraft);
+                    setShowRulesModal(false);
+                  }}
+                  className="px-4 py-2 rounded-xl bg-[#0071E3] text-white font-semibold hover:bg-[#0077ED]"
+                >
+                  Save Rules
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       )}
     </div>

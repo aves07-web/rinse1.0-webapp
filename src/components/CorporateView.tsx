@@ -2,8 +2,11 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   Building2,
   FileText,
+  Pencil,
   Plus,
   Receipt,
+  RotateCcw,
+  Search,
   SlidersHorizontal,
   Trash2,
   Wallet,
@@ -15,12 +18,20 @@ import {
   CorporateCustomer,
   CorporateMovement,
   CorporateMovementType,
+  CorporateRewashRecord,
   ErpState,
   Invoice,
   InvoiceLineSnapshot,
   PaymentSplit,
+  RewashStatus,
 } from '../types/erp';
-import { dateInputToIso, formatMoney, getMoneySourceAccounts, toDateInputValue } from '../utils/accounting';
+import {
+  computeLineNetAmount,
+  dateInputToIso,
+  formatMoney,
+  getMoneySourceAccounts,
+  toDateInputValue,
+} from '../utils/accounting';
 import { getCorporateBrandColor } from '../utils/migration';
 import {
   DEFAULT_ID_FORMATS,
@@ -102,6 +113,7 @@ interface CorporateViewProps {
       dueDate?: string;
       customDiscountType?: 'percent' | 'amount';
       customDiscountValue?: number;
+      lineDiscounts?: Record<string, number>;
       approvedZeroPriceLines?: Array<{ productName: string; serviceName: string; quantity: number }>;
     }
   ) => void;
@@ -130,6 +142,36 @@ interface CorporateViewProps {
     accountCode: string,
     paymentSplits?: PaymentSplit[]
   ) => void;
+  onAddCorporateRewash?: (params: {
+    corporateId: string;
+    itemName: string;
+    category?: string;
+    serviceName?: string;
+    quantity: number;
+    originalOrderRef?: string;
+    originalInvoiceRef?: string;
+    reason: string;
+    loggedDate?: string;
+    status?: RewashStatus;
+  }) => void;
+  onUpdateCorporateRewash?: (
+    rewashId: string,
+    patch: Partial<
+      Pick<
+        CorporateRewashRecord,
+        | 'itemName'
+        | 'category'
+        | 'serviceName'
+        | 'quantity'
+        | 'originalOrderRef'
+        | 'originalInvoiceRef'
+        | 'reason'
+        | 'loggedDate'
+        | 'status'
+      >
+    >
+  ) => void;
+  onDeleteCorporateRewash?: (rewashId: string) => void;
   onOpenInvoice: (invoiceId: string) => void;
   onDeleteCorporate?: (corpId: string) => void;
   onDeactivateCorporate?: (corpId: string) => void;
@@ -157,6 +199,9 @@ export function CorporateView({
   onOwnerCustomizeInvoice,
   onOwnerDeleteInvoice,
   onCollectCorporatePayment,
+  onAddCorporateRewash,
+  onUpdateCorporateRewash,
+  onDeleteCorporateRewash,
   onOpenInvoice,
   onDeleteCorporate,
   onDeactivateCorporate,
@@ -169,7 +214,7 @@ export function CorporateView({
 }: CorporateViewProps) {
   const sym = state.settings.currencySymbol;
   const [selectedCorpId, setSelectedCorpId] = useState(state.corporateCustomers[0]?.id || '');
-  const [subTab, setSubTab] = useState<'movements' | 'catalogue' | 'billing'>('movements');
+  const [subTab, setSubTab] = useState<'movements' | 'catalogue' | 'billing' | 'rewash'>('movements');
   const [showNewCorp, setShowNewCorp] = useState(false);
 
   // New Corporate Form
@@ -282,6 +327,37 @@ export function CorporateView({
   const [eiPaid, setEiPaid] = useState(0);
   const [eiPayAcc, setEiPayAcc] = useState(defaultCorpMoneyCode);
 
+  // Per-item custom discounts on unbilled corporate movements
+  const [lineDiscounts, setLineDiscounts] = useState<Record<string, number>>({});
+
+  // Corporate Rewash Inventory Tracker State
+  const [rwSelectedProdId, setRwSelectedProdId] = useState<string>('');
+  const [rwCustomItemName, setRwCustomItemName] = useState('');
+  const [rwCategory, setRwCategory] = useState('');
+  const [rwServiceName, setRwServiceName] = useState('');
+  const [rwQty, setRwQty] = useState(1);
+  const [rwOrderRef, setRwOrderRef] = useState('');
+  const [rwInvoiceRef, setRwInvoiceRef] = useState('');
+  const [rwDate, setRwDate] = useState(() => toDateInputValue());
+  const [rwStatus, setRwStatus] = useState<RewashStatus>('Pending');
+  const [rwReason, setRwReason] = useState('');
+  const [rwSearch, setRwSearch] = useState('');
+  const [rwStatusFilter, setRwStatusFilter] = useState<'ALL' | RewashStatus>('ALL');
+  const [rwDateFrom, setRwDateFrom] = useState('');
+  const [rwDateTo, setRwDateTo] = useState('');
+
+  // Edit Rewash Modal
+  const [editRewashTarget, setEditRewashTarget] = useState<CorporateRewashRecord | null>(null);
+  const [erItemName, setErItemName] = useState('');
+  const [erCategory, setErCategory] = useState('');
+  const [erServiceName, setErServiceName] = useState('');
+  const [erQty, setErQty] = useState(1);
+  const [erOrderRef, setErOrderRef] = useState('');
+  const [erInvoiceRef, setErInvoiceRef] = useState('');
+  const [erDate, setErDate] = useState('');
+  const [erStatus, setErStatus] = useState<RewashStatus>('Pending');
+  const [erReason, setErReason] = useState('');
+
   useEffect(() => {
     setMovOrderId(generateNextSmartId(state, 'corporateOrder').id);
     setContinueCorpOrderNum(false);
@@ -364,20 +440,28 @@ export function CorporateView({
         const rate =
           activeCorp.prices.find((p) => p.productId === m.productId && p.serviceId === m.serviceId)
             ?.price ?? m.unitPriceSnapshot;
+        const calc = computeLineNetAmount(unbilledQty, rate, lineDiscounts[m.id] ?? 0);
         return {
           movement: m,
           unbilledQty,
           rate,
-          lineTotal: Number((unbilledQty * rate).toFixed(2)),
+          gross: calc.gross,
+          discount: calc.discount,
+          discountPct: calc.discountPct,
+          lineTotal: calc.net,
         };
       });
-  }, [corpMovements, activeCorp]);
+  }, [corpMovements, activeCorp, lineDiscounts]);
 
-  const unbilledTotal = unbilledItems.reduce((s, i) => s + i.lineTotal, 0);
+  const unbilledTotal = Number(unbilledItems.reduce((s, i) => s + i.lineTotal, 0).toFixed(2));
 
   useEffect(() => {
     setCustomDiscountType('percent');
     setCustomDiscountValue(String(activeCorp?.discountPct ?? 0));
+    setLineDiscounts({});
+    setRwSelectedProdId(activeCorp?.products[0]?.id || '__custom__');
+    setRwCategory(activeCorp?.products[0]?.type || '');
+    setRwServiceName(activeCorp?.services[0]?.name || '');
   }, [activeCorp?.id, activeCorp?.discountPct]);
 
   const parsedCustomDiscVal = Math.max(0, Number(customDiscountValue) || 0);
@@ -390,6 +474,62 @@ export function CorporateView({
   const corpInvoices = activeCorp
     ? state.invoices.filter((inv) => inv.corporateId === activeCorp.id)
     : [];
+
+  const corpRewashRecords = useMemo(() => {
+    if (!activeCorp) return [];
+    return (state.corporateRewashRecords || []).filter((r) => r.corporateId === activeCorp.id);
+  }, [state.corporateRewashRecords, activeCorp]);
+
+  const filteredCorpRewash = useMemo(() => {
+    const q = rwSearch.trim().toLowerCase();
+    return corpRewashRecords.filter((rec) => {
+      if (rwStatusFilter !== 'ALL' && rec.status !== rwStatusFilter) return false;
+      const dateStr = rec.loggedDate.slice(0, 10);
+      if (rwDateFrom && dateStr < rwDateFrom) return false;
+      if (rwDateTo && dateStr > rwDateTo) return false;
+      if (!q) return true;
+      return (
+        rec.itemName.toLowerCase().includes(q) ||
+        (rec.category || '').toLowerCase().includes(q) ||
+        (rec.serviceName || '').toLowerCase().includes(q) ||
+        rec.reason.toLowerCase().includes(q) ||
+        (rec.originalOrderRef || '').toLowerCase().includes(q) ||
+        (rec.originalInvoiceRef || '').toLowerCase().includes(q)
+      );
+    });
+  }, [corpRewashRecords, rwSearch, rwStatusFilter, rwDateFrom, rwDateTo]);
+
+  const rewashSummary = useMemo(() => {
+    const currentMonthPrefix = new Date().toISOString().slice(0, 7);
+    let totalPieces = 0;
+    let thisMonthPieces = 0;
+    let pendingPieces = 0;
+    let inRewashPieces = 0;
+    let completedPieces = 0;
+    let pendingCount = 0;
+    for (const r of corpRewashRecords) {
+      totalPieces += r.quantity;
+      if (r.loggedDate.slice(0, 7) === currentMonthPrefix) {
+        thisMonthPieces += r.quantity;
+      }
+      if (r.status === 'Pending') {
+        pendingPieces += r.quantity;
+        pendingCount += 1;
+      } else if (r.status === 'In Rewash') {
+        inRewashPieces += r.quantity;
+      } else {
+        completedPieces += r.quantity;
+      }
+    }
+    return {
+      totalPieces,
+      thisMonthPieces,
+      pendingPieces,
+      inRewashPieces,
+      completedPieces,
+      pendingCount,
+    };
+  }, [corpRewashRecords]);
 
   return (
     <div className="space-y-6">
@@ -683,10 +823,10 @@ export function CorporateView({
                   </div>
                 </div>
 
-                <div className="flex items-center gap-1 p-1 bg-slate-200/70 rounded-xl w-fit">
+                <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-200/70 rounded-xl w-fit">
                   <button
                     onClick={() => setSubTab('movements')}
-                    className={`px-3.5 py-1.5 text-xs font-medium rounded-lg transition-colors whitespace-nowrap ${
+                    className={`px-3.5 py-1.5 text-xs font-medium rounded-lg transition-colors whitespace-nowrap shrink-0 ${
                       subTab === 'movements' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
                     }`}
                   >
@@ -694,7 +834,7 @@ export function CorporateView({
                   </button>
                   <button
                     onClick={() => setSubTab('catalogue')}
-                    className={`px-3.5 py-1.5 text-xs font-medium rounded-lg transition-colors whitespace-nowrap ${
+                    className={`px-3.5 py-1.5 text-xs font-medium rounded-lg transition-colors whitespace-nowrap shrink-0 ${
                       subTab === 'catalogue' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
                     }`}
                   >
@@ -702,11 +842,20 @@ export function CorporateView({
                   </button>
                   <button
                     onClick={() => setSubTab('billing')}
-                    className={`px-3.5 py-1.5 text-xs font-medium rounded-lg transition-colors whitespace-nowrap ${
+                    className={`px-3.5 py-1.5 text-xs font-medium rounded-lg transition-colors whitespace-nowrap shrink-0 ${
                       subTab === 'billing' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
                     }`}
                   >
                     Billing &amp; Statements ({unbilledItems.length} unbilled)
+                  </button>
+                  <button
+                    onClick={() => setSubTab('rewash')}
+                    className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+                      subTab === 'rewash' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
+                    }`}
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    Rewash Inventory ({corpRewashRecords.length})
                   </button>
                 </div>
               </div>
@@ -1290,60 +1439,86 @@ export function CorporateView({
                       </p>
                     ) : (
                       <>
-                        <table className="w-full text-left text-xs border-collapse erp-table">
-                          <thead>
-                            <tr className="border-b border-slate-200/70">
-                              <th className="py-2 px-2">Date &amp; Event</th>
-                              <th className="py-2 px-2">Product &amp; Service</th>
-                              <th className="py-2 px-2 text-right">Unbilled Qty</th>
-                              <th className="py-2 px-2 text-right">Private Rate</th>
-                              <th className="py-2 px-2 text-right">Subtotal</th>
-                            </tr>
-                          </thead>
-                          <tbody className="divide-y divide-slate-200/60 tabular-nums">
-                            {unbilledItems.map((item) => {
-                              const isHighlighted = highlightedMovementIds.has(item.movement.id);
-                              return (
-                                <tr
-                                  key={item.movement.id}
-                                  className={
-                                    isHighlighted
-                                      ? 'bg-red-50/90 border-l-4 border-l-red-500'
-                                      : ''
-                                  }
-                                >
-                                  <td className="py-2.5 px-2 font-mono text-slate-600">
-                                    {new Date(item.movement.date).toLocaleDateString()} · {item.movement.event}
-                                  </td>
-                                  <td className="py-2.5 px-2 font-medium text-slate-900">
-                                    {item.movement.productName} · {item.movement.serviceName}
-                                  </td>
-                                  <td
-                                    className={`py-2.5 px-2 text-right font-mono ${
-                                      isHighlighted && item.unbilledQty <= 0
-                                        ? 'text-red-600 font-bold'
-                                        : ''
-                                    }`}
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-left text-xs border-collapse erp-table">
+                            <thead>
+                              <tr className="border-b border-slate-200/70">
+                                <th className="py-2 px-2">Date &amp; Event</th>
+                                <th className="py-2 px-2">Product &amp; Service</th>
+                                <th className="py-2 px-2 text-right">Unbilled Qty</th>
+                                <th className="py-2 px-2 text-right">Private Rate</th>
+                                <th className="py-2 px-2 text-right">Discount ({sym})</th>
+                                <th className="py-2 px-2 text-right">Net Amount</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-200/60 tabular-nums">
+                              {unbilledItems.map((item) => {
+                                const isHighlighted = highlightedMovementIds.has(item.movement.id);
+                                return (
+                                  <tr
+                                    key={item.movement.id}
+                                    className={isHighlighted ? 'bg-red-50/90' : ''}
                                   >
-                                    {item.unbilledQty}
-                                  </td>
-                                  <td
-                                    className={`py-2.5 px-2 text-right font-mono ${
-                                      item.rate <= 0
-                                        ? 'text-red-600 font-semibold'
-                                        : ''
-                                    }`}
-                                  >
-                                    {formatMoney(item.rate, sym)}
-                                  </td>
-                                  <td className="py-2.5 px-2 text-right font-mono font-semibold">
-                                    {formatMoney(item.lineTotal, sym)}
-                                  </td>
-                                </tr>
-                              );
-                            })}
-                          </tbody>
-                        </table>
+                                    <td className="py-2.5 px-2 font-mono text-slate-600">
+                                      {new Date(item.movement.date).toLocaleDateString()} · {item.movement.event}
+                                    </td>
+                                    <td className="py-2.5 px-2 font-medium text-slate-900">
+                                      {item.movement.productName} · {item.movement.serviceName}
+                                    </td>
+                                    <td
+                                      className={`py-2.5 px-2 text-right font-mono ${
+                                        isHighlighted && item.unbilledQty <= 0
+                                          ? 'text-red-600 font-bold'
+                                          : ''
+                                      }`}
+                                    >
+                                      {item.unbilledQty}
+                                    </td>
+                                    <td
+                                      className={`py-2.5 px-2 text-right font-mono ${
+                                        item.rate <= 0 ? 'text-red-600 font-semibold' : ''
+                                      }`}
+                                    >
+                                      {formatMoney(item.rate, sym)}
+                                    </td>
+                                    <td className="py-2 px-2 text-right">
+                                      <div className="inline-flex flex-col items-end">
+                                        <input
+                                          type="number"
+                                          min={0}
+                                          max={item.gross}
+                                          step="0.5"
+                                          value={lineDiscounts[item.movement.id] ?? 0}
+                                          onChange={(e) => {
+                                            const clamped = computeLineNetAmount(
+                                              item.unbilledQty,
+                                              item.rate,
+                                              Math.max(0, Number(e.target.value))
+                                            ).discount;
+                                            setLineDiscounts((prev) => ({
+                                              ...prev,
+                                              [item.movement.id]: clamped,
+                                            }));
+                                          }}
+                                          aria-label={`Discount for ${item.movement.productName}`}
+                                          className="w-20 px-2 py-1 text-right text-xs font-mono rounded-lg bg-white border border-slate-200"
+                                        />
+                                        {item.discountPct > 0 && (
+                                          <span className="text-[10px] font-mono text-emerald-700">
+                                            -{item.discountPct}%
+                                          </span>
+                                        )}
+                                      </div>
+                                    </td>
+                                    <td className="py-2.5 px-2 text-right font-mono font-semibold text-slate-900">
+                                      {formatMoney(item.lineTotal, sym)}
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
 
                         <div className="p-4 rounded-xl bg-slate-50/90 border border-slate-200/80 flex flex-col lg:flex-row lg:items-center justify-between gap-4 text-xs">
                           <div className="space-y-1">
@@ -1633,6 +1808,462 @@ export function CorporateView({
                   </div>
                 </div>
               )}
+
+              {subTab === 'rewash' && (
+                <div className="space-y-6">
+                  {/* Isolation Notice + KPI Summary */}
+                  <div className="liquid-glass rounded-2xl p-6 space-y-4">
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div>
+                        <h3 className="text-base font-semibold text-slate-900">
+                          Rewash Inventory Tracker · {activeCorp.name}
+                        </h3>
+                        <p className="text-xs text-slate-500 mt-0.5">
+                          Non-billable corporate rewash log strictly isolated to {activeCorp.name} — excluded from invoice totals &amp; revenue journals.
+                        </p>
+                      </div>
+                      <span className="text-[11px] font-medium px-2.5 py-1 rounded-lg bg-amber-50 border border-amber-200 text-amber-800 whitespace-nowrap">
+                        Non-Billable Tracker
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 tabular-nums">
+                      <div className="p-3 rounded-xl bg-white/80 border border-slate-200">
+                        <p className="text-[11px] text-slate-500">Total Rewash Pcs</p>
+                        <p className="text-lg font-mono font-semibold text-slate-900 mt-0.5">
+                          {rewashSummary.totalPieces}
+                        </p>
+                      </div>
+                      <div className="p-3 rounded-xl bg-white/80 border border-slate-200">
+                        <p className="text-[11px] text-slate-500">This Month</p>
+                        <p className="text-lg font-mono font-semibold text-[#0071E3] mt-0.5">
+                          {rewashSummary.thisMonthPieces}
+                        </p>
+                      </div>
+                      <div className="p-3 rounded-xl bg-white/80 border border-slate-200">
+                        <p className="text-[11px] text-slate-500">Pending</p>
+                        <p className="text-lg font-mono font-semibold text-amber-700 mt-0.5">
+                          {rewashSummary.pendingPieces}
+                        </p>
+                      </div>
+                      <div className="p-3 rounded-xl bg-white/80 border border-slate-200">
+                        <p className="text-[11px] text-slate-500">In Rewash</p>
+                        <p className="text-lg font-mono font-semibold text-violet-700 mt-0.5">
+                          {rewashSummary.inRewashPieces}
+                        </p>
+                      </div>
+                      <div className="p-3 rounded-xl bg-white/80 border border-slate-200">
+                        <p className="text-[11px] text-slate-500">Completed</p>
+                        <p className="text-lg font-mono font-semibold text-emerald-700 mt-0.5">
+                          {rewashSummary.completedPieces}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Log New Rewash Entry */}
+                  {onAddCorporateRewash && (
+                    <form
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        const selectedProd = activeCorp.products.find(
+                          (p) => p.id === rwSelectedProdId
+                        );
+                        const resolvedItemName =
+                          rwSelectedProdId === '__custom__' || !selectedProd
+                            ? rwCustomItemName.trim()
+                            : selectedProd.name;
+                        if (!resolvedItemName || !rwReason.trim() || rwQty <= 0) return;
+                        onAddCorporateRewash({
+                          corporateId: activeCorp.id,
+                          itemName: resolvedItemName,
+                          category: rwCategory.trim() || selectedProd?.type || undefined,
+                          serviceName: rwServiceName.trim() || undefined,
+                          quantity: rwQty,
+                          originalOrderRef: rwOrderRef.trim() || undefined,
+                          originalInvoiceRef: rwInvoiceRef.trim() || undefined,
+                          reason: rwReason.trim(),
+                          loggedDate: rwDate,
+                          status: rwStatus,
+                        });
+                        setRwCustomItemName('');
+                        setRwQty(1);
+                        setRwOrderRef('');
+                        setRwInvoiceRef('');
+                        setRwReason('');
+                      }}
+                      className="liquid-glass rounded-2xl p-6 space-y-4 text-xs"
+                    >
+                      <h4 className="text-sm font-semibold text-slate-900">
+                        Log Corporate Rewash Item
+                      </h4>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                        <div>
+                          <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                            Item (Private Catalogue or Custom)
+                          </label>
+                          <select
+                            value={rwSelectedProdId}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              setRwSelectedProdId(val);
+                              const prod = activeCorp.products.find((p) => p.id === val);
+                              if (prod) setRwCategory(prod.type || '');
+                            }}
+                            className="w-full px-3 py-2 rounded-xl bg-white border border-slate-200"
+                          >
+                            {activeCorp.products.map((p) => (
+                              <option key={p.id} value={p.id}>
+                                {p.name} ({p.type})
+                              </option>
+                            ))}
+                            <option value="__custom__">+ Custom Item Name</option>
+                          </select>
+                        </div>
+
+                        {rwSelectedProdId === '__custom__' ? (
+                          <div>
+                            <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                              Custom Item Name
+                            </label>
+                            <input
+                              required
+                              value={rwCustomItemName}
+                              onChange={(e) => setRwCustomItemName(e.target.value)}
+                              placeholder="e.g., King Duvet Cover"
+                              className="w-full px-3 py-2 rounded-xl bg-white border border-slate-200"
+                            />
+                          </div>
+                        ) : (
+                          <div>
+                            <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                              Category
+                            </label>
+                            <input
+                              value={rwCategory}
+                              onChange={(e) => setRwCategory(e.target.value)}
+                              placeholder="e.g., Commercial Linen"
+                              className="w-full px-3 py-2 rounded-xl bg-white border border-slate-200"
+                            />
+                          </div>
+                        )}
+
+                        <div>
+                          <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                            Service (Optional)
+                          </label>
+                          <input
+                            list={`corp-srv-list-${activeCorp.id}`}
+                            value={rwServiceName}
+                            onChange={(e) => setRwServiceName(e.target.value)}
+                            placeholder="Wash & Press..."
+                            className="w-full px-3 py-2 rounded-xl bg-white border border-slate-200"
+                          />
+                          <datalist id={`corp-srv-list-${activeCorp.id}`}>
+                            {activeCorp.services.map((s) => (
+                              <option key={s.id} value={s.name} />
+                            ))}
+                          </datalist>
+                        </div>
+
+                        <div>
+                          <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                            Quantity (Pcs)
+                          </label>
+                          <input
+                            type="number"
+                            required
+                            min={1}
+                            value={rwQty}
+                            onChange={(e) => setRwQty(Math.max(1, Number(e.target.value)))}
+                            className="w-full px-3 py-2 font-mono rounded-xl bg-white border border-slate-200"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                        <div>
+                          <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                            Original Batch / Order Ref
+                          </label>
+                          <input
+                            list={`corp-ord-refs-${activeCorp.id}`}
+                            value={rwOrderRef}
+                            onChange={(e) => setRwOrderRef(e.target.value)}
+                            placeholder="Optional e.g. CORD-001"
+                            className="w-full px-3 py-2 font-mono rounded-xl bg-white border border-slate-200"
+                          />
+                          <datalist id={`corp-ord-refs-${activeCorp.id}`}>
+                            {Array.from(
+                              new Set(
+                                corpMovements
+                                  .map((m) => m.orderId)
+                                  .filter((v): v is string => Boolean(v))
+                              )
+                            ).map((id) => (
+                              <option key={id} value={id} />
+                            ))}
+                          </datalist>
+                        </div>
+
+                        <div>
+                          <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                            Original Invoice Ref
+                          </label>
+                          <input
+                            list={`corp-inv-refs-${activeCorp.id}`}
+                            value={rwInvoiceRef}
+                            onChange={(e) => setRwInvoiceRef(e.target.value)}
+                            placeholder="Optional e.g. CINV-001"
+                            className="w-full px-3 py-2 font-mono rounded-xl bg-white border border-slate-200"
+                          />
+                          <datalist id={`corp-inv-refs-${activeCorp.id}`}>
+                            {corpInvoices.map((inv) => (
+                              <option key={inv.id} value={inv.id} />
+                            ))}
+                          </datalist>
+                        </div>
+
+                        <div>
+                          <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                            Date Logged
+                          </label>
+                          <input
+                            type="date"
+                            value={rwDate}
+                            onChange={(e) => setRwDate(e.target.value)}
+                            className="w-full px-3 py-2 font-mono rounded-xl bg-white border border-slate-200"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                            Initial Status
+                          </label>
+                          <select
+                            value={rwStatus}
+                            onChange={(e) => setRwStatus(e.target.value as RewashStatus)}
+                            className="w-full px-3 py-2 rounded-xl bg-white border border-slate-200"
+                          >
+                            <option value="Pending">Pending</option>
+                            <option value="In Rewash">In Rewash</option>
+                            <option value="Completed">Completed</option>
+                          </select>
+                        </div>
+                      </div>
+
+                      <div className="flex flex-col sm:flex-row gap-3">
+                        <input
+                          required
+                          value={rwReason}
+                          onChange={(e) => setRwReason(e.target.value)}
+                          placeholder="Reason / quality note (e.g. stubborn oil stain on edge, press crease)..."
+                          className="flex-1 px-3 py-2 rounded-xl bg-white border border-slate-200"
+                        />
+                        <button
+                          type="submit"
+                          className="inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-xl bg-[#0071E3] text-white hover:bg-[#0077ED] whitespace-nowrap shrink-0"
+                        >
+                          <Plus className="w-3.5 h-3.5" />
+                          Log Rewash Entry
+                        </button>
+                      </div>
+                    </form>
+                  )}
+
+                  {/* Filters & Rewash Records Table */}
+                  <div className="liquid-glass rounded-2xl p-6 space-y-4 text-xs">
+                    <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-200/70">
+                      <div className="relative flex-1 min-w-[200px]">
+                        <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                        <input
+                          value={rwSearch}
+                          onChange={(e) => setRwSearch(e.target.value)}
+                          placeholder="Filter by item, reason, order or invoice ref..."
+                          className="w-full pl-8 pr-3 py-1.5 rounded-xl bg-white border border-slate-200"
+                        />
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2">
+                        <select
+                          value={rwStatusFilter}
+                          onChange={(e) =>
+                            setRwStatusFilter(e.target.value as 'ALL' | RewashStatus)
+                          }
+                          className="px-2.5 py-1.5 rounded-xl bg-white border border-slate-200"
+                        >
+                          <option value="ALL">All Statuses</option>
+                          <option value="Pending">Pending</option>
+                          <option value="In Rewash">In Rewash</option>
+                          <option value="Completed">Completed</option>
+                        </select>
+                        <input
+                          type="date"
+                          value={rwDateFrom}
+                          onChange={(e) => setRwDateFrom(e.target.value)}
+                          title="From date"
+                          className="px-2.5 py-1.5 font-mono rounded-xl bg-white border border-slate-200"
+                        />
+                        <input
+                          type="date"
+                          value={rwDateTo}
+                          onChange={(e) => setRwDateTo(e.target.value)}
+                          title="To date"
+                          className="px-2.5 py-1.5 font-mono rounded-xl bg-white border border-slate-200"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const now = new Date();
+                            const ym = now.toISOString().slice(0, 7);
+                            setRwDateFrom(`${ym}-01`);
+                            setRwDateTo(toDateInputValue());
+                          }}
+                          className="px-2.5 py-1.5 rounded-xl border border-slate-200 bg-white text-slate-700 hover:border-[#0071E3] hover:text-[#0071E3] whitespace-nowrap"
+                        >
+                          This Month
+                        </button>
+                        {(rwSearch || rwStatusFilter !== 'ALL' || rwDateFrom || rwDateTo) && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setRwSearch('');
+                              setRwStatusFilter('ALL');
+                              setRwDateFrom('');
+                              setRwDateTo('');
+                            }}
+                            className="px-2.5 py-1.5 rounded-xl text-slate-500 hover:text-slate-800 whitespace-nowrap"
+                          >
+                            Clear
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {filteredCorpRewash.length === 0 ? (
+                      <p className="text-center text-slate-500 py-8">
+                        {corpRewashRecords.length === 0
+                          ? `No rewash items logged for ${activeCorp.name} yet.`
+                          : 'No rewash entries match the current filters.'}
+                      </p>
+                    ) : (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left text-xs border-collapse erp-table">
+                          <thead>
+                            <tr className="border-b border-slate-200/70">
+                              <th className="py-2 px-2">Date</th>
+                              <th className="py-2 px-2">Item &amp; Details</th>
+                              <th className="py-2 px-2">Origin Refs</th>
+                              <th className="py-2 px-2 text-right">Qty</th>
+                              <th className="py-2 px-2">Reason</th>
+                              <th className="py-2 px-2">Status</th>
+                              <th className="py-2 px-2 text-right">Actions</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-200/60">
+                            {filteredCorpRewash.map((rec) => (
+                              <tr key={rec.id}>
+                                <td className="py-2.5 px-2 font-mono text-slate-500 whitespace-nowrap">
+                                  <p>{new Date(rec.loggedDate).toLocaleDateString()}</p>
+                                  <p className="text-[10px] text-slate-400">{rec.id}</p>
+                                </td>
+                                <td className="py-2.5 px-2">
+                                  <p className="font-semibold text-slate-900">{rec.itemName}</p>
+                                  <p className="text-[11px] text-slate-500">
+                                    {[rec.category, rec.serviceName].filter(Boolean).join(' · ') || 'Rewash Item'}
+                                  </p>
+                                </td>
+                                <td className="py-2.5 px-2 font-mono text-[11px] text-slate-600 whitespace-nowrap">
+                                  {rec.originalOrderRef && <p>Ord: {rec.originalOrderRef}</p>}
+                                  {rec.originalInvoiceRef && <p>Inv: {rec.originalInvoiceRef}</p>}
+                                  {!rec.originalOrderRef && !rec.originalInvoiceRef && (
+                                    <span className="text-slate-400">—</span>
+                                  )}
+                                </td>
+                                <td className="py-2.5 px-2 text-right font-mono tabular-nums font-semibold text-slate-900">
+                                  {rec.quantity}
+                                </td>
+                                <td className="py-2.5 px-2">
+                                  <p className="text-slate-700">{rec.reason}</p>
+                                  <p className="text-[10px] text-slate-400">By {rec.loggedBy}</p>
+                                </td>
+                                <td className="py-2.5 px-2">
+                                  {onUpdateCorporateRewash ? (
+                                    <select
+                                      value={rec.status}
+                                      onChange={(e) =>
+                                        onUpdateCorporateRewash(rec.id, {
+                                          status: e.target.value as RewashStatus,
+                                        })
+                                      }
+                                      className={`px-2 py-1 text-[11px] font-semibold rounded-lg border bg-white ${
+                                        rec.status === 'Completed'
+                                          ? 'border-emerald-200 text-emerald-700'
+                                          : rec.status === 'In Rewash'
+                                            ? 'border-violet-200 text-violet-700'
+                                            : 'border-amber-200 text-amber-700'
+                                      }`}
+                                    >
+                                      <option value="Pending">Pending</option>
+                                      <option value="In Rewash">In Rewash</option>
+                                      <option value="Completed">Completed</option>
+                                    </select>
+                                  ) : (
+                                    <span className="font-semibold text-slate-700">{rec.status}</span>
+                                  )}
+                                </td>
+                                <td className="py-2.5 px-2 text-right whitespace-nowrap">
+                                  <div className="inline-flex items-center gap-1">
+                                    {onUpdateCorporateRewash && (
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setEditRewashTarget(rec);
+                                          setErItemName(rec.itemName);
+                                          setErCategory(rec.category || '');
+                                          setErServiceName(rec.serviceName || '');
+                                          setErQty(rec.quantity);
+                                          setErOrderRef(rec.originalOrderRef || '');
+                                          setErInvoiceRef(rec.originalInvoiceRef || '');
+                                          setErDate(toDateInputValue(rec.loggedDate));
+                                          setErStatus(rec.status);
+                                          setErReason(rec.reason);
+                                        }}
+                                        className="p-1 text-slate-500 hover:text-[#0071E3] rounded"
+                                        title="Edit rewash record"
+                                      >
+                                        <Pencil className="w-3.5 h-3.5" />
+                                      </button>
+                                    )}
+                                    {onDeleteCorporateRewash && onRequestDelete && (
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          onRequestDelete({
+                                            itemType: 'Corporate Rewash Entry',
+                                            itemNameOrId: `${rec.id} · ${rec.quantity}x ${rec.itemName}`,
+                                            bodyText: `Delete non-billable rewash record "${rec.quantity}x ${rec.itemName}" from ${activeCorp.name}?`,
+                                            onConfirmDelete: () => onDeleteCorporateRewash(rec.id),
+                                          })
+                                        }
+                                        className="p-1 text-slate-400 hover:text-red-600 rounded"
+                                        title="Delete rewash entry"
+                                      >
+                                        <Trash2 className="w-3.5 h-3.5" />
+                                      </button>
+                                    )}
+                                  </div>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
             </>
           ) : (
             <div className="liquid-glass rounded-2xl p-8 text-center text-sm text-slate-500">
@@ -1833,11 +2464,13 @@ export function CorporateView({
                     dueDate: invDueDate,
                     customDiscountType,
                     customDiscountValue: parsedCustomDiscVal,
+                    lineDiscounts,
                     approvedZeroPriceLines: approvedCorpZeroLines,
                   });
                   setApprovedCorpZeroLines(undefined);
                   setCustomDiscountType('percent');
                   setCustomDiscountValue(String(activeCorp.discountPct ?? 0));
+                  setLineDiscounts({});
                   setInvoiceDialogOpen(false);
                 }}
                 className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-xl btn-primary"
@@ -2326,7 +2959,9 @@ export function CorporateView({
                   Add Line
                 </button>
               </div>
-              {eiLines.map((line, i) => (
+              {eiLines.map((line, i) => {
+                const lineCalc = computeLineNetAmount(line.quantity, line.unitPrice, line.discount);
+                return (
                 <div
                   key={i}
                   className="grid grid-cols-12 gap-2 items-end p-2 rounded-xl bg-slate-50 border border-slate-200"
@@ -2345,7 +2980,7 @@ export function CorporateView({
                       className="w-full px-2 py-1 rounded bg-white border border-slate-200"
                     />
                   </div>
-                  <div className="col-span-3">
+                  <div className="col-span-2">
                     <label className="block text-[10px] text-slate-500">Service</label>
                     <input
                       value={line.serviceName}
@@ -2365,13 +3000,16 @@ export function CorporateView({
                       type="number"
                       min={0}
                       value={line.quantity}
-                      onChange={(e) =>
+                      onChange={(e) => {
+                        const qty = Math.max(0, Number(e.target.value));
                         setEiLines((prev) =>
-                          prev.map((row, idx) =>
-                            idx === i ? { ...row, quantity: Math.max(0, Number(e.target.value)) } : row
-                          )
-                        )
-                      }
+                          prev.map((row, idx) => {
+                            if (idx !== i) return row;
+                            const calc = computeLineNetAmount(qty, row.unitPrice, row.discount);
+                            return { ...row, quantity: qty, discount: calc.discount, total: calc.net };
+                          })
+                        );
+                      }}
                       className="w-full px-2 py-1 font-mono rounded bg-white border border-slate-200"
                     />
                   </div>
@@ -2382,33 +3020,46 @@ export function CorporateView({
                       min={0}
                       step="0.5"
                       value={line.unitPrice}
-                      onChange={(e) =>
+                      onChange={(e) => {
+                        const price = Math.max(0, Number(e.target.value));
                         setEiLines((prev) =>
-                          prev.map((row, idx) =>
-                            idx === i ? { ...row, unitPrice: Math.max(0, Number(e.target.value)) } : row
-                          )
-                        )
-                      }
+                          prev.map((row, idx) => {
+                            if (idx !== i) return row;
+                            const calc = computeLineNetAmount(row.quantity, price, row.discount);
+                            return { ...row, unitPrice: price, discount: calc.discount, total: calc.net };
+                          })
+                        );
+                      }}
                       className="w-full px-2 py-1 font-mono rounded bg-white border border-slate-200"
                     />
                   </div>
-                  <div className="col-span-1">
-                    <label className="block text-[10px] text-slate-500">Disc</label>
+                  <div className="col-span-2">
+                    <label className="block text-[10px] text-slate-500">
+                      Disc ({sym}){lineCalc.discountPct > 0 ? ` · ${lineCalc.discountPct}%` : ''}
+                    </label>
                     <input
                       type="number"
                       min={0}
+                      max={lineCalc.gross}
+                      step="0.5"
                       value={line.discount}
-                      onChange={(e) =>
+                      onChange={(e) => {
+                        const raw = Math.max(0, Number(e.target.value));
                         setEiLines((prev) =>
-                          prev.map((row, idx) =>
-                            idx === i ? { ...row, discount: Math.max(0, Number(e.target.value)) } : row
-                          )
-                        )
-                      }
+                          prev.map((row, idx) => {
+                            if (idx !== i) return row;
+                            const calc = computeLineNetAmount(row.quantity, row.unitPrice, raw);
+                            return { ...row, discount: calc.discount, total: calc.net };
+                          })
+                        );
+                      }}
                       className="w-full px-2 py-1 font-mono rounded bg-white border border-slate-200"
                     />
                   </div>
-                  <div className="col-span-1 text-right">
+                  <div className="col-span-1 flex items-center justify-end gap-1 pb-0.5">
+                    <span className="text-[10px] font-mono tabular-nums font-semibold text-slate-700">
+                      {formatMoney(lineCalc.net, sym)}
+                    </span>
                     {eiLines.length > 1 && (
                       <button
                         type="button"
@@ -2420,7 +3071,8 @@ export function CorporateView({
                     )}
                   </div>
                 </div>
-              ))}
+                );
+              })}
             </div>
 
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-2 border-t border-slate-200">
@@ -2483,6 +3135,154 @@ export function CorporateView({
                 className="px-5 py-2 font-semibold rounded-xl bg-[#0071E3] text-white hover:bg-[#0077ED]"
               >
                 Save Invoice &amp; Sync Ledger
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* Edit Corporate Rewash Modal */}
+      {editRewashTarget && onUpdateCorporateRewash && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/45 backdrop-blur-xs"
+          onClick={() => setEditRewashTarget(null)}
+        >
+          <form
+            onClick={(e) => e.stopPropagation()}
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (!erItemName.trim() || !erReason.trim()) return;
+              onUpdateCorporateRewash(editRewashTarget.id, {
+                itemName: erItemName.trim(),
+                category: erCategory.trim() || undefined,
+                serviceName: erServiceName.trim() || undefined,
+                quantity: Math.max(1, Math.round(Number(erQty) || 1)),
+                originalOrderRef: erOrderRef.trim() || undefined,
+                originalInvoiceRef: erInvoiceRef.trim() || undefined,
+                loggedDate: dateInputToIso(erDate, editRewashTarget.loggedDate),
+                status: erStatus,
+                reason: erReason.trim(),
+              });
+              setEditRewashTarget(null);
+            }}
+            className="w-full max-w-lg bg-white rounded-2xl border border-slate-200 p-6 space-y-4 text-xs"
+          >
+            <div className="flex items-center justify-between border-b border-slate-200 pb-3">
+              <div>
+                <h3 className="text-base font-semibold text-slate-900">
+                  Edit Rewash Entry · {editRewashTarget.id}
+                </h3>
+                <p className="text-slate-500">Non-billable corporate rewash record</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditRewashTarget(null)}
+                className="p-1 text-slate-400 hover:text-slate-700"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Item Name</label>
+                <input
+                  required
+                  value={erItemName}
+                  onChange={(e) => setErItemName(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Category</label>
+                <input
+                  value={erCategory}
+                  onChange={(e) => setErCategory(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Service</label>
+                <input
+                  value={erServiceName}
+                  onChange={(e) => setErServiceName(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Quantity</label>
+                <input
+                  type="number"
+                  min={1}
+                  required
+                  value={erQty}
+                  onChange={(e) => setErQty(Math.max(1, Number(e.target.value)))}
+                  className="w-full px-3 py-2 font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Original Order Ref</label>
+                <input
+                  value={erOrderRef}
+                  onChange={(e) => setErOrderRef(e.target.value)}
+                  className="w-full px-3 py-2 font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Original Invoice Ref</label>
+                <input
+                  value={erInvoiceRef}
+                  onChange={(e) => setErInvoiceRef(e.target.value)}
+                  className="w-full px-3 py-2 font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Date Logged</label>
+                <input
+                  type="date"
+                  required
+                  value={erDate}
+                  onChange={(e) => setErDate(e.target.value)}
+                  className="w-full px-3 py-2 font-mono rounded-xl bg-white border border-slate-200"
+                />
+              </div>
+              <div>
+                <label className="block font-medium text-slate-600 mb-1">Status</label>
+                <select
+                  value={erStatus}
+                  onChange={(e) => setErStatus(e.target.value as RewashStatus)}
+                  className="w-full px-3 py-2 rounded-xl bg-white border border-slate-200"
+                >
+                  <option value="Pending">Pending</option>
+                  <option value="In Rewash">In Rewash</option>
+                  <option value="Completed">Completed</option>
+                </select>
+              </div>
+            </div>
+
+            <div>
+              <label className="block font-medium text-slate-600 mb-1">Reason / Notes</label>
+              <input
+                required
+                value={erReason}
+                onChange={(e) => setErReason(e.target.value)}
+                className="w-full px-3 py-2 rounded-xl bg-white border border-slate-200"
+              />
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-200">
+              <button
+                type="button"
+                onClick={() => setEditRewashTarget(null)}
+                className="px-4 py-2 font-medium rounded-xl border border-slate-200 text-slate-600"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="px-4 py-2 font-semibold rounded-xl bg-[#0071E3] text-white hover:bg-[#0077ED]"
+              >
+                Save Rewash Changes
               </button>
             </div>
           </form>

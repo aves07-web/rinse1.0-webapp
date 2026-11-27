@@ -1,6 +1,18 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Plus, Receipt, SlidersHorizontal, Trash2, Users, Wallet, X } from 'lucide-react';
-import { Employee, ErpState, ExpenseRecord, PayrollRecord } from '../types/erp';
+import {
+  Gavel,
+  Pencil,
+  Plus,
+  Receipt,
+  RotateCcw,
+  Search,
+  SlidersHorizontal,
+  Trash2,
+  Users,
+  Wallet,
+  X,
+} from 'lucide-react';
+import { Employee, ErpState, ExpenseRecord, PayrollRecord, StaffFineRecord } from '../types/erp';
 import { formatMoney, getMoneySourceAccounts, toDateInputValue } from '../utils/accounting';
 import { DeleteConfirmationRequest } from './ConfirmDeleteModal';
 
@@ -8,8 +20,25 @@ interface EmployeesExpensesViewProps {
   state: ErpState;
   isOwner?: boolean;
   onAddEmployee: (emp: Omit<Employee, 'id' | 'advanceBalance' | 'salaryDue' | 'active'>) => void;
+  onUpdateEmployee?: (
+    empId: string,
+    patch: Partial<
+      Pick<Employee, 'name' | 'role' | 'phone' | 'payType' | 'baseRate' | 'customPayTerms' | 'active' | 'salaryDue'>
+    >
+  ) => void;
   onDeleteEmployee?: (empId: string) => void;
   onDeactivateEmployee?: (empId: string) => void;
+  onAddStaffRole?: (roleName: string) => void;
+  onRenameStaffRole?: (oldRole: string, newRole: string) => void;
+  onDeleteStaffRole?: (roleName: string) => void;
+  onApplyStaffFine?: (params: {
+    employeeId: string;
+    amount: number;
+    reason: string;
+    date?: string;
+  }) => void;
+  onToggleStaffFineStatus?: (fineId: string, waivedReason?: string) => void;
+  onDeleteStaffFine?: (fineId: string) => void;
   onPostPayroll: (params: {
     employeeId: string;
     type: PayrollRecord['type'];
@@ -56,6 +85,7 @@ interface EmployeesExpensesViewProps {
   ) => void;
   onOwnerDeleteExpense?: (expId: string) => void;
   onAddExpenseCategory: (category: string) => void;
+  onRenameExpenseCategory?: (oldCategory: string, newCategory: string) => void;
   onDeleteExpenseCategory?: (category: string) => void;
   onGoToAccounting?: () => void;
   onRequestDelete?: (req: DeleteConfirmationRequest) => void;
@@ -65,8 +95,15 @@ export function EmployeesExpensesView({
   state,
   isOwner = false,
   onAddEmployee,
+  onUpdateEmployee,
   onDeleteEmployee,
   onDeactivateEmployee,
+  onAddStaffRole,
+  onRenameStaffRole,
+  onDeleteStaffRole,
+  onApplyStaffFine,
+  onToggleStaffFineStatus,
+  onDeleteStaffFine,
   onPostPayroll,
   onOwnerCustomizePayroll,
   onOwnerDeletePayroll,
@@ -74,6 +111,7 @@ export function EmployeesExpensesView({
   onOwnerCustomizeExpense,
   onOwnerDeleteExpense,
   onAddExpenseCategory,
+  onRenameExpenseCategory,
   onDeleteExpenseCategory,
   onGoToAccounting,
   onRequestDelete,
@@ -102,8 +140,34 @@ export function EmployeesExpensesView({
   const [newEmpPhone, setNewEmpPhone] = useState('');
   const [newEmpPayType, setNewEmpPayType] = useState<'Monthly Salary' | 'Daily Wage'>('Monthly Salary');
   const [newEmpRate, setNewEmpRate] = useState('');
+  const [newEmpCustomTerms, setNewEmpCustomTerms] = useState('');
 
-  // Expense Form
+  // Custom Staff Roles Manager
+  const [newRoleInput, setNewRoleInput] = useState('');
+  const [editingRole, setEditingRole] = useState<string | null>(null);
+  const [editingRoleValue, setEditingRoleValue] = useState('');
+
+  // Instant Salary Fine Modal + Audit Log Filter
+  const [fineModalOpen, setFineModalOpen] = useState(false);
+  const [fineEmpId, setFineEmpId] = useState(state.employees[0]?.id || '');
+  const [fineAmount, setFineAmount] = useState('');
+  const [fineDate, setFineDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [fineReason, setFineReason] = useState('');
+  const [fineEmpFilter, setFineEmpFilter] = useState('ALL');
+  const [fineStatusFilter, setFineStatusFilter] = useState<'ALL' | 'Active' | 'Waived'>('ALL');
+
+  // Edit Staff Profile Modal
+  const [editEmpTarget, setEditEmpTarget] = useState<Employee | null>(null);
+  const [eeEmpName, setEeEmpName] = useState('');
+  const [eeEmpRole, setEeEmpRole] = useState('');
+  const [eeEmpPhone, setEeEmpPhone] = useState('');
+  const [eeEmpPayType, setEeEmpPayType] = useState<'Monthly Salary' | 'Daily Wage'>('Monthly Salary');
+  const [eeEmpRate, setEeEmpRate] = useState('');
+  const [eeEmpTerms, setEeEmpTerms] = useState('');
+  const [eeEmpSalaryDue, setEeEmpSalaryDue] = useState('0');
+  const [eeEmpActive, setEeEmpActive] = useState(true);
+
+  // Expense Form & Filters
   const [expCategory, setExpCategory] = useState(state.settings.expenseCategories[0] || 'Electricity');
   const [expAmount, setExpAmount] = useState('');
   const [expAcc, setExpAcc] = useState(defaultExpenseCode);
@@ -113,6 +177,10 @@ export function EmployeesExpensesView({
   const [expRecurring, setExpRecurring] = useState(false);
   const [expCycle, setExpCycle] = useState<'Weekly' | 'Monthly'>('Monthly');
   const [newExpCategory, setNewExpCategory] = useState('');
+  const [expSearch, setExpSearch] = useState('');
+  const [expCatFilter, setExpCatFilter] = useState('ALL');
+  const [editingExpCat, setEditingExpCat] = useState<string | null>(null);
+  const [editingExpCatValue, setEditingExpCatValue] = useState('');
 
   // Owner Customize Payroll Modal
   const [editPayrollTarget, setEditPayrollTarget] = useState<PayrollRecord | null>(null);
@@ -137,11 +205,104 @@ export function EmployeesExpensesView({
   const resolvedPayAcc = moneyAccounts.some((a) => a.code === payAcc) ? payAcc : defaultPayrollCode;
   const resolvedExpAcc = moneyAccounts.some((a) => a.code === expAcc) ? expAcc : defaultExpenseCode;
 
+  const staffFines = useMemo<StaffFineRecord[]>(() => state.staffFines || [], [state.staffFines]);
+
+  const staffRoles = useMemo(() => {
+    const base =
+      state.settings.staffRoles && state.settings.staffRoles.length > 0
+        ? state.settings.staffRoles
+        : ['Washer', 'Presser', 'Rider', 'Supervisor', 'Counter Staff'];
+    return Array.from(new Set([...base, ...state.employees.map((e) => e.role).filter(Boolean)]));
+  }, [state.settings.staffRoles, state.employees]);
+
+  const activeFinesByEmpId = useMemo(() => {
+    const map: Record<string, number> = {};
+    for (const fine of staffFines) {
+      if (fine.status === 'Active') {
+        map[fine.employeeId] = Number(((map[fine.employeeId] || 0) + fine.amount).toFixed(2));
+      }
+    }
+    return map;
+  }, [staffFines]);
+
+  const staffSummary = useMemo(() => {
+    let activeStaffCount = 0;
+    let totalBasePayroll = 0;
+    let totalAdvances = 0;
+    let totalActiveFines = 0;
+    let totalNetPayable = 0;
+
+    for (const emp of state.employees) {
+      const fine = activeFinesByEmpId[emp.id] || 0;
+      totalActiveFines += fine;
+      totalAdvances += emp.advanceBalance;
+      if (emp.active) {
+        activeStaffCount += 1;
+        totalBasePayroll += emp.baseRate;
+        totalNetPayable += Math.max(0, emp.baseRate + emp.salaryDue - emp.advanceBalance - fine);
+      }
+    }
+
+    return {
+      activeStaffCount,
+      totalBasePayroll: Number(totalBasePayroll.toFixed(2)),
+      totalAdvances: Number(totalAdvances.toFixed(2)),
+      totalActiveFines: Number(totalActiveFines.toFixed(2)),
+      totalNetPayable: Number(totalNetPayable.toFixed(2)),
+    };
+  }, [state.employees, activeFinesByEmpId]);
+
+  const selectedEmp = useMemo(
+    () => state.employees.find((e) => e.id === empId) || null,
+    [state.employees, empId]
+  );
+  const selectedEmpActiveFine = selectedEmp ? activeFinesByEmpId[selectedEmp.id] || 0 : 0;
+  const selectedEmpEstNet = selectedEmp
+    ? Math.max(0, selectedEmp.baseRate + selectedEmp.salaryDue - selectedEmp.advanceBalance - selectedEmpActiveFine)
+    : 0;
+
+  const filteredFines = useMemo(() => {
+    return staffFines.filter((fine) => {
+      if (fineEmpFilter !== 'ALL' && fine.employeeId !== fineEmpFilter) return false;
+      if (fineStatusFilter !== 'ALL' && fine.status !== fineStatusFilter) return false;
+      return true;
+    });
+  }, [staffFines, fineEmpFilter, fineStatusFilter]);
+
+  const filteredExpenses = useMemo(() => {
+    const q = expSearch.trim().toLowerCase();
+    return state.expenses.filter((exp) => {
+      if (expCatFilter !== 'ALL' && exp.category !== expCatFilter) return false;
+      if (!q) return true;
+      return (
+        exp.description.toLowerCase().includes(q) ||
+        exp.category.toLowerCase().includes(q) ||
+        exp.reference.toLowerCase().includes(q)
+      );
+    });
+  }, [state.expenses, expSearch, expCatFilter]);
+
+  const filteredExpensesTotal = useMemo(
+    () => Number(filteredExpenses.reduce((sum, e) => sum + e.amount, 0).toFixed(2)),
+    [filteredExpenses]
+  );
+
   useEffect(() => {
     if (!empId && state.employees.length > 0) {
       setEmpId(state.employees[0].id);
     }
-  }, [empId, state.employees]);
+    if (!fineEmpId && state.employees.length > 0) {
+      setFineEmpId(state.employees[0].id);
+    }
+  }, [empId, fineEmpId, state.employees]);
+
+  const openFineModalFor = (targetEmpId?: string) => {
+    setFineEmpId(targetEmpId || empId || state.employees[0]?.id || '');
+    setFineAmount('');
+    setFineReason('');
+    setFineDate(new Date().toISOString().slice(0, 10));
+    setFineModalOpen(true);
+  };
 
   return (
     <div className="space-y-6">
@@ -151,32 +312,81 @@ export function EmployeesExpensesView({
             Employees, Payroll &amp; Business Expenses
           </h1>
           <p className="text-sm text-slate-500 mt-1">
-            Staff salary, daily wages, overtime, advances, custom expense categories, and recurring bill reminders
+            Owner-led staff roster, custom roles &amp; pay terms, instant salary fines, and operating expense controls
           </p>
         </div>
 
-        <div className="flex items-center gap-1 p-1 bg-slate-200/70 rounded-xl self-start sm:self-auto">
-          <button
-            onClick={() => setSubTab('employees')}
-            className={`px-3.5 py-1.5 text-xs font-medium rounded-lg transition-colors whitespace-nowrap ${
-              subTab === 'employees' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
-            }`}
-          >
-            Staff &amp; Payroll ({state.employees.length})
-          </button>
-          <button
-            onClick={() => setSubTab('expenses')}
-            className={`px-3.5 py-1.5 text-xs font-medium rounded-lg transition-colors whitespace-nowrap ${
-              subTab === 'expenses' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
-            }`}
-          >
-            Operating Expenses ({state.expenses.length})
-          </button>
+        <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto">
+          {subTab === 'employees' && onApplyStaffFine && state.employees.length > 0 && (
+            <button
+              type="button"
+              onClick={() => openFineModalFor()}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-xl bg-rose-50 border border-rose-200 text-rose-700 hover:bg-rose-100 whitespace-nowrap shrink-0"
+            >
+              <Gavel className="w-3.5 h-3.5" />
+              Apply Instant Fine
+            </button>
+          )}
+          <div className="flex items-center gap-1 p-1 bg-slate-200/70 rounded-xl">
+            <button
+              onClick={() => setSubTab('employees')}
+              className={`px-3.5 py-1.5 text-xs font-medium rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+                subTab === 'employees' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
+              }`}
+            >
+              Staff &amp; Payroll ({state.employees.length})
+            </button>
+            <button
+              onClick={() => setSubTab('expenses')}
+              className={`px-3.5 py-1.5 text-xs font-medium rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+                subTab === 'expenses' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
+              }`}
+            >
+              Operating Expenses ({state.expenses.length})
+            </button>
+          </div>
         </div>
       </div>
 
       {subTab === 'employees' && (
         <div className="space-y-6">
+          {/* Summary KPI Strip */}
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+            <div className="liquid-glass rounded-2xl p-4">
+              <p className="text-[11px] font-medium text-slate-500">Active Staff</p>
+              <p className="text-lg font-semibold font-mono tabular-nums text-slate-900 mt-1">
+                {staffSummary.activeStaffCount}
+                <span className="text-xs font-normal text-slate-400 ml-1">
+                  / {state.employees.length}
+                </span>
+              </p>
+            </div>
+            <div className="liquid-glass rounded-2xl p-4">
+              <p className="text-[11px] font-medium text-slate-500">Base Rate Total</p>
+              <p className="text-lg font-semibold font-mono tabular-nums text-slate-900 mt-1">
+                {formatMoney(staffSummary.totalBasePayroll, sym)}
+              </p>
+            </div>
+            <div className="liquid-glass rounded-2xl p-4">
+              <p className="text-[11px] font-medium text-slate-500">Staff Advances</p>
+              <p className="text-lg font-semibold font-mono tabular-nums text-amber-700 mt-1">
+                {formatMoney(staffSummary.totalAdvances, sym)}
+              </p>
+            </div>
+            <div className="liquid-glass rounded-2xl p-4">
+              <p className="text-[11px] font-medium text-slate-500">Active Fines</p>
+              <p className="text-lg font-semibold font-mono tabular-nums text-rose-700 mt-1">
+                {formatMoney(staffSummary.totalActiveFines, sym)}
+              </p>
+            </div>
+            <div className="liquid-glass rounded-2xl p-4 col-span-2 sm:col-span-1">
+              <p className="text-[11px] font-medium text-slate-500">Est. Net Payable</p>
+              <p className="text-lg font-semibold font-mono tabular-nums text-[#0071E3] mt-1">
+                {formatMoney(staffSummary.totalNetPayable, sym)}
+              </p>
+            </div>
+          </div>
+
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
             {/* Post Payroll / Advance */}
             <form
@@ -252,6 +462,46 @@ export function EmployeesExpensesView({
                 </div>
               </div>
 
+              {selectedEmp && (
+                <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-xl bg-slate-50 border border-slate-200 text-[11px] text-slate-600">
+                  <div className="flex flex-wrap items-center gap-3 font-mono tabular-nums">
+                    <span>
+                      Base: <strong className="text-slate-900">{formatMoney(selectedEmp.baseRate, sym)}</strong>
+                    </span>
+                    <span>
+                      Due: <strong className="text-slate-900">{formatMoney(selectedEmp.salaryDue, sym)}</strong>
+                    </span>
+                    <span>
+                      Adv: <strong className="text-amber-700">{formatMoney(selectedEmp.advanceBalance, sym)}</strong>
+                    </span>
+                    <span>
+                      Fines: <strong className="text-rose-700">{formatMoney(selectedEmpActiveFine, sym)}</strong>
+                    </span>
+                    <span>
+                      Est. Net: <strong className="text-[#0071E3]">{formatMoney(selectedEmpEstNet, sym)}</strong>
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {selectedEmpActiveFine > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setDeduction(String(selectedEmpActiveFine))}
+                        className="px-2 py-1 rounded-lg bg-rose-50 border border-rose-200 text-rose-700 font-medium hover:bg-rose-100 whitespace-nowrap shrink-0"
+                      >
+                        Prefill Fines ({formatMoney(selectedEmpActiveFine, sym)})
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setGross(String(selectedEmp.baseRate))}
+                      className="px-2 py-1 rounded-lg bg-white border border-slate-200 text-slate-700 font-medium hover:bg-slate-100 whitespace-nowrap shrink-0"
+                    >
+                      Use Base Rate
+                    </button>
+                  </div>
+                </div>
+              )}
+
               <div className="grid grid-cols-1 sm:grid-cols-4 gap-3 items-end">
                 <div>
                   <label className="block text-[11px] text-slate-500 mb-1">Payroll Date</label>
@@ -276,7 +526,7 @@ export function EmployeesExpensesView({
                 </div>
                 <div>
                   <label className="block text-[11px] text-slate-500 mb-1">
-                    Advance / Deduction ({sym})
+                    Advance / Fine Ded. ({sym})
                   </label>
                   <input
                     type="number"
@@ -300,7 +550,7 @@ export function EmployeesExpensesView({
               <div className="flex justify-end">
                 <button
                   type="submit"
-                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-xl bg-[#0071E3] text-white hover:bg-[#0077ED]"
+                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-xl bg-[#0071E3] text-white hover:bg-[#0077ED] whitespace-nowrap shrink-0"
                 >
                   <Wallet className="w-3.5 h-3.5" />
                   Post Payroll &amp; Ledger Entry
@@ -319,11 +569,13 @@ export function EmployeesExpensesView({
                   phone: newEmpPhone.trim(),
                   payType: newEmpPayType,
                   baseRate: Number(newEmpRate) || 12000,
+                  customPayTerms: newEmpCustomTerms.trim() || undefined,
                 });
                 setNewEmpName('');
                 setNewEmpRole('');
                 setNewEmpPhone('');
                 setNewEmpRate('');
+                setNewEmpCustomTerms('');
               }}
               className="lg:col-span-5 liquid-glass rounded-2xl p-6 space-y-3"
             >
@@ -336,12 +588,20 @@ export function EmployeesExpensesView({
                 className="w-full px-3 py-2 text-xs rounded-xl bg-white border border-slate-200"
               />
               <div className="grid grid-cols-2 gap-2">
-                <input
-                  value={newEmpRole}
-                  onChange={(e) => setNewEmpRole(e.target.value)}
-                  placeholder="Role (Washer, Rider...)"
-                  className="px-3 py-2 text-xs rounded-xl bg-white border border-slate-200"
-                />
+                <div>
+                  <input
+                    list="rinse-staff-roles"
+                    value={newEmpRole}
+                    onChange={(e) => setNewEmpRole(e.target.value)}
+                    placeholder="Role (pick or type custom)"
+                    className="w-full px-3 py-2 text-xs rounded-xl bg-white border border-slate-200"
+                  />
+                  <datalist id="rinse-staff-roles">
+                    {staffRoles.map((r) => (
+                      <option key={r} value={r} />
+                    ))}
+                  </datalist>
+                </div>
                 <input
                   value={newEmpPhone}
                   onChange={(e) => setNewEmpPhone(e.target.value)}
@@ -369,9 +629,15 @@ export function EmployeesExpensesView({
                   className="px-3 py-2 text-xs font-mono rounded-xl bg-white border border-slate-200"
                 />
               </div>
+              <input
+                value={newEmpCustomTerms}
+                onChange={(e) => setNewEmpCustomTerms(e.target.value)}
+                placeholder="Custom pay terms (e.g., 26 days/mo, 1.5x OT, weekly payout)"
+                className="w-full px-3 py-2 text-xs rounded-xl bg-white border border-slate-200"
+              />
               <button
                 type="submit"
-                className="w-full inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-xl bg-slate-900 text-white"
+                className="w-full inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-xl bg-slate-900 text-white whitespace-nowrap shrink-0"
               >
                 <Plus className="w-3.5 h-3.5" />
                 Save Employee
@@ -380,12 +646,17 @@ export function EmployeesExpensesView({
           </div>
 
           {/* Staff Table + Payroll History */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
             <div className="liquid-glass rounded-2xl p-6">
-              <h3 className="text-sm font-semibold text-slate-900 mb-3 flex items-center gap-1.5">
-                <Users className="w-4 h-4 text-slate-400" />
-                Active Employees
-              </h3>
+              <div className="flex items-center justify-between gap-2 mb-3">
+                <h3 className="text-sm font-semibold text-slate-900 flex items-center gap-1.5">
+                  <Users className="w-4 h-4 text-slate-400" />
+                  Staff Roster &amp; Running Balance
+                </h3>
+                <span className="text-[11px] text-slate-500 font-mono tabular-nums">
+                  {state.employees.length} profiles
+                </span>
+              </div>
               <div className="divide-y divide-slate-200/60 text-xs">
                 {state.employees.length === 0 && (
                   <p className="py-6 text-center text-xs text-slate-400">
@@ -394,66 +665,121 @@ export function EmployeesExpensesView({
                 )}
                 {state.employees.map((emp) => {
                   const hasPayroll = state.payrollRecords.some((pr) => pr.employeeId === emp.id);
-                  const hasBalance = emp.salaryDue > 0 || emp.advanceBalance > 0;
+                  const empActiveFines = activeFinesByEmpId[emp.id] || 0;
+                  const netPayable = Math.max(
+                    0,
+                    emp.baseRate + emp.salaryDue - emp.advanceBalance - empActiveFines
+                  );
+                  const hasBalance = emp.salaryDue > 0 || emp.advanceBalance > 0 || empActiveFines > 0;
                   return (
-                    <div key={emp.id} className="py-3 flex items-center justify-between gap-3">
-                      <div>
-                        <p className="font-semibold text-slate-900">
+                    <div key={emp.id} className="py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="font-semibold text-slate-900 flex flex-wrap items-center gap-1.5">
                           <span className={!emp.active ? 'line-through text-slate-400' : ''}>
                             {emp.name}
-                          </span>{' '}
-                          · <span className="font-normal text-slate-500">{emp.role}</span>
+                          </span>
+                          <span className="px-1.5 py-0.5 rounded bg-slate-100 border border-slate-200 text-[10px] font-medium text-slate-700">
+                            {emp.role}
+                          </span>
                           {!emp.active && (
-                            <span className="ml-1.5 text-[10px] px-1.5 py-0.5 rounded bg-slate-200 text-slate-600">
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-200 text-slate-600">
                               Inactive
                             </span>
                           )}
                         </p>
                         <p className="text-slate-500 mt-0.5">
-                          {emp.payType} ({formatMoney(emp.baseRate, sym)}) · {emp.phone}
+                          {emp.payType} ({formatMoney(emp.baseRate, sym)})
+                          {emp.phone ? ` · ${emp.phone}` : ''}
                         </p>
-                      </div>
-                      <div className="flex items-center gap-3">
-                        <div className="text-right font-mono tabular-nums">
-                          <p className="text-slate-900">Due: {formatMoney(emp.salaryDue, sym)}</p>
-                          <p className="text-amber-700">Adv: {formatMoney(emp.advanceBalance, sym)}</p>
-                        </div>
-                        {onRequestDelete && (
-                          <button
-                            type="button"
-                            onClick={() =>
-                              onRequestDelete({
-                                itemType: 'Employee',
-                                itemNameOrId: `${emp.name} (${emp.role})`,
-                                bodyText:
-                                  hasPayroll || hasBalance
-                                    ? `"${emp.name}" has posted payroll entries or staff advance/salary balances.`
-                                    : `Delete staff profile "${emp.name}"?`,
-                                linkedInfo:
-                                  hasPayroll || hasBalance
-                                    ? 'Staff members with payroll or accounting balances should be deactivated instead of deleted.'
-                                    : undefined,
-                                alternativeLabel:
-                                  emp.active && onDeactivateEmployee
-                                    ? 'Deactivate Instead'
-                                    : undefined,
-                                onAlternative:
-                                  emp.active && onDeactivateEmployee
-                                    ? () => onDeactivateEmployee(emp.id)
-                                    : undefined,
-                                accountingProtected: hasBalance,
-                                onConfirmDelete:
-                                  !hasPayroll && !hasBalance && onDeleteEmployee
-                                    ? () => onDeleteEmployee(emp.id)
-                                    : undefined,
-                              })
-                            }
-                            className="p-1 text-slate-400 hover:text-red-600"
-                            title={`Delete or deactivate ${emp.name}`}
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
+                        {emp.customPayTerms && (
+                          <p className="text-[11px] text-slate-600 mt-0.5">
+                            Terms: {emp.customPayTerms}
+                          </p>
                         )}
+                      </div>
+                      <div className="flex items-center justify-between sm:justify-end gap-3 shrink-0">
+                        <div className="text-right font-mono tabular-nums space-y-0.5">
+                          <p className="text-slate-900">
+                            Net Est: <span className="font-semibold text-[#0071E3]">{formatMoney(netPayable, sym)}</span>
+                          </p>
+                          <p className="text-[11px] text-slate-500">
+                            Due: {formatMoney(emp.salaryDue, sym)} · Adv: <span className="text-amber-700">{formatMoney(emp.advanceBalance, sym)}</span>
+                          </p>
+                          {empActiveFines > 0 && (
+                            <p className="text-[11px] text-rose-700 font-medium">
+                              Fines: -{formatMoney(empActiveFines, sym)}
+                            </p>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-1">
+                          {onApplyStaffFine && (
+                            <button
+                              type="button"
+                              onClick={() => openFineModalFor(emp.id)}
+                              className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded-lg bg-rose-50 border border-rose-200 text-rose-700 hover:bg-rose-100 whitespace-nowrap shrink-0"
+                              title={`Apply fine or deduction to ${emp.name}`}
+                            >
+                              <Gavel className="w-3 h-3" />
+                              Fine
+                            </button>
+                          )}
+                          {onUpdateEmployee && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setEditEmpTarget(emp);
+                                setEeEmpName(emp.name);
+                                setEeEmpRole(emp.role);
+                                setEeEmpPhone(emp.phone);
+                                setEeEmpPayType(emp.payType);
+                                setEeEmpRate(String(emp.baseRate));
+                                setEeEmpTerms(emp.customPayTerms || '');
+                                setEeEmpSalaryDue(String(emp.salaryDue));
+                                setEeEmpActive(emp.active);
+                              }}
+                              className="p-1.5 rounded-lg text-slate-500 hover:text-slate-900 hover:bg-slate-100"
+                              title={`Edit profile & pay terms for ${emp.name}`}
+                            >
+                              <Pencil className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                          {onRequestDelete && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                onRequestDelete({
+                                  itemType: 'Employee',
+                                  itemNameOrId: `${emp.name} (${emp.role})`,
+                                  bodyText:
+                                    hasPayroll || hasBalance
+                                      ? `"${emp.name}" has posted payroll entries, fines, or staff advance/salary balances.`
+                                      : `Delete staff profile "${emp.name}"?`,
+                                  linkedInfo:
+                                    hasPayroll || hasBalance
+                                      ? 'Staff members with payroll or accounting balances should be deactivated instead of deleted.'
+                                      : undefined,
+                                  alternativeLabel:
+                                    emp.active && onDeactivateEmployee
+                                      ? 'Deactivate Instead'
+                                      : undefined,
+                                  onAlternative:
+                                    emp.active && onDeactivateEmployee
+                                      ? () => onDeactivateEmployee(emp.id)
+                                      : undefined,
+                                  accountingProtected: hasBalance,
+                                  onConfirmDelete:
+                                    !hasPayroll && !hasBalance && onDeleteEmployee
+                                      ? () => onDeleteEmployee(emp.id)
+                                      : undefined,
+                                })
+                              }
+                              className="p-1.5 rounded-lg text-slate-400 hover:text-red-600"
+                              title={`Delete or deactivate ${emp.name}`}
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                        </div>
                       </div>
                     </div>
                   );
@@ -495,7 +821,7 @@ export function EmployeesExpensesView({
                             setEpAcc(pr.paymentAccountCode || defaultPayrollCode);
                             setEpNote(pr.note);
                           }}
-                          className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-semibold rounded-lg bg-amber-50 border border-amber-200 text-amber-800 hover:bg-amber-100"
+                          className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-semibold rounded-lg bg-amber-50 border border-amber-200 text-amber-800 hover:bg-amber-100 whitespace-nowrap shrink-0"
                           title="Customize payroll entry (Owner)"
                         >
                           <SlidersHorizontal className="w-3 h-3" />
@@ -544,22 +870,288 @@ export function EmployeesExpensesView({
               </div>
             </div>
           </div>
+
+          {/* Instant Fines Audit Log + Custom Staff Roles */}
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+            <div className="lg:col-span-7 liquid-glass rounded-2xl p-6 space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-sm font-semibold text-slate-900 flex items-center gap-1.5">
+                    <Gavel className="w-4 h-4 text-rose-600" />
+                    Salary Fines &amp; Deductions Audit Log
+                  </h3>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    Timestamped fine records for staff balance reconciliation and dispute checks
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <select
+                    value={fineEmpFilter}
+                    onChange={(e) => setFineEmpFilter(e.target.value)}
+                    className="px-2.5 py-1.5 text-xs rounded-lg bg-white border border-slate-200"
+                  >
+                    <option value="ALL">All Staff</option>
+                    {state.employees.map((e) => (
+                      <option key={e.id} value={e.id}>
+                        {e.name}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    value={fineStatusFilter}
+                    onChange={(e) => setFineStatusFilter(e.target.value as 'ALL' | 'Active' | 'Waived')}
+                    className="px-2.5 py-1.5 text-xs rounded-lg bg-white border border-slate-200"
+                  >
+                    <option value="ALL">All Status</option>
+                    <option value="Active">Active</option>
+                    <option value="Waived">Waived</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="divide-y divide-slate-200/60 text-xs">
+                {filteredFines.length === 0 && (
+                  <p className="py-6 text-center text-xs text-slate-400">
+                    No salary fines or deductions match the current filter.
+                  </p>
+                )}
+                {filteredFines.map((fine) => (
+                  <div key={fine.id} className="py-3 flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="font-semibold text-slate-900">{fine.employeeName}</span>
+                        <span
+                          className={`px-1.5 py-0.5 rounded text-[10px] font-medium border ${
+                            fine.status === 'Active'
+                              ? 'bg-rose-50 border-rose-200 text-rose-700'
+                              : 'bg-slate-100 border-slate-200 text-slate-600'
+                          }`}
+                        >
+                          {fine.status}
+                        </span>
+                        <span className="font-mono text-[11px] text-slate-400">{fine.id}</span>
+                      </div>
+                      <p className="text-slate-700 mt-1">{fine.reason}</p>
+                      <p className="text-[11px] text-slate-500 mt-0.5">
+                        {new Date(fine.date).toLocaleString()} · Logged by {fine.createdBy}
+                        {fine.status === 'Waived' && fine.waivedReason
+                          ? ` · Waived (${fine.waivedReason})`
+                          : ''}
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <span
+                        className={`font-mono tabular-nums font-semibold ${
+                          fine.status === 'Active' ? 'text-rose-700' : 'line-through text-slate-400'
+                        }`}
+                      >
+                        -{formatMoney(fine.amount, sym)}
+                      </span>
+                      {onToggleStaffFineStatus && (
+                        <button
+                          type="button"
+                          onClick={() => onToggleStaffFineStatus(fine.id)}
+                          className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium rounded-lg border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 whitespace-nowrap shrink-0"
+                          title={fine.status === 'Active' ? 'Waive this fine' : 'Restore fine as active'}
+                        >
+                          <RotateCcw className="w-3 h-3" />
+                          {fine.status === 'Active' ? 'Waive' : 'Restore'}
+                        </button>
+                      )}
+                      {onRequestDelete && onDeleteStaffFine && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onRequestDelete({
+                              itemType: 'Salary Fine Record',
+                              itemNameOrId: `${fine.employeeName} · -${formatMoney(fine.amount, sym)}`,
+                              bodyText: `Permanently remove fine record ${fine.id} ("${fine.reason}")?`,
+                              accountingProtected: false,
+                              onConfirmDelete: () => onDeleteStaffFine(fine.id),
+                            })
+                          }
+                          className="p-1 text-slate-400 hover:text-red-600"
+                          title="Delete fine record"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Custom Staff Roles Manager */}
+            <div className="lg:col-span-5 liquid-glass rounded-2xl p-6 space-y-4">
+              <div>
+                <h3 className="text-sm font-semibold text-slate-900">Custom Staff Roles</h3>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  Create, rename, or remove custom staff roles used across your roster
+                </p>
+              </div>
+
+              {onAddStaffRole && (
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    if (!newRoleInput.trim()) return;
+                    onAddStaffRole(newRoleInput.trim());
+                    setNewRoleInput('');
+                  }}
+                  className="flex items-center gap-2"
+                >
+                  <input
+                    value={newRoleInput}
+                    onChange={(e) => setNewRoleInput(e.target.value)}
+                    placeholder="New role (e.g., Spotter, Night Rider)"
+                    className="flex-1 px-3 py-2 text-xs rounded-xl bg-white border border-slate-200"
+                  />
+                  <button
+                    type="submit"
+                    className="px-3.5 py-2 text-xs font-medium rounded-xl bg-slate-900 text-white whitespace-nowrap shrink-0"
+                  >
+                    Add Role
+                  </button>
+                </form>
+              )}
+
+              <div className="divide-y divide-slate-200/60 text-xs">
+                {staffRoles.map((roleName) => {
+                  const assignedCount = state.employees.filter((e) => e.role === roleName).length;
+                  const isEditing = editingRole === roleName;
+                  return (
+                    <div key={roleName} className="py-2.5 flex items-center justify-between gap-2">
+                      {isEditing ? (
+                        <form
+                          onSubmit={(e) => {
+                            e.preventDefault();
+                            if (onRenameStaffRole && editingRoleValue.trim()) {
+                              onRenameStaffRole(roleName, editingRoleValue.trim());
+                            }
+                            setEditingRole(null);
+                          }}
+                          className="flex-1 flex items-center gap-2"
+                        >
+                          <input
+                            autoFocus
+                            value={editingRoleValue}
+                            onChange={(e) => setEditingRoleValue(e.target.value)}
+                            className="flex-1 px-2.5 py-1 text-xs rounded-lg bg-white border border-slate-300"
+                          />
+                          <button
+                            type="submit"
+                            className="px-2.5 py-1 text-[11px] font-semibold rounded-lg bg-[#0071E3] text-white whitespace-nowrap shrink-0"
+                          >
+                            Save
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setEditingRole(null)}
+                            className="px-2 py-1 text-[11px] rounded-lg border border-slate-200 text-slate-600"
+                          >
+                            Cancel
+                          </button>
+                        </form>
+                      ) : (
+                        <>
+                          <div className="flex items-center gap-2">
+                            <span className="font-medium text-slate-800">{roleName}</span>
+                            <span className="text-[11px] text-slate-400 font-mono tabular-nums">
+                              ({assignedCount})
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-1">
+                            {onRenameStaffRole && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setEditingRole(roleName);
+                                  setEditingRoleValue(roleName);
+                                }}
+                                className="p-1 text-slate-400 hover:text-slate-700"
+                                title={`Rename ${roleName}`}
+                              >
+                                <Pencil className="w-3 h-3" />
+                              </button>
+                            )}
+                            {onRequestDelete && onDeleteStaffRole && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  onRequestDelete({
+                                    itemType: 'Staff Role',
+                                    itemNameOrId: roleName,
+                                    bodyText:
+                                      assignedCount > 0
+                                        ? `Role "${roleName}" is currently assigned to ${assignedCount} staff profile(s). Removing it from presets keeps existing staff tags intact.`
+                                        : `Remove staff role "${roleName}"?`,
+                                    onConfirmDelete: () => onDeleteStaffRole(roleName),
+                                  })
+                                }
+                                className="p-1 text-slate-400 hover:text-red-600"
+                                title={`Delete ${roleName}`}
+                              >
+                                <Trash2 className="w-3 h-3" />
+                              </button>
+                            )}
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
         </div>
       )}
 
       {subTab === 'expenses' && (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
           <div className="lg:col-span-7 liquid-glass rounded-2xl p-6">
-            <h2 className="text-base font-semibold text-slate-900 pb-3 border-b border-slate-200/70">
-              Recorded Business Expenses
-            </h2>
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-200/70">
+              <div>
+                <h2 className="text-base font-semibold text-slate-900">
+                  Recorded Business Expenses
+                </h2>
+                <p className="text-[11px] text-slate-500 mt-0.5 font-mono tabular-nums">
+                  {filteredExpenses.length} entries · Total: {formatMoney(filteredExpensesTotal, sym)}
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="relative">
+                  <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                  <input
+                    value={expSearch}
+                    onChange={(e) => setExpSearch(e.target.value)}
+                    placeholder="Search bill or ref..."
+                    className="pl-7 pr-2.5 py-1.5 text-xs rounded-lg bg-white border border-slate-200 w-40"
+                  />
+                </div>
+                <select
+                  value={expCatFilter}
+                  onChange={(e) => setExpCatFilter(e.target.value)}
+                  className="px-2.5 py-1.5 text-xs rounded-lg bg-white border border-slate-200"
+                >
+                  <option value="ALL">All Categories</option>
+                  {state.settings.expenseCategories.map((cat) => (
+                    <option key={cat} value={cat}>
+                      {cat}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
             <div className="divide-y divide-slate-200/60 mt-2 text-xs">
-              {state.expenses.length === 0 && (
+              {filteredExpenses.length === 0 && (
                 <p className="py-6 text-center text-xs text-slate-400">
-                  No business expenses recorded yet.
+                  {state.expenses.length === 0
+                    ? 'No business expenses recorded yet.'
+                    : 'No expenses match your search or category filter.'}
                 </p>
               )}
-              {state.expenses.map((exp) => (
+              {filteredExpenses.map((exp) => (
                 <div key={exp.id} className="py-3.5 flex items-start justify-between gap-4">
                   <div>
                     <div className="flex items-center gap-2 text-slate-500">
@@ -597,7 +1189,7 @@ export function EmployeesExpensesView({
                           setEeRecurring(Boolean(exp.recurring));
                           setEeCycle(exp.recurrenceCycle || 'Monthly');
                         }}
-                        className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-semibold rounded-lg bg-amber-50 border border-amber-200 text-amber-800 hover:bg-amber-100"
+                        className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-semibold rounded-lg bg-amber-50 border border-amber-200 text-amber-800 hover:bg-amber-100 whitespace-nowrap shrink-0"
                         title="Customize expense (Owner)"
                       >
                         <SlidersHorizontal className="w-3 h-3" />
@@ -770,42 +1362,100 @@ export function EmployeesExpensesView({
                 />
                 <button
                   type="submit"
-                  className="px-3.5 py-2 text-xs font-medium rounded-xl bg-slate-900 text-white whitespace-nowrap"
+                  className="px-3.5 py-2 text-xs font-medium rounded-xl bg-slate-900 text-white whitespace-nowrap shrink-0"
                 >
                   Add Category
                 </button>
               </form>
 
-              {onRequestDelete && onDeleteExpenseCategory && state.settings.expenseCategories.length > 0 && (
-                <div className="flex flex-wrap gap-1.5">
+              {state.settings.expenseCategories.length > 0 && (
+                <div className="divide-y divide-slate-200/60 text-xs">
                   {state.settings.expenseCategories.map((cat) => {
                     const usedCount = state.expenses.filter((e) => e.category === cat).length;
+                    const isEditingCat = editingExpCat === cat;
                     return (
-                      <div
-                        key={cat}
-                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-white/80 border border-slate-200 text-[11px] text-slate-700"
-                      >
-                        <span>{cat}</span>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            onRequestDelete({
-                              itemType: 'Expense Category',
-                              itemNameOrId: cat,
-                              bodyText:
-                                usedCount > 0
-                                  ? `Category "${cat}" is used on ${usedCount} recorded expense(s). Removing it hides it from new expense entries while preserving past bills.`
-                                  : `Delete expense category "${cat}"?`,
-                              linkedInfo:
-                                usedCount > 0 ? `Used in ${usedCount} recorded expense(s).` : undefined,
-                              onConfirmDelete: () => onDeleteExpenseCategory(cat),
-                            })
-                          }
-                          className="text-slate-400 hover:text-red-600"
-                          title={`Remove ${cat}`}
-                        >
-                          <Trash2 className="w-3 h-3" />
-                        </button>
+                      <div key={cat} className="py-2 flex items-center justify-between gap-2">
+                        {isEditingCat ? (
+                          <form
+                            onSubmit={(e) => {
+                              e.preventDefault();
+                              if (onRenameExpenseCategory && editingExpCatValue.trim()) {
+                                onRenameExpenseCategory(cat, editingExpCatValue.trim());
+                                if (expCategory === cat) {
+                                  setExpCategory(editingExpCatValue.trim());
+                                }
+                              }
+                              setEditingExpCat(null);
+                            }}
+                            className="flex-1 flex items-center gap-2"
+                          >
+                            <input
+                              autoFocus
+                              value={editingExpCatValue}
+                              onChange={(e) => setEditingExpCatValue(e.target.value)}
+                              className="flex-1 px-2.5 py-1 text-xs rounded-lg bg-white border border-slate-300"
+                            />
+                            <button
+                              type="submit"
+                              className="px-2.5 py-1 text-[11px] font-semibold rounded-lg bg-[#0071E3] text-white whitespace-nowrap shrink-0"
+                            >
+                              Save
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setEditingExpCat(null)}
+                              className="px-2 py-1 text-[11px] rounded-lg border border-slate-200 text-slate-600"
+                            >
+                              Cancel
+                            </button>
+                          </form>
+                        ) : (
+                          <>
+                            <div className="flex items-center gap-2">
+                              <span className="font-medium text-slate-800">{cat}</span>
+                              <span className="text-[11px] text-slate-400 font-mono tabular-nums">
+                                ({usedCount})
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-1">
+                              {onRenameExpenseCategory && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setEditingExpCat(cat);
+                                    setEditingExpCatValue(cat);
+                                  }}
+                                  className="p-1 text-slate-400 hover:text-slate-700"
+                                  title={`Rename ${cat}`}
+                                >
+                                  <Pencil className="w-3 h-3" />
+                                </button>
+                              )}
+                              {onRequestDelete && onDeleteExpenseCategory && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    onRequestDelete({
+                                      itemType: 'Expense Category',
+                                      itemNameOrId: cat,
+                                      bodyText:
+                                        usedCount > 0
+                                          ? `Category "${cat}" is used on ${usedCount} recorded expense(s). Removing it hides it from new expense entries while preserving past bills.`
+                                          : `Delete expense category "${cat}"?`,
+                                      linkedInfo:
+                                        usedCount > 0 ? `Used in ${usedCount} recorded expense(s).` : undefined,
+                                      onConfirmDelete: () => onDeleteExpenseCategory(cat),
+                                    })
+                                  }
+                                  className="p-1 text-slate-400 hover:text-red-600"
+                                  title={`Remove ${cat}`}
+                                >
+                                  <Trash2 className="w-3 h-3" />
+                                </button>
+                              )}
+                            </div>
+                          </>
+                        )}
                       </div>
                     );
                   })}
@@ -1118,6 +1768,277 @@ export function EmployeesExpensesView({
                 className="px-4 py-2 rounded-xl bg-[#0071E3] text-white font-semibold"
               >
                 Save Expense Changes
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* Apply Instant Salary Fine Modal */}
+      {fineModalOpen && onApplyStaffFine && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/45 backdrop-blur-xs"
+          onClick={() => setFineModalOpen(false)}
+        >
+          <form
+            onClick={(e) => e.stopPropagation()}
+            onSubmit={(e) => {
+              e.preventDefault();
+              const amt = Number(fineAmount);
+              if (!fineEmpId || Number.isNaN(amt) || amt <= 0 || !fineReason.trim()) return;
+              onApplyStaffFine({
+                employeeId: fineEmpId,
+                amount: amt,
+                reason: fineReason.trim(),
+                date: fineDate,
+              });
+              setFineModalOpen(false);
+            }}
+            className="w-full max-w-md rounded-2xl bg-white border border-slate-200 shadow-2xl p-6 space-y-4 text-xs"
+          >
+            <div className="flex items-center justify-between border-b border-slate-200 pb-3">
+              <div>
+                <h3 className="text-base font-semibold text-slate-900 flex items-center gap-1.5">
+                  <Gavel className="w-4 h-4 text-rose-600" />
+                  Apply Instant Salary Fine
+                </h3>
+                <p className="text-slate-500">
+                  Immediately updates active deductions and staff net balance
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setFineModalOpen(false)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-medium text-slate-500 mb-1">
+                Staff Member
+              </label>
+              <select
+                required
+                value={fineEmpId}
+                onChange={(e) => setFineEmpId(e.target.value)}
+                className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white"
+              >
+                {state.employees.map((emp) => (
+                  <option key={emp.id} value={emp.id}>
+                    {emp.name} ({emp.role})
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-[11px] font-medium text-slate-500 mb-1">
+                  Fine Amount ({sym})
+                </label>
+                <input
+                  type="number"
+                  required
+                  min={0.01}
+                  step="0.01"
+                  value={fineAmount}
+                  onChange={(e) => setFineAmount(e.target.value)}
+                  placeholder="0.00"
+                  className="w-full px-3 py-2 font-mono rounded-xl border border-slate-200 bg-white"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-500 mb-1">Date</label>
+                <input
+                  type="date"
+                  required
+                  value={fineDate}
+                  onChange={(e) => setFineDate(e.target.value)}
+                  className="w-full px-3 py-2 font-mono rounded-xl border border-slate-200 bg-white"
+                />
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-medium text-slate-500 mb-1">
+                Reason / Incident Note
+              </label>
+              <input
+                required
+                value={fineReason}
+                onChange={(e) => setFineReason(e.target.value)}
+                placeholder="e.g., Late arrival, garment damage, unapproved absence..."
+                className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white"
+              />
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-200">
+              <button
+                type="button"
+                onClick={() => setFineModalOpen(false)}
+                className="px-4 py-2 rounded-xl border border-slate-200 text-slate-700 font-medium"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="px-4 py-2 rounded-xl bg-rose-600 text-white font-semibold hover:bg-rose-700"
+              >
+                Apply Salary Fine
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* Customize Staff Profile Modal */}
+      {editEmpTarget && onUpdateEmployee && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/45 backdrop-blur-xs"
+          onClick={() => setEditEmpTarget(null)}
+        >
+          <form
+            onClick={(e) => e.stopPropagation()}
+            onSubmit={(e) => {
+              e.preventDefault();
+              onUpdateEmployee(editEmpTarget.id, {
+                name: eeEmpName.trim() || editEmpTarget.name,
+                role: eeEmpRole.trim() || editEmpTarget.role,
+                phone: eeEmpPhone.trim(),
+                payType: eeEmpPayType,
+                baseRate: Math.max(0, Number(eeEmpRate) || 0),
+                customPayTerms: eeEmpTerms.trim() || undefined,
+                salaryDue: Math.max(0, Number(eeEmpSalaryDue) || 0),
+                active: eeEmpActive,
+              });
+              setEditEmpTarget(null);
+            }}
+            className="w-full max-w-lg rounded-2xl bg-white border border-slate-200 shadow-2xl p-6 space-y-4 text-xs"
+          >
+            <div className="flex items-center justify-between border-b border-slate-200 pb-3">
+              <div>
+                <h3 className="text-base font-semibold text-slate-900">
+                  Edit Staff Profile · {editEmpTarget.name}
+                </h3>
+                <p className="text-slate-500">
+                  Customize role, pay rate, custom pay terms, and active status
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditEmpTarget(null)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-[11px] font-medium text-slate-500 mb-1">Full Name</label>
+                <input
+                  required
+                  value={eeEmpName}
+                  onChange={(e) => setEeEmpName(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-500 mb-1">Role</label>
+                <input
+                  list="rinse-staff-roles"
+                  required
+                  value={eeEmpRole}
+                  onChange={(e) => setEeEmpRole(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-500 mb-1">Phone</label>
+                <input
+                  value={eeEmpPhone}
+                  onChange={(e) => setEeEmpPhone(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-500 mb-1">Pay Type</label>
+                <select
+                  value={eeEmpPayType}
+                  onChange={(e) =>
+                    setEeEmpPayType(e.target.value as 'Monthly Salary' | 'Daily Wage')
+                  }
+                  className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white"
+                >
+                  <option value="Monthly Salary">Monthly Salary</option>
+                  <option value="Daily Wage">Daily Wage</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-500 mb-1">
+                  Base Rate ({sym})
+                </label>
+                <input
+                  type="number"
+                  required
+                  min={0}
+                  step="0.01"
+                  value={eeEmpRate}
+                  onChange={(e) => setEeEmpRate(e.target.value)}
+                  className="w-full px-3 py-2 font-mono rounded-xl border border-slate-200 bg-white"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-medium text-slate-500 mb-1">
+                  Salary Due ({sym})
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  step="0.01"
+                  value={eeEmpSalaryDue}
+                  onChange={(e) => setEeEmpSalaryDue(e.target.value)}
+                  className="w-full px-3 py-2 font-mono rounded-xl border border-slate-200 bg-white"
+                />
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-medium text-slate-500 mb-1">
+                Custom Pay Terms
+              </label>
+              <input
+                value={eeEmpTerms}
+                onChange={(e) => setEeEmpTerms(e.target.value)}
+                placeholder="e.g., 26 shifts/mo, overtime Tk 120/hr, weekly Sunday off"
+                className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white"
+              />
+            </div>
+
+            <label className="inline-flex items-center gap-2 text-slate-700 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={eeEmpActive}
+                onChange={(e) => setEeEmpActive(e.target.checked)}
+              />
+              Active employee on payroll roster
+            </label>
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-200">
+              <button
+                type="button"
+                onClick={() => setEditEmpTarget(null)}
+                className="px-4 py-2 rounded-xl border border-slate-200 text-slate-700 font-medium"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="px-4 py-2 rounded-xl bg-[#0071E3] text-white font-semibold"
+              >
+                Save Staff Profile
               </button>
             </div>
           </form>

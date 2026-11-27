@@ -3,16 +3,25 @@ import {
   Download,
   Eye,
   FileText,
+  Image as ImageIcon,
   Pencil,
   Plus,
   Printer,
+  Share2,
   SlidersHorizontal,
   Tag,
   Trash2,
   X,
 } from 'lucide-react';
 import { ErpState, InvoiceLineSnapshot } from '../types/erp';
-import { dateInputToIso, formatMoney, getMoneySourceAccounts, toDateInputValue } from '../utils/accounting';
+import {
+  computeLineNetAmount,
+  dateInputToIso,
+  formatMoney,
+  getMoneySourceAccounts,
+  toDateInputValue,
+} from '../utils/accounting';
+import { exportInvoiceAsImage, shareInvoiceImage } from '../utils/invoiceImageExport';
 import { exportInvoiceToA4Pdf } from '../utils/pdfExport';
 import {
   DEFAULT_ID_FORMATS,
@@ -94,6 +103,8 @@ export function DocumentsPrintView({
   );
   const [previewModalOpen, setPreviewModalOpen] = useState(false);
   const [exportingPdf, setExportingPdf] = useState(false);
+  const [exportingImage, setExportingImage] = useState<null | 'png' | 'jpg' | 'share'>(null);
+  const [exportStatusMsg, setExportStatusMsg] = useState('');
 
   // Token Designer Customizations
   const [tokenWidthMm, setTokenWidthMm] = useState(state.settings.tokenWidthMm);
@@ -161,6 +172,40 @@ export function DocumentsPrintView({
       await exportInvoiceToA4Pdf(invoice, state.settings);
     } finally {
       setExportingPdf(false);
+    }
+  };
+
+  const handleExportImage = async (format: 'png' | 'jpg') => {
+    if (!invoice) return;
+    setExportingImage(format);
+    setExportStatusMsg('');
+    try {
+      const res = await exportInvoiceAsImage(invoice, state.settings, format);
+      const kb = Math.max(1, Math.round(res.bytes / 1024));
+      setExportStatusMsg(`Saved ${res.fileName} (${kb} KB${res.fromCache ? ', cached' : ''})`);
+    } catch (err) {
+      setExportStatusMsg(err instanceof Error ? err.message : 'Image export failed');
+    } finally {
+      setExportingImage(null);
+    }
+  };
+
+  const handleShareImage = async () => {
+    if (!invoice) return;
+    setExportingImage('share');
+    setExportStatusMsg('');
+    try {
+      const res = await shareInvoiceImage(invoice, state.settings, 'jpg');
+      const kb = Math.max(1, Math.round(res.bytes / 1024));
+      setExportStatusMsg(
+        res.shared
+          ? `Shared ${res.fileName} (${kb} KB)`
+          : `Downloaded ${res.fileName} (${kb} KB) for sharing`
+      );
+    } catch (err) {
+      setExportStatusMsg(err instanceof Error ? err.message : 'Share failed');
+    } finally {
+      setExportingImage(null);
     }
   };
 
@@ -314,16 +359,49 @@ export function DocumentsPrintView({
                   type="button"
                   onClick={handleExportPdf}
                   disabled={exportingPdf}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium rounded-xl btn-secondary disabled:opacity-50"
+                  className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-xl btn-secondary disabled:opacity-50 whitespace-nowrap shrink-0"
                 >
                   <Download className="w-3.5 h-3.5" />
-                  {exportingPdf ? 'Generating PDF...' : 'Export PDF'}
+                  {exportingPdf ? 'PDF...' : 'PDF'}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleExportImage('png')}
+                  disabled={exportingImage !== null}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-xl btn-secondary disabled:opacity-50 whitespace-nowrap shrink-0"
+                  title="Export lightweight PNG (< 1 MB)"
+                >
+                  <ImageIcon className="w-3.5 h-3.5" />
+                  {exportingImage === 'png' ? 'PNG...' : 'PNG'}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleExportImage('jpg')}
+                  disabled={exportingImage !== null}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-xl btn-secondary disabled:opacity-50 whitespace-nowrap shrink-0"
+                  title="Export compressed JPG (< 1 MB)"
+                >
+                  <ImageIcon className="w-3.5 h-3.5" />
+                  {exportingImage === 'jpg' ? 'JPG...' : 'JPG'}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleShareImage}
+                  disabled={exportingImage !== null}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-xl btn-secondary disabled:opacity-50 whitespace-nowrap shrink-0"
+                  title="Share compressed invoice image (< 1 MB)"
+                >
+                  <Share2 className="w-3.5 h-3.5" />
+                  {exportingImage === 'share' ? 'Sharing...' : 'Share'}
                 </button>
 
                 <button
                   type="button"
                   onClick={() => handlePrint('Invoice', invoice.id)}
-                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-xl btn-primary"
+                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-xl btn-primary whitespace-nowrap shrink-0"
                 >
                   <Printer className="w-3.5 h-3.5" />
                   Print
@@ -388,6 +466,19 @@ export function DocumentsPrintView({
               </button>
             )}
           </div>
+
+          {exportStatusMsg && (
+            <div className="no-print px-3.5 py-2 rounded-xl bg-emerald-50 border border-emerald-200 text-xs font-medium text-emerald-800 flex items-center justify-between gap-2">
+              <span className="font-mono">{exportStatusMsg}</span>
+              <button
+                type="button"
+                onClick={() => setExportStatusMsg('')}
+                className="text-emerald-700 hover:text-emerald-950"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
 
           {editingInvId && invoice && (
             <div className="no-print liquid-glass rounded-2xl p-4 flex flex-wrap items-center gap-2">
@@ -621,20 +712,47 @@ export function DocumentsPrintView({
               <span className="text-xs font-semibold text-slate-800">
                 A4 Print Preview (210 × 297 mm) — {invoice.id}
               </span>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
                   onClick={handleExportPdf}
                   disabled={exportingPdf}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg btn-secondary"
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg btn-secondary whitespace-nowrap shrink-0"
                 >
                   <Download className="w-3.5 h-3.5" />
-                  Export PDF
+                  {exportingPdf ? 'PDF...' : 'PDF'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleExportImage('png')}
+                  disabled={exportingImage !== null}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg btn-secondary disabled:opacity-50 whitespace-nowrap shrink-0"
+                >
+                  <ImageIcon className="w-3.5 h-3.5" />
+                  {exportingImage === 'png' ? 'PNG...' : 'PNG'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleExportImage('jpg')}
+                  disabled={exportingImage !== null}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg btn-secondary disabled:opacity-50 whitespace-nowrap shrink-0"
+                >
+                  <ImageIcon className="w-3.5 h-3.5" />
+                  {exportingImage === 'jpg' ? 'JPG...' : 'JPG'}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleShareImage}
+                  disabled={exportingImage !== null}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg btn-secondary disabled:opacity-50 whitespace-nowrap shrink-0"
+                >
+                  <Share2 className="w-3.5 h-3.5" />
+                  {exportingImage === 'share' ? 'Sharing...' : 'Share'}
                 </button>
                 <button
                   type="button"
                   onClick={() => handlePrint('Invoice', invoice.id)}
-                  className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold rounded-lg btn-primary"
+                  className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold rounded-lg btn-primary whitespace-nowrap shrink-0"
                 >
                   <Printer className="w-3.5 h-3.5" />
                   Print
@@ -788,7 +906,9 @@ export function DocumentsPrintView({
                   Add Line
                 </button>
               </div>
-              {cLines.map((line, i) => (
+              {cLines.map((line, i) => {
+                const lineCalc = computeLineNetAmount(line.quantity, line.unitPrice, line.discount);
+                return (
                 <div
                   key={i}
                   className="grid grid-cols-1 md:grid-cols-12 gap-2 items-end p-2.5 rounded-xl bg-slate-50 border border-slate-200"
@@ -807,7 +927,7 @@ export function DocumentsPrintView({
                       className="w-full px-2 py-1.5 text-xs rounded-lg bg-white border border-slate-200"
                     />
                   </div>
-                  <div className="md:col-span-3">
+                  <div className="md:col-span-2">
                     <label className="block text-[10px] text-slate-500 mb-0.5">Service</label>
                     <input
                       value={line.serviceName}
@@ -827,13 +947,16 @@ export function DocumentsPrintView({
                       type="number"
                       min={0}
                       value={line.quantity}
-                      onChange={(e) =>
+                      onChange={(e) => {
+                        const qty = Math.max(0, Number(e.target.value));
                         setCLines((prev) =>
-                          prev.map((row, idx) =>
-                            idx === i ? { ...row, quantity: Math.max(0, Number(e.target.value)) } : row
-                          )
-                        )
-                      }
+                          prev.map((row, idx) => {
+                            if (idx !== i) return row;
+                            const calc = computeLineNetAmount(qty, row.unitPrice, row.discount);
+                            return { ...row, quantity: qty, discount: calc.discount, total: calc.net };
+                          })
+                        );
+                      }}
                       className="w-full px-2 py-1.5 text-xs font-mono rounded-lg bg-white border border-slate-200"
                     />
                   </div>
@@ -844,45 +967,59 @@ export function DocumentsPrintView({
                       min={0}
                       step="0.5"
                       value={line.unitPrice}
-                      onChange={(e) =>
+                      onChange={(e) => {
+                        const price = Math.max(0, Number(e.target.value));
                         setCLines((prev) =>
-                          prev.map((row, idx) =>
-                            idx === i ? { ...row, unitPrice: Math.max(0, Number(e.target.value)) } : row
-                          )
-                        )
-                      }
+                          prev.map((row, idx) => {
+                            if (idx !== i) return row;
+                            const calc = computeLineNetAmount(row.quantity, price, row.discount);
+                            return { ...row, unitPrice: price, discount: calc.discount, total: calc.net };
+                          })
+                        );
+                      }}
                       className="w-full px-2 py-1.5 text-xs font-mono rounded-lg bg-white border border-slate-200"
                     />
                   </div>
-                  <div className="md:col-span-1">
-                    <label className="block text-[10px] text-slate-500 mb-0.5">Disc.</label>
+                  <div className="md:col-span-2">
+                    <label className="block text-[10px] text-slate-500 mb-0.5">
+                      Disc ({sym}){lineCalc.discountPct > 0 ? ` · ${lineCalc.discountPct}%` : ''}
+                    </label>
                     <input
                       type="number"
                       min={0}
+                      max={lineCalc.gross}
+                      step="0.5"
                       value={line.discount}
-                      onChange={(e) =>
+                      onChange={(e) => {
+                        const raw = Math.max(0, Number(e.target.value));
                         setCLines((prev) =>
-                          prev.map((row, idx) =>
-                            idx === i ? { ...row, discount: Math.max(0, Number(e.target.value)) } : row
-                          )
-                        )
-                      }
+                          prev.map((row, idx) => {
+                            if (idx !== i) return row;
+                            const calc = computeLineNetAmount(row.quantity, row.unitPrice, raw);
+                            return { ...row, discount: calc.discount, total: calc.net };
+                          })
+                        );
+                      }}
                       className="w-full px-2 py-1.5 text-xs font-mono rounded-lg bg-white border border-slate-200"
                     />
                   </div>
-                  <div className="md:col-span-1 text-right">
+                  <div className="md:col-span-1 flex items-center justify-end gap-1 pb-1">
+                    <span className="text-[11px] font-mono tabular-nums font-semibold text-slate-700">
+                      {formatMoney(lineCalc.net, sym)}
+                    </span>
                     {cLines.length > 1 && (
                       <button
                         type="button"
                         onClick={() => setCLines((prev) => prev.filter((_, idx) => idx !== i))}
-                        className="p-1.5 text-red-500 hover:bg-red-50 rounded-lg"
+                        className="p-1 text-red-500 hover:bg-red-50 rounded-lg"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>
                     )}
                   </div>
                 </div>
-              ))}
+                );
+              })}
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 pt-2 border-t border-slate-200">
@@ -1154,7 +1291,9 @@ export function DocumentsPrintView({
                   Add Line
                 </button>
               </div>
-              {nLines.map((line, i) => (
+              {nLines.map((line, i) => {
+                const lineCalc = computeLineNetAmount(line.quantity, line.unitPrice, line.discount);
+                return (
                 <div
                   key={i}
                   className="grid grid-cols-1 md:grid-cols-12 gap-2 items-end p-2.5 rounded-xl bg-slate-50 border border-slate-200"
@@ -1173,7 +1312,7 @@ export function DocumentsPrintView({
                       className="w-full px-2 py-1.5 text-xs rounded-lg bg-white border border-slate-200"
                     />
                   </div>
-                  <div className="md:col-span-3">
+                  <div className="md:col-span-2">
                     <label className="block text-[10px] text-slate-500 mb-0.5">Service</label>
                     <input
                       value={line.serviceName}
@@ -1193,13 +1332,16 @@ export function DocumentsPrintView({
                       type="number"
                       min={0}
                       value={line.quantity}
-                      onChange={(e) =>
+                      onChange={(e) => {
+                        const qty = Math.max(0, Number(e.target.value));
                         setNLines((prev) =>
-                          prev.map((row, idx) =>
-                            idx === i ? { ...row, quantity: Math.max(0, Number(e.target.value)) } : row
-                          )
-                        )
-                      }
+                          prev.map((row, idx) => {
+                            if (idx !== i) return row;
+                            const calc = computeLineNetAmount(qty, row.unitPrice, row.discount);
+                            return { ...row, quantity: qty, discount: calc.discount, total: calc.net };
+                          })
+                        );
+                      }}
                       className="w-full px-2 py-1.5 text-xs font-mono rounded-lg bg-white border border-slate-200"
                     />
                   </div>
@@ -1210,45 +1352,59 @@ export function DocumentsPrintView({
                       min={0}
                       step="0.5"
                       value={line.unitPrice}
-                      onChange={(e) =>
+                      onChange={(e) => {
+                        const price = Math.max(0, Number(e.target.value));
                         setNLines((prev) =>
-                          prev.map((row, idx) =>
-                            idx === i ? { ...row, unitPrice: Math.max(0, Number(e.target.value)) } : row
-                          )
-                        )
-                      }
+                          prev.map((row, idx) => {
+                            if (idx !== i) return row;
+                            const calc = computeLineNetAmount(row.quantity, price, row.discount);
+                            return { ...row, unitPrice: price, discount: calc.discount, total: calc.net };
+                          })
+                        );
+                      }}
                       className="w-full px-2 py-1.5 text-xs font-mono rounded-lg bg-white border border-slate-200"
                     />
                   </div>
-                  <div className="md:col-span-1">
-                    <label className="block text-[10px] text-slate-500 mb-0.5">Disc.</label>
+                  <div className="md:col-span-2">
+                    <label className="block text-[10px] text-slate-500 mb-0.5">
+                      Disc ({sym}){lineCalc.discountPct > 0 ? ` · ${lineCalc.discountPct}%` : ''}
+                    </label>
                     <input
                       type="number"
                       min={0}
+                      max={lineCalc.gross}
+                      step="0.5"
                       value={line.discount}
-                      onChange={(e) =>
+                      onChange={(e) => {
+                        const raw = Math.max(0, Number(e.target.value));
                         setNLines((prev) =>
-                          prev.map((row, idx) =>
-                            idx === i ? { ...row, discount: Math.max(0, Number(e.target.value)) } : row
-                          )
-                        )
-                      }
+                          prev.map((row, idx) => {
+                            if (idx !== i) return row;
+                            const calc = computeLineNetAmount(row.quantity, row.unitPrice, raw);
+                            return { ...row, discount: calc.discount, total: calc.net };
+                          })
+                        );
+                      }}
                       className="w-full px-2 py-1.5 text-xs font-mono rounded-lg bg-white border border-slate-200"
                     />
                   </div>
-                  <div className="md:col-span-1 text-right">
+                  <div className="md:col-span-1 flex items-center justify-end gap-1 pb-1">
+                    <span className="text-[11px] font-mono tabular-nums font-semibold text-slate-700">
+                      {formatMoney(lineCalc.net, sym)}
+                    </span>
                     {nLines.length > 1 && (
                       <button
                         type="button"
                         onClick={() => setNLines((prev) => prev.filter((_, idx) => idx !== i))}
-                        className="p-1.5 text-red-500 hover:bg-red-50 rounded-lg"
+                        className="p-1 text-red-500 hover:bg-red-50 rounded-lg"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>
                     )}
                   </div>
                 </div>
-              ))}
+                );
+              })}
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 pt-2 border-t border-slate-200">

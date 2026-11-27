@@ -188,6 +188,24 @@ export interface CorporateMovement {
   isOpening?: boolean;
 }
 
+export type RewashStatus = 'Pending' | 'In Rewash' | 'Completed';
+
+export interface CorporateRewashRecord {
+  id: string;
+  corporateId: string;
+  itemName: string;
+  category?: string;
+  serviceName?: string;
+  quantity: number;
+  originalOrderRef?: string;
+  originalInvoiceRef?: string;
+  reason: string;
+  loggedDate: string;
+  status: RewashStatus;
+  loggedBy: string;
+  updatedAt?: string;
+}
+
 export interface Supplier {
   id: string;
   name: string;
@@ -283,9 +301,23 @@ export interface Employee {
   phone: string;
   payType: 'Monthly Salary' | 'Daily Wage';
   baseRate: number;
+  customPayTerms?: string;
   advanceBalance: number;
   salaryDue: number;
   active: boolean;
+}
+
+export interface StaffFineRecord {
+  id: string;
+  employeeId: string;
+  employeeName: string;
+  amount: number;
+  reason: string;
+  date: string;
+  createdBy: string;
+  status: 'Active' | 'Waived';
+  waivedReason?: string;
+  waivedAt?: string;
 }
 
 export interface PayrollRecord {
@@ -345,8 +377,10 @@ export interface Invoice {
   paidAmount: number;
   dueAmount: number;
   paymentTerms: string;
+  paymentMode?: string;
   termsAndConditions: string;
   reprintCount: number;
+  updatedAt?: string;
   isOpening?: boolean;
   logoSnapshotDataUrl?: string;
   logoSizeSnapshot?: LogoSizePreset;
@@ -415,6 +449,16 @@ export interface BlackBoxEvent {
 export type LogoSizePreset = 'Small' | 'Medium' | 'Large';
 export type AppearanceTheme = 'classic-blue' | 'colorful' | 'calm';
 
+export interface QuantityDiscountRule {
+  id: string;
+  name: string;
+  minQuantity: number;
+  discountType: 'percent' | 'amount';
+  discountValue: number;
+  productCategory?: string;
+  active: boolean;
+}
+
 export interface AppSettings {
   companyName: string;
   companyTagline: string;
@@ -435,6 +479,8 @@ export interface AppSettings {
   tokenShowQr: boolean;
   tokenCustomFooter: string;
   expenseCategories: string[];
+  staffRoles?: string[];
+  quantityDiscountRules?: QuantityDiscountRule[];
   lanModeEnabled: boolean;
   autoBackupEnabled: boolean;
   lastBackupAt?: string;
@@ -622,6 +668,7 @@ export interface ErpState {
   orders: Order[];
   corporateCustomers: CorporateCustomer[];
   corporateMovements: CorporateMovement[];
+  corporateRewashRecords: CorporateRewashRecord[];
   suppliers: Supplier[];
   chemicals: ChemicalItem[];
   stockMovements: StockMovement[];
@@ -629,6 +676,7 @@ export interface ErpState {
   journalEntries: JournalEntry[];
   employees: Employee[];
   payrollRecords: PayrollRecord[];
+  staffFines: StaffFineRecord[];
   expenses: ExpenseRecord[];
   invoices: Invoice[];
   tasks: ScheduledTask[];

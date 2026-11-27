@@ -69,6 +69,7 @@ import {
   CorporateCustomer,
   CorporateMovement,
   CorporateMovementType,
+  CorporateRewashRecord,
   Customer,
   CustomerCategory,
   DeliveryOption,
@@ -94,9 +95,12 @@ import {
   PaymentSplit,
   PayrollRecord,
   Product,
+  QuantityDiscountRule,
+  RewashStatus,
   RoleActionPermissions,
   ScheduledTask,
   Service,
+  StaffFineRecord,
   StockMovement,
   Supplier,
   UserAccount,
@@ -105,8 +109,10 @@ import {
 import {
   applyJournalToAccounts,
   buildJournalEntry,
+  computeLineNetAmount,
   createBlackBoxEvent,
   dateInputToIso,
+  derivePaymentModeLabel,
   generateNextMoneyAccountCode,
   inferMoneyChannel,
   isDebitNormal,
@@ -285,11 +291,13 @@ export default function App() {
       : `tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
   );
   const syncedRevisionRef = useRef<number>(1);
+  const remoteSyncRevisionRef = useRef<number>(0);
   const isRemoteUpdateRef = useRef<boolean>(false);
   const dirtyForFirestoreRef = useRef<boolean>(false);
   const firestoreDocIdsRef = useRef<string[]>([]);
   const lastSyncedJsonRef = useRef<string>('');
   const lastSyncedDocsRef = useRef<Record<string, string>>({});
+  const saveTimerRef = useRef<number | null>(null);
   const latestStateRef = useRef<ErpState>(state);
   latestStateRef.current = state;
   const wsRef = useRef<WebSocket | null>(null);
@@ -306,6 +314,17 @@ export default function App() {
   >('disconnected');
   const [firestoreStatusMessage, setFirestoreStatusMessage] = useState('');
   const [firestoreFatalError, setFirestoreFatalError] = useState<Error | null>(null);
+
+  const firebaseUserRef = useRef<User | null>(firebaseUser);
+  firebaseUserRef.current = firebaseUser;
+  const workspaceContextRef = useRef<WorkspaceContext | null>(workspaceContext);
+  workspaceContextRef.current = workspaceContext;
+  const activeUserNameRef = useRef<string>(activeUserName);
+  activeUserNameRef.current = activeUserName;
+  const backendModeRef = useRef(backendMode);
+  backendModeRef.current = backendMode;
+  const loadedFromServerRef = useRef(loadedFromServer);
+  loadedFromServerRef.current = loadedFromServer;
 
   if (firestoreFatalError) {
     throw firestoreFatalError;
@@ -437,6 +456,7 @@ export default function App() {
           isRemoteUpdateRef.current = true;
           dirtyForFirestoreRef.current = false;
           syncedRevisionRef.current = migrationResult.syncRevision ?? syncedRevisionRef.current;
+          remoteSyncRevisionRef.current = migrationResult.syncRevision ?? remoteSyncRevisionRef.current;
           firestoreDocIdsRef.current = migrationResult.docIds ?? [];
           if (migrationResult.businessJson) {
             lastSyncedJsonRef.current = migrationResult.businessJson;
@@ -457,6 +477,10 @@ export default function App() {
             firestoreDocIdsRef.current = remote.docIds;
             lastSyncedJsonRef.current = remote.businessJson;
             lastSyncedDocsRef.current = remote.sectionHashes;
+            remoteSyncRevisionRef.current = Math.max(
+              remoteSyncRevisionRef.current,
+              remote.syncRevision
+            );
             syncedRevisionRef.current = Math.max(syncedRevisionRef.current, remote.syncRevision);
             setFirestoreStatus('synced');
             setFirestoreStatusMessage('Live multi-user sync active');
@@ -472,14 +496,19 @@ export default function App() {
               return;
             }
 
+            // Incoming remote update supersedes any queued debounced local write
+            if (saveTimerRef.current) {
+              window.clearTimeout(saveTimerRef.current);
+              saveTimerRef.current = null;
+            }
+            dirtyForFirestoreRef.current = false;
+
             if (computeBusinessStateHash(latestStateRef.current) === remote.businessJson) {
-              dirtyForFirestoreRef.current = false;
               setLoadedFromServer(true);
               return;
             }
 
             isRemoteUpdateRef.current = true;
-            dirtyForFirestoreRef.current = false;
             setState(remote.state);
             setLoadedFromServer(true);
 
@@ -494,6 +523,8 @@ export default function App() {
           onEmpty: () => {
             if (cancelled) return;
             // Never seed default or demo data when Firestore is empty
+            remoteSyncRevisionRef.current = 0;
+            syncedRevisionRef.current = 0;
             lastSyncedJsonRef.current = computeBusinessStateHash(latestStateRef.current);
             lastSyncedDocsRef.current = computeSectionHashes(latestStateRef.current);
             dirtyForFirestoreRef.current = false;
@@ -634,9 +665,14 @@ export default function App() {
           };
 
           if (msg.type === 'sync:init' || msg.type === 'state:updated') {
+            if (firebaseUserRef.current && workspaceContextRef.current && lastSyncedJsonRef.current) {
+              if (msg.onlineUsers) setOnlineUsers(msg.onlineUsers);
+              if (msg.githubStatus) setGithubStatus(msg.githubStatus);
+              return;
+            }
             if (msg.originClientId && msg.originClientId === clientIdRef.current) {
               if (typeof msg.revision === 'number') {
-                syncedRevisionRef.current = msg.revision;
+                syncedRevisionRef.current = Math.max(syncedRevisionRef.current, msg.revision);
               }
               return;
             }
@@ -647,7 +683,7 @@ export default function App() {
               }
               const migrated = migrateErpState(msg.state);
               isRemoteUpdateRef.current = true;
-              syncedRevisionRef.current = incomingRev;
+              syncedRevisionRef.current = Math.max(syncedRevisionRef.current, incomingRev);
               setState(migrated);
               setLoadedFromServer(true);
             }
@@ -687,75 +723,91 @@ export default function App() {
     };
   }, [backendMode]);
 
-  // Persist real local edits to Firestore (2000ms debounce, changed partitions only), localStorage backup, and optional Node server
-  const saveTimerRef = useRef<number | null>(null);
+  // Cleanup any pending debounced explicit sync timer on unmount (no passive useEffect watching entire state)
   useEffect(() => {
-    if (!loadedFromServer) return;
-    if (isRemoteUpdateRef.current) {
-      isRemoteUpdateRef.current = false;
-      return;
-    }
-    if (!dirtyForFirestoreRef.current) {
-      return;
-    }
-
-    const preCheckHash = computeBusinessStateHash(state);
-    if (lastSyncedJsonRef.current && preCheckHash === lastSyncedJsonRef.current) {
-      dirtyForFirestoreRef.current = false;
-      return;
-    }
-
-    if (backendMode === 'static') {
-      try {
-        const migratedDone = window.localStorage.getItem(FIRESTORE_MIGRATED_KEY) === 'true';
-        if (!firebaseUser || migratedDone) {
-          window.localStorage.setItem(STATIC_STATE_KEY, JSON.stringify(state));
-        }
-      } catch {
-        // ignore storage quota/blocked
+    return () => {
+      if (saveTimerRef.current) {
+        window.clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = null;
       }
-    }
+    };
+  }, []);
 
-    if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
-    saveTimerRef.current = window.setTimeout(async () => {
+  // Explicit-action-only persistence with strict revision guard and business-hash kill-switch
+  const persistExplicitState = useCallback(
+    async (targetState: ErpState) => {
+      if (!loadedFromServerRef.current) return;
       if (!dirtyForFirestoreRef.current) return;
       dirtyForFirestoreRef.current = false;
 
-      const currentHash = computeBusinessStateHash(state);
-      const hasUnsyncedFirestoreChanges =
-        !lastSyncedJsonRef.current || currentHash !== lastSyncedJsonRef.current;
+      if (backendModeRef.current === 'static') {
+        try {
+          const migratedDone = window.localStorage.getItem(FIRESTORE_MIGRATED_KEY) === 'true';
+          if (!firebaseUserRef.current || migratedDone) {
+            window.localStorage.setItem(STATIC_STATE_KEY, JSON.stringify(targetState));
+          }
+        } catch {
+          // ignore storage quota/blocked
+        }
+      }
 
-      if (firebaseUser && workspaceContext && hasUnsyncedFirestoreChanges) {
-        const prevRev = syncedRevisionRef.current;
-        const nextRev = prevRev + 1;
+      const currentHash = computeBusinessStateHash(targetState);
+      const hasUnsyncedFirestoreChanges =
+        Boolean(lastSyncedJsonRef.current) && currentHash !== lastSyncedJsonRef.current;
+
+      const activeFbUser = firebaseUserRef.current;
+      const activeWs = workspaceContextRef.current;
+
+      if (activeFbUser && activeWs && hasUnsyncedFirestoreChanges) {
+        const localBaseRev = syncedRevisionRef.current;
+        const remoteRev = remoteSyncRevisionRef.current;
+        const nextRev = localBaseRev + 1;
+
+        if (remoteRev > localBaseRev || remoteRev >= nextRev) {
+          setFirestoreStatus('synced');
+          setFirestoreStatusMessage('Skipped stale write — newer cloud revision active');
+          return;
+        }
+
         syncedRevisionRef.current = nextRev;
         try {
           const result = await saveStateToFirestoreBatch({
             state: {
-              ...state,
+              ...targetState,
               syncRevision: nextRev,
               lastUpdatedAt: new Date().toISOString(),
-              lastUpdatedBy: activeUserName,
+              lastUpdatedBy: activeUserNameRef.current,
             },
-            user: firebaseUser,
-            workspace: workspaceContext,
+            user: activeFbUser,
+            workspace: activeWs,
             syncRevision: nextRev,
+            localBaseRevision: localBaseRev,
+            remoteSyncRevision: remoteRev,
             originClientId: clientIdRef.current,
             knownDocIds: firestoreDocIdsRef.current,
             lastSyncedDocs:
               Object.keys(lastSyncedDocsRef.current).length > 0
                 ? lastSyncedDocsRef.current
                 : undefined,
+            lastSyncedJson: lastSyncedJsonRef.current,
           });
+          if (result.abortedReason === 'stale-revision') {
+            const latestRev = Math.max(localBaseRev, result.remoteRevision ?? remoteRev);
+            syncedRevisionRef.current = latestRev;
+            remoteSyncRevisionRef.current = Math.max(remoteSyncRevisionRef.current, latestRev);
+            return;
+          }
           firestoreDocIdsRef.current = result.docIds;
           lastSyncedDocsRef.current = result.sectionHashes;
           lastSyncedJsonRef.current = result.businessJson;
           if (result.writtenCount === 0) {
-            syncedRevisionRef.current = prevRev;
+            syncedRevisionRef.current = localBaseRev;
+          } else {
+            remoteSyncRevisionRef.current = Math.max(remoteSyncRevisionRef.current, nextRev);
           }
           setFirestoreStatus('synced');
         } catch (err) {
-          syncedRevisionRef.current = prevRev;
+          syncedRevisionRef.current = localBaseRev;
           const wrapped = err instanceof Error ? err : new Error(String(err));
           if (isFirestoreQuotaError(wrapped)) {
             setFirestoreStatus('error');
@@ -774,24 +826,30 @@ export default function App() {
         }
       }
 
-      if (backendMode !== 'server') return;
+      if (backendModeRef.current !== 'server') return;
       try {
         const res = await fetch('/api/state', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            state,
+            state: targetState,
             baseRevision: syncedRevisionRef.current,
-            updatedBy: activeUserName,
+            updatedBy: activeUserNameRef.current,
             clientId: clientIdRef.current,
           }),
         });
         if (res.ok) {
           const data = (await res.json()) as { revision?: number };
-          if (typeof data.revision === 'number') {
-            syncedRevisionRef.current = data.revision;
+          if (
+            typeof data.revision === 'number' &&
+            (!firebaseUserRef.current || !workspaceContextRef.current)
+          ) {
+            syncedRevisionRef.current = Math.max(syncedRevisionRef.current, data.revision);
           }
-        } else if (res.status === 409) {
+        } else if (
+          res.status === 409 &&
+          (!firebaseUserRef.current || !workspaceContextRef.current)
+        ) {
           const conflict = (await res.json()) as {
             currentRevision?: number;
             latestState?: Partial<ErpState>;
@@ -806,24 +864,42 @@ export default function App() {
       } catch {
         // ignore network hiccup
       }
-    }, 2000);
-    return () => {
-      if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
-    };
-  }, [state, loadedFromServer, backendMode, activeUserName, showToast, firebaseUser, workspaceContext]);
+    },
+    [showToast]
+  );
 
+  const scheduleExplicitPersist = useCallback(
+    (nextState: ErpState) => {
+      if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = window.setTimeout(() => {
+        saveTimerRef.current = null;
+        void persistExplicitState(nextState);
+      }, 2000);
+    },
+    [persistExplicitState]
+  );
+
+  // Explicit user business action mutator: only marks Firestore dirty & schedules sync if business hash changed
   const commitState = useCallback(
     (updater: (prev: ErpState) => ErpState, recordUndo = false) => {
-      dirtyForFirestoreRef.current = true;
-      setState((prev) => {
-        if (recordUndo) {
-          setUndoStack((u) => [prev, ...u.slice(0, 14)]);
-          setRedoStack([]);
-        }
-        return updater(prev);
-      });
+      const prev = latestStateRef.current;
+      const next = updater(prev);
+      if (next === prev) return;
+      latestStateRef.current = next;
+      if (recordUndo) {
+        setUndoStack((u) => [prev, ...u.slice(0, 14)]);
+        setRedoStack([]);
+      }
+      setState(next);
+
+      const prevHash = computeBusinessStateHash(prev);
+      const nextHash = computeBusinessStateHash(next);
+      if (nextHash !== prevHash) {
+        dirtyForFirestoreRef.current = true;
+        scheduleExplicitPersist(next);
+      }
     },
-    []
+    [scheduleExplicitPersist]
   );
 
   // Automated Notification Rules Scanner (strictly local alerts so idle scans never mark Firestore dirty or increment Rev #)
@@ -961,7 +1037,12 @@ export default function App() {
           const prevSnap = undoStack[0];
           setRedoStack((r) => [state, ...r]);
           setUndoStack((u) => u.slice(1));
+          latestStateRef.current = prevSnap;
           setState(prevSnap);
+          if (computeBusinessStateHash(prevSnap) !== computeBusinessStateHash(state)) {
+            dirtyForFirestoreRef.current = true;
+            scheduleExplicitPersist(prevSnap);
+          }
         }
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && e.shiftKey) {
         const tag = (e.target as HTMLElement)?.tagName;
@@ -971,7 +1052,12 @@ export default function App() {
           const nextSnap = redoStack[0];
           setUndoStack((u) => [state, ...u]);
           setRedoStack((r) => r.slice(1));
+          latestStateRef.current = nextSnap;
           setState(nextSnap);
+          if (computeBusinessStateHash(nextSnap) !== computeBusinessStateHash(state)) {
+            dirtyForFirestoreRef.current = true;
+            scheduleExplicitPersist(nextSnap);
+          }
         }
       } else if (e.key === 'Escape') {
         setQuickSearchOpen(false);
@@ -980,7 +1066,7 @@ export default function App() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [undoStack, redoStack, state, currentUser, allowedSections, activePerms]);
+  }, [undoStack, redoStack, state, currentUser, allowedSections, activePerms, scheduleExplicitPersist]);
 
   const requestBrowserPermission = async () => {
     if (typeof window === 'undefined' || !('Notification' in window)) return;
@@ -1650,6 +1736,7 @@ export default function App() {
             });
           }
         }
+        const calc = computeLineNetAmount(l.quantity, l.unitPrice, l.discount);
         return {
           id: `ol-${Date.now()}-${idx}`,
           productId: l.productId,
@@ -1660,14 +1747,18 @@ export default function App() {
           quantityReceived: params.physicallyReceived ? l.quantity : 0,
           quantityDelivered: 0,
           quantityRewash: 0,
-          unitPrice: l.unitPrice,
-          discount: l.discount,
+          unitPrice: Math.max(0, Number(l.unitPrice) || 0),
+          discount: calc.discount,
         };
       });
 
-      const subtotal = orderLines.reduce(
-        (s, l) => s + Math.max(0, l.quantityOrdered * l.unitPrice - l.discount),
-        0
+      const subtotal = Number(
+        orderLines
+          .reduce(
+            (s, l) => s + computeLineNetAmount(l.quantityOrdered, l.unitPrice, l.discount).net,
+            0
+          )
+          .toFixed(2)
       );
       const extra = params.addAdditionalToOrder ? params.additionalCharge : 0;
       const totalAmount = Math.max(0, Number((subtotal - params.orderDiscount + extra).toFixed(2)));
@@ -1728,14 +1819,17 @@ export default function App() {
         isCorporate: false,
         issuedAt: invoiceIssuedAt,
         dueDate: expectedDeliveryAt,
-        lines: orderLines.map((l) => ({
-          productName: l.productName,
-          serviceName: l.serviceName,
-          quantity: l.quantityOrdered,
-          unitPrice: l.unitPrice,
-          discount: l.discount,
-          total: Number((l.quantityOrdered * l.unitPrice - l.discount).toFixed(2)),
-        })),
+        lines: orderLines.map((l) => {
+          const calc = computeLineNetAmount(l.quantityOrdered, l.unitPrice, l.discount);
+          return {
+            productName: l.productName,
+            serviceName: l.serviceName,
+            quantity: l.quantityOrdered,
+            unitPrice: l.unitPrice,
+            discount: calc.discount,
+            total: calc.net,
+          };
+        }),
         subtotal,
         discountTotal: params.orderDiscount,
         extraCharges: extra,
@@ -1743,8 +1837,10 @@ export default function App() {
         paidAmount,
         dueAmount,
         paymentTerms: 'Due on Delivery',
+        paymentMode: derivePaymentModeLabel(paidAmount, totalAmount, normalizedSplits),
         termsAndConditions: prev.settings.invoiceTerms,
         reprintCount: 0,
+        updatedAt: new Date().toISOString(),
         logoSnapshotDataUrl: prev.settings.companyLogoDataUrl,
         logoSizeSnapshot: prev.settings.companyLogoSize || 'Medium',
         showBrandNameSnapshot: prev.settings.showBrandNameWithLogo ?? true,
@@ -2045,24 +2141,28 @@ export default function App() {
       });
 
       const nextAccounts = applyJournalToAccounts(prev.accounts, je);
+      const combinedSplits = [...(ord.paymentSplits || []), ...splits];
+      const nextOrdPaid = Number((ord.paidAmount + applied).toFixed(2));
       const nextOrders = prev.orders.map((o) =>
         o.id === orderId
           ? {
               ...o,
-              paidAmount: Number((o.paidAmount + applied).toFixed(2)),
-              paymentSplits: [...(o.paymentSplits || []), ...splits],
+              paidAmount: nextOrdPaid,
+              paymentSplits: combinedSplits,
             }
           : o
       );
-      const nextInvoices = prev.invoices.map((inv) =>
-        inv.orderId === orderId
-          ? {
-              ...inv,
-              paidAmount: Number((inv.paidAmount + applied).toFixed(2)),
-              dueAmount: Math.max(0, Number((inv.dueAmount - applied).toFixed(2))),
-            }
-          : inv
-      );
+      const nextInvoices = prev.invoices.map((inv) => {
+        if (inv.orderId !== orderId) return inv;
+        const invPaid = Number((inv.paidAmount + applied).toFixed(2));
+        return {
+          ...inv,
+          paidAmount: invPaid,
+          dueAmount: Math.max(0, Number((inv.dueAmount - applied).toFixed(2))),
+          paymentMode: derivePaymentModeLabel(invPaid, inv.grandTotal, combinedSplits),
+          updatedAt: new Date().toISOString(),
+        };
+      });
       const nextCustomers = prev.customers.map((c) =>
         c.id === ord.customerId
           ? {
@@ -2356,6 +2456,7 @@ export default function App() {
       dueDate?: string;
       customDiscountType?: 'percent' | 'amount';
       customDiscountValue?: number;
+      lineDiscounts?: Record<string, number>;
       approvedZeroPriceLines?: Array<{ productName: string; serviceName: string; quantity: number }>;
     }
   ) => {
@@ -2398,13 +2499,15 @@ export default function App() {
         const rate =
           corp.prices.find((p) => p.productId === m.productId && p.serviceId === m.serviceId)
             ?.price ?? m.unitPriceSnapshot;
+        const rawLineDisc = options?.lineDiscounts?.[m.id] ?? 0;
+        const calc = computeLineNetAmount(qty, rate, rawLineDisc);
         return {
           productName: m.productName,
           serviceName: m.serviceName,
           quantity: qty,
           unitPrice: rate,
-          discount: 0,
-          total: Number((qty * rate).toFixed(2)),
+          discount: calc.discount,
+          total: calc.net,
         };
       });
 
@@ -2442,12 +2545,14 @@ export default function App() {
         paidAmount: 0,
         dueAmount: grandTotal,
         paymentTerms: 'Net 7 Days',
+        paymentMode: derivePaymentModeLabel(0, grandTotal),
         termsAndConditions: `Corporate ${corp.billingBasis} statement for ${periodLabel}.${
           discountTotal > 0
             ? ` Custom discount applied: ${prev.settings.currencySymbol} ${discountTotal.toFixed(2)}.`
             : ''
         }`,
         reprintCount: 0,
+        updatedAt: new Date().toISOString(),
         logoSnapshotDataUrl: prev.settings.companyLogoDataUrl,
         logoSizeSnapshot: prev.settings.companyLogoSize || 'Medium',
         showBrandNameSnapshot: prev.settings.showBrandNameWithLogo ?? true,
@@ -2587,10 +2692,13 @@ export default function App() {
         if (inv.corporateId !== corpId || inv.dueAmount <= 0 || remainingToApply <= 0) return inv;
         const apply = Math.min(remainingToApply, inv.dueAmount);
         remainingToApply -= apply;
+        const nextPaid = Number((inv.paidAmount + apply).toFixed(2));
         return {
           ...inv,
-          paidAmount: Number((inv.paidAmount + apply).toFixed(2)),
+          paidAmount: nextPaid,
           dueAmount: Number((inv.dueAmount - apply).toFixed(2)),
+          paymentMode: derivePaymentModeLabel(nextPaid, inv.grandTotal, splits),
+          updatedAt: new Date().toISOString(),
         };
       });
 
@@ -4117,6 +4225,356 @@ export default function App() {
     showToast('Expense category deleted');
   };
 
+  const handleRenameExpenseCategory = (oldCategory: string, newCategory: string) => {
+    if (!requireAction(activePerms.actions.canManagePayrollExpenses, 'rename expense categories')) return;
+    const cleanNew = newCategory.trim();
+    if (!cleanNew || cleanNew === oldCategory) return;
+    commitState((prev) => {
+      const nextCategories = Array.from(
+        new Set(prev.settings.expenseCategories.map((c) => (c === oldCategory ? cleanNew : c)))
+      );
+      const nextExpenses = prev.expenses.map((exp) =>
+        exp.category === oldCategory ? { ...exp, category: cleanNew } : exp
+      );
+      const bb = createBlackBoxEvent(prev.blackBox, {
+        user: activeUserName,
+        role: currentUserRole,
+        action: 'EXPENSE_CATEGORY_RENAMED',
+        module: 'Expenses',
+        recordId: cleanNew,
+        summary: `Renamed expense category "${oldCategory}" to "${cleanNew}"`,
+        beforeValue: oldCategory,
+        afterValue: cleanNew,
+      });
+      return {
+        ...prev,
+        settings: { ...prev.settings, expenseCategories: nextCategories },
+        expenses: nextExpenses,
+        blackBox: [bb, ...prev.blackBox],
+      };
+    });
+    showToast(`Category renamed to "${cleanNew}"`);
+  };
+
+  const handleUpdateEmployee = (
+    empId: string,
+    patch: Partial<
+      Pick<Employee, 'name' | 'role' | 'phone' | 'payType' | 'baseRate' | 'customPayTerms' | 'active' | 'salaryDue'>
+    >
+  ) => {
+    if (!requireAction(activePerms.actions.canManagePayrollExpenses, 'customize staff profiles')) return;
+    commitState((prev) => {
+      const target = prev.employees.find((e) => e.id === empId);
+      if (!target) return prev;
+      const updatedEmp: Employee = {
+        ...target,
+        ...patch,
+        name: patch.name !== undefined ? patch.name.trim() || target.name : target.name,
+        role: patch.role !== undefined ? patch.role.trim() || target.role : target.role,
+        phone: patch.phone !== undefined ? patch.phone.trim() : target.phone,
+        baseRate:
+          patch.baseRate !== undefined ? Math.max(0, Number(patch.baseRate) || 0) : target.baseRate,
+        salaryDue:
+          patch.salaryDue !== undefined ? Math.max(0, Number(patch.salaryDue) || 0) : target.salaryDue,
+      };
+      const nextEmployees = prev.employees.map((e) => (e.id === empId ? updatedEmp : e));
+      const nextRoles =
+        updatedEmp.role && !(prev.settings.staffRoles || []).includes(updatedEmp.role)
+          ? [...(prev.settings.staffRoles || []), updatedEmp.role]
+          : prev.settings.staffRoles;
+      const bb = createBlackBoxEvent(prev.blackBox, {
+        user: activeUserName,
+        role: currentUserRole,
+        action: 'EMPLOYEE_UPDATED',
+        module: 'Employees',
+        recordId: empId,
+        summary: `Updated staff profile ${updatedEmp.name} (${updatedEmp.role}, ${updatedEmp.payType} ${prev.settings.currencySymbol} ${updatedEmp.baseRate})`,
+        beforeValue: target,
+        afterValue: updatedEmp,
+      });
+      return {
+        ...prev,
+        employees: nextEmployees,
+        settings: { ...prev.settings, staffRoles: nextRoles },
+        blackBox: [bb, ...prev.blackBox],
+      };
+    });
+    showToast('Staff profile updated');
+  };
+
+  const handleAddStaffRole = (roleName: string) => {
+    if (!requireAction(activePerms.actions.canManagePayrollExpenses, 'add staff roles')) return;
+    const clean = roleName.trim();
+    if (!clean) return;
+    commitState((prev) => ({
+      ...prev,
+      settings: {
+        ...prev.settings,
+        staffRoles: Array.from(new Set([...(prev.settings.staffRoles || []), clean])),
+      },
+    }));
+  };
+
+  const handleRenameStaffRole = (oldRole: string, newRole: string) => {
+    if (!requireAction(activePerms.actions.canManagePayrollExpenses, 'rename staff roles')) return;
+    const cleanNew = newRole.trim();
+    if (!cleanNew || cleanNew === oldRole) return;
+    commitState((prev) => ({
+      ...prev,
+      settings: {
+        ...prev.settings,
+        staffRoles: Array.from(
+          new Set((prev.settings.staffRoles || []).map((r) => (r === oldRole ? cleanNew : r)))
+        ),
+      },
+      employees: prev.employees.map((e) => (e.role === oldRole ? { ...e, role: cleanNew } : e)),
+    }));
+    showToast(`Staff role renamed to "${cleanNew}"`);
+  };
+
+  const handleDeleteStaffRole = (roleName: string) => {
+    if (!requireAction(activePerms.actions.canManagePayrollExpenses, 'remove staff roles')) return;
+    commitState((prev) => ({
+      ...prev,
+      settings: {
+        ...prev.settings,
+        staffRoles: (prev.settings.staffRoles || []).filter((r) => r !== roleName),
+      },
+    }));
+  };
+
+  const handleApplyStaffFine = (params: {
+    employeeId: string;
+    amount: number;
+    reason: string;
+    date?: string;
+  }) => {
+    if (!requireAction(activePerms.actions.canManagePayrollExpenses, 'apply salary fines')) return;
+    const amt = Number((Math.max(0, Number(params.amount) || 0)).toFixed(2));
+    if (amt <= 0 || !params.reason.trim()) return;
+    commitState((prev) => {
+      const emp = prev.employees.find((e) => e.id === params.employeeId);
+      if (!emp) return prev;
+      const fine: StaffFineRecord = {
+        id: `FINE-${101 + (prev.staffFines?.length || 0)}-${Date.now().toString().slice(-3)}`,
+        employeeId: emp.id,
+        employeeName: emp.name,
+        amount: amt,
+        reason: params.reason.trim(),
+        date: params.date ? dateInputToIso(params.date) : new Date().toISOString(),
+        createdBy: activeUserName,
+        status: 'Active',
+      };
+      const bb = createBlackBoxEvent(prev.blackBox, {
+        user: activeUserName,
+        role: currentUserRole,
+        action: 'STAFF_FINE_APPLIED',
+        module: 'Employees',
+        recordId: fine.id,
+        summary: `Applied fine of ${prev.settings.currencySymbol} ${amt} to ${emp.name}: ${fine.reason}`,
+        afterValue: fine,
+      });
+      return {
+        ...prev,
+        staffFines: [fine, ...(prev.staffFines || [])],
+        blackBox: [bb, ...prev.blackBox],
+      };
+    });
+    showToast('Salary fine applied');
+  };
+
+  const handleToggleStaffFineStatus = (fineId: string, waivedReason?: string) => {
+    if (!requireAction(activePerms.actions.canManagePayrollExpenses, 'update salary fines')) return;
+    commitState((prev) => {
+      const target = (prev.staffFines || []).find((f) => f.id === fineId);
+      if (!target) return prev;
+      const nextStatus: 'Active' | 'Waived' = target.status === 'Active' ? 'Waived' : 'Active';
+      const nextFines = (prev.staffFines || []).map((f) =>
+        f.id === fineId
+          ? {
+              ...f,
+              status: nextStatus,
+              waivedReason: nextStatus === 'Waived' ? waivedReason?.trim() || 'Waived by owner' : undefined,
+              waivedAt: nextStatus === 'Waived' ? new Date().toISOString() : undefined,
+            }
+          : f
+      );
+      const bb = createBlackBoxEvent(prev.blackBox, {
+        user: activeUserName,
+        role: currentUserRole,
+        action: nextStatus === 'Waived' ? 'STAFF_FINE_WAIVED' : 'STAFF_FINE_RESTORED',
+        module: 'Employees',
+        recordId: fineId,
+        summary: `${nextStatus === 'Waived' ? 'Waived' : 'Restored'} fine ${fineId} (${target.employeeName})`,
+      });
+      return {
+        ...prev,
+        staffFines: nextFines,
+        blackBox: [bb, ...prev.blackBox],
+      };
+    });
+  };
+
+  const handleDeleteStaffFine = (fineId: string) => {
+    if (!requireAction(activePerms.actions.canManagePayrollExpenses, 'delete salary fines')) return;
+    commitState((prev) => {
+      const target = (prev.staffFines || []).find((f) => f.id === fineId);
+      if (!target) return prev;
+      const bb = createBlackBoxEvent(prev.blackBox, {
+        user: activeUserName,
+        role: currentUserRole,
+        action: 'STAFF_FINE_DELETED',
+        module: 'Employees',
+        recordId: fineId,
+        summary: `Deleted fine ${fineId} for ${target.employeeName}`,
+        beforeValue: target,
+      });
+      return {
+        ...prev,
+        staffFines: (prev.staffFines || []).filter((f) => f.id !== fineId),
+        blackBox: [bb, ...prev.blackBox],
+      };
+    });
+    showToast('Fine record deleted');
+  };
+
+  const handleUpdateQuantityDiscountRules = (rules: QuantityDiscountRule[]) => {
+    if (!requireAction(activePerms.actions.canCreateOrders, 'update quantity discount rules')) return;
+    commitState((prev) => ({
+      ...prev,
+      settings: {
+        ...prev.settings,
+        quantityDiscountRules: rules,
+      },
+    }));
+    showToast('Quantity discount rules saved');
+  };
+
+  // --- CORPORATE REWASH INVENTORY TRACKER (Non-billable & Strictly Isolated per Account) ---
+
+  const handleAddCorporateRewash = (params: {
+    corporateId: string;
+    itemName: string;
+    category?: string;
+    serviceName?: string;
+    quantity: number;
+    originalOrderRef?: string;
+    originalInvoiceRef?: string;
+    reason: string;
+    loggedDate?: string;
+    status?: RewashStatus;
+  }) => {
+    if (!requireAction(activePerms.actions.canManageCorporate, 'log corporate rewash items')) return;
+    const qty = Math.max(1, Math.round(Number(params.quantity) || 0));
+    if (!params.itemName.trim() || !params.reason.trim()) return;
+    commitState((prev) => {
+      const corp = prev.corporateCustomers.find((c) => c.id === params.corporateId);
+      if (!corp) return prev;
+      const rec: CorporateRewashRecord = {
+        id: `CRW-${101 + (prev.corporateRewashRecords?.length || 0)}-${Date.now().toString().slice(-3)}`,
+        corporateId: corp.id,
+        itemName: params.itemName.trim(),
+        category: params.category?.trim() || undefined,
+        serviceName: params.serviceName?.trim() || undefined,
+        quantity: qty,
+        originalOrderRef: params.originalOrderRef?.trim() || undefined,
+        originalInvoiceRef: params.originalInvoiceRef?.trim() || undefined,
+        reason: params.reason.trim(),
+        loggedDate: params.loggedDate ? dateInputToIso(params.loggedDate) : new Date().toISOString(),
+        status: params.status || 'Pending',
+        loggedBy: activeUserName,
+        updatedAt: new Date().toISOString(),
+      };
+      const bb = createBlackBoxEvent(prev.blackBox, {
+        user: activeUserName,
+        role: currentUserRole,
+        action: 'CORP_REWASH_LOGGED',
+        module: 'Corporate',
+        recordId: rec.id,
+        summary: `Logged non-billable rewash for ${corp.name}: ${qty}x ${rec.itemName} (${rec.status})`,
+        afterValue: rec,
+      });
+      return {
+        ...prev,
+        corporateRewashRecords: [rec, ...(prev.corporateRewashRecords || [])],
+        blackBox: [bb, ...prev.blackBox],
+      };
+    });
+    showToast('Corporate rewash item logged');
+  };
+
+  const handleUpdateCorporateRewash = (
+    rewashId: string,
+    patch: Partial<
+      Pick<
+        CorporateRewashRecord,
+        | 'itemName'
+        | 'category'
+        | 'serviceName'
+        | 'quantity'
+        | 'originalOrderRef'
+        | 'originalInvoiceRef'
+        | 'reason'
+        | 'loggedDate'
+        | 'status'
+      >
+    >
+  ) => {
+    if (!requireAction(activePerms.actions.canManageCorporate, 'update corporate rewash items')) return;
+    commitState((prev) => {
+      const target = (prev.corporateRewashRecords || []).find((r) => r.id === rewashId);
+      if (!target) return prev;
+      const updatedRec: CorporateRewashRecord = {
+        ...target,
+        ...patch,
+        quantity:
+          patch.quantity !== undefined ? Math.max(1, Math.round(Number(patch.quantity) || 1)) : target.quantity,
+        updatedAt: new Date().toISOString(),
+      };
+      const bb = createBlackBoxEvent(prev.blackBox, {
+        user: activeUserName,
+        role: currentUserRole,
+        action: 'CORP_REWASH_UPDATED',
+        module: 'Corporate',
+        recordId: rewashId,
+        summary: `Updated rewash ${rewashId} (${updatedRec.itemName} -> ${updatedRec.status})`,
+        beforeValue: target,
+        afterValue: updatedRec,
+      });
+      return {
+        ...prev,
+        corporateRewashRecords: (prev.corporateRewashRecords || []).map((r) =>
+          r.id === rewashId ? updatedRec : r
+        ),
+        blackBox: [bb, ...prev.blackBox],
+      };
+    });
+    showToast('Rewash record updated');
+  };
+
+  const handleDeleteCorporateRewash = (rewashId: string) => {
+    if (!requireAction(activePerms.actions.canManageCorporate, 'delete corporate rewash items')) return;
+    commitState((prev) => {
+      const target = (prev.corporateRewashRecords || []).find((r) => r.id === rewashId);
+      if (!target) return prev;
+      const bb = createBlackBoxEvent(prev.blackBox, {
+        user: activeUserName,
+        role: currentUserRole,
+        action: 'CORP_REWASH_DELETED',
+        module: 'Corporate',
+        recordId: rewashId,
+        summary: `Deleted corporate rewash record ${rewashId} (${target.itemName})`,
+        beforeValue: target,
+      });
+      return {
+        ...prev,
+        corporateRewashRecords: (prev.corporateRewashRecords || []).filter((r) => r.id !== rewashId),
+        blackBox: [bb, ...prev.blackBox],
+      };
+    });
+    showToast('Rewash record removed');
+  };
+
   const handleRemoveCompanyLogo = () => {
     commitState((prev) => {
       const bb = createBlackBoxEvent(prev.blackBox, {
@@ -4653,21 +5111,29 @@ export default function App() {
         prev.deliveryOptions.find((d) => d.id === updated.deliveryOptionId) ||
         prev.deliveryOptions[0];
 
-      const cleanLines = updated.lines.map((l) => ({
-        ...l,
-        quantityOrdered: Math.max(0, Number(l.quantityOrdered) || 0),
-        quantityReceived: updated.physicallyReceived
-          ? Math.max(0, Number(l.quantityReceived || l.quantityOrdered) || 0)
-          : 0,
-        quantityDelivered: Math.max(0, Number(l.quantityDelivered) || 0),
-        quantityRewash: Math.max(0, Number(l.quantityRewash) || 0),
-        unitPrice: Math.max(0, Number(l.unitPrice) || 0),
-        discount: Math.max(0, Number(l.discount) || 0),
-      }));
+      const cleanLines = updated.lines.map((l) => {
+        const qty = Math.max(0, Number(l.quantityOrdered) || 0);
+        const price = Math.max(0, Number(l.unitPrice) || 0);
+        const calc = computeLineNetAmount(qty, price, l.discount);
+        return {
+          ...l,
+          quantityOrdered: qty,
+          quantityReceived: updated.physicallyReceived
+            ? Math.max(0, Number(l.quantityReceived || qty) || 0)
+            : 0,
+          quantityDelivered: Math.max(0, Number(l.quantityDelivered) || 0),
+          quantityRewash: Math.max(0, Number(l.quantityRewash) || 0),
+          unitPrice: price,
+          discount: calc.discount,
+        };
+      });
 
       const subtotal = Number(
         cleanLines
-          .reduce((s, l) => s + Math.max(0, l.quantityOrdered * l.unitPrice - l.discount), 0)
+          .reduce(
+            (s, l) => s + computeLineNetAmount(l.quantityOrdered, l.unitPrice, l.discount).net,
+            0
+          )
           .toFixed(2)
       );
       const orderDiscount = Math.max(0, Number(updated.orderDiscount) || 0);
@@ -4770,20 +5236,25 @@ export default function App() {
           customerAddress: newCust.address,
           issuedAt: invoiceIssuedIso,
           dueDate: expectedDeliveryIso,
-          lines: cleanLines.map((l) => ({
-            productName: l.productName,
-            serviceName: l.serviceName,
-            quantity: l.quantityOrdered,
-            unitPrice: l.unitPrice,
-            discount: l.discount,
-            total: Number((l.quantityOrdered * l.unitPrice - l.discount).toFixed(2)),
-          })),
+          lines: cleanLines.map((l) => {
+            const calc = computeLineNetAmount(l.quantityOrdered, l.unitPrice, l.discount);
+            return {
+              productName: l.productName,
+              serviceName: l.serviceName,
+              quantity: l.quantityOrdered,
+              unitPrice: l.unitPrice,
+              discount: calc.discount,
+              total: calc.net,
+            };
+          }),
           subtotal,
           discountTotal: orderDiscount,
           extraCharges: extra,
           grandTotal: totalAmount,
           paidAmount,
           dueAmount,
+          paymentMode: derivePaymentModeLabel(paidAmount, totalAmount, normalizedSplits),
+          updatedAt: new Date().toISOString(),
         };
       });
 
@@ -5302,13 +5773,13 @@ export default function App() {
       const cleanLines = params.lines.map((l) => {
         const qty = Math.max(0, Number(l.quantity) || 0);
         const price = Math.max(0, Number(l.unitPrice) || 0);
-        const disc = Math.max(0, Number(l.discount) || 0);
+        const calc = computeLineNetAmount(qty, price, l.discount);
         return {
           ...l,
           quantity: qty,
           unitPrice: price,
-          discount: disc,
-          total: Number(Math.max(0, qty * price - disc).toFixed(2)),
+          discount: calc.discount,
+          total: calc.net,
         };
       });
       const subtotal = Number(cleanLines.reduce((s, l) => s + l.total, 0).toFixed(2));
@@ -5320,6 +5791,7 @@ export default function App() {
 
       const issuedAt = dateInputToIso(params.issuedAt);
       const dueDate = dateInputToIso(params.dueDate, issuedAt);
+      const selectedAccName = prev.accounts.find((a) => a.code === params.paymentAccountCode)?.name;
 
       const newInvoice: Invoice = {
         id: invoiceId,
@@ -5340,8 +5812,16 @@ export default function App() {
         paidAmount,
         dueAmount,
         paymentTerms: params.paymentTerms || (params.isCorporate ? 'Net 7 Days' : 'Due on Delivery'),
+        paymentMode: derivePaymentModeLabel(
+          paidAmount,
+          grandTotal,
+          paidAmount > 0 && selectedAccName
+            ? [{ accountCode: params.paymentAccountCode || '1010', accountName: selectedAccName, amount: paidAmount }]
+            : undefined
+        ),
         termsAndConditions: params.termsAndConditions || prev.settings.invoiceTerms,
         reprintCount: 0,
+        updatedAt: new Date().toISOString(),
         logoSnapshotDataUrl: prev.settings.companyLogoDataUrl,
         logoSizeSnapshot: prev.settings.companyLogoSize || 'Medium',
         showBrandNameSnapshot: prev.settings.showBrandNameWithLogo ?? true,
@@ -5467,13 +5947,13 @@ export default function App() {
       const cleanLines = updated.lines.map((l) => {
         const qty = Math.max(0, Number(l.quantity) || 0);
         const price = Math.max(0, Number(l.unitPrice) || 0);
-        const disc = Math.max(0, Number(l.discount) || 0);
+        const calc = computeLineNetAmount(qty, price, l.discount);
         return {
           ...l,
           quantity: qty,
           unitPrice: price,
-          discount: disc,
-          total: Number(Math.max(0, qty * price - disc).toFixed(2)),
+          discount: calc.discount,
+          total: calc.net,
         };
       });
       const subtotal = Number(cleanLines.reduce((s, l) => s + l.total, 0).toFixed(2));
@@ -5486,6 +5966,7 @@ export default function App() {
 
       const issuedAtIso = updated.issuedAt || inv.issuedAt;
       const dueDateIso = updated.dueDate || inv.dueDate;
+      const selectedAccName = prev.accounts.find((a) => a.code === updated.paymentAccountCode)?.name;
 
       const updatedInv: Invoice = {
         ...inv,
@@ -5496,6 +5977,13 @@ export default function App() {
         customerAddress: updated.customerAddress.trim(),
         periodCovered: updated.periodCovered,
         paymentTerms: updated.paymentTerms,
+        paymentMode: derivePaymentModeLabel(
+          paidAmount,
+          grandTotal,
+          paidAmount > 0 && selectedAccName
+            ? [{ accountCode: updated.paymentAccountCode || '1010', accountName: selectedAccName, amount: paidAmount }]
+            : undefined
+        ),
         termsAndConditions: updated.termsAndConditions,
         lines: cleanLines,
         subtotal,
@@ -5504,6 +5992,7 @@ export default function App() {
         grandTotal,
         paidAmount,
         dueAmount,
+        updatedAt: new Date().toISOString(),
       };
 
       const nextCustomers = !inv.isCorporate
@@ -6595,18 +7084,24 @@ export default function App() {
 
   const handleForceFirestoreSync = useCallback(async () => {
     if (!firebaseUser || !workspaceContext) return;
+    if (!lastSyncedJsonRef.current) {
+      showToast('Waiting for initial Firestore snapshot before syncing.');
+      return;
+    }
     const currentHash = computeBusinessStateHash(state);
-    if (
-      lastSyncedJsonRef.current &&
-      currentHash === lastSyncedJsonRef.current &&
-      firestoreDocIdsRef.current.length > 0
-    ) {
+    if (currentHash === lastSyncedJsonRef.current && firestoreDocIdsRef.current.length > 0) {
       showToast('Already up to date with Firestore (no changes to write).');
       return;
     }
 
     const prevRev = syncedRevisionRef.current;
+    const remoteRev = remoteSyncRevisionRef.current;
     const nextRev = prevRev + 1;
+    if (remoteRev > prevRev || remoteRev >= nextRev) {
+      showToast('Remote revision is newer; waiting for incoming cloud snapshot.');
+      return;
+    }
+
     syncedRevisionRef.current = nextRev;
     try {
       const result = await saveStateToFirestoreBatch({
@@ -6619,13 +7114,23 @@ export default function App() {
         user: firebaseUser,
         workspace: workspaceContext,
         syncRevision: nextRev,
+        localBaseRevision: prevRev,
+        remoteSyncRevision: remoteRev,
         originClientId: clientIdRef.current,
         knownDocIds: firestoreDocIdsRef.current,
         lastSyncedDocs:
           Object.keys(lastSyncedDocsRef.current).length > 0
             ? lastSyncedDocsRef.current
             : undefined,
+        lastSyncedJson: lastSyncedJsonRef.current,
       });
+      if (result.abortedReason === 'stale-revision') {
+        const latestRev = Math.max(prevRev, result.remoteRevision ?? remoteRev);
+        syncedRevisionRef.current = latestRev;
+        remoteSyncRevisionRef.current = Math.max(remoteSyncRevisionRef.current, latestRev);
+        showToast('Sync aborted: newer revision detected in Firestore.');
+        return;
+      }
       firestoreDocIdsRef.current = result.docIds;
       lastSyncedDocsRef.current = result.sectionHashes;
       lastSyncedJsonRef.current = result.businessJson;
@@ -6633,6 +7138,7 @@ export default function App() {
         syncedRevisionRef.current = prevRev;
         showToast('Already up to date with Firestore (no changes to write).');
       } else {
+        remoteSyncRevisionRef.current = Math.max(remoteSyncRevisionRef.current, nextRev);
         showToast(`Synced ${result.writtenCount} changed document(s) to Firestore rinse_state.`);
       }
     } catch (err) {
@@ -7031,6 +7537,7 @@ export default function App() {
               onAddException={handleAddOrderException}
               onResolveException={handleResolveOrderException}
               onCollectOrderPayment={handleCollectOrderPayment}
+              onUpdateQuantityDiscountRules={handleUpdateQuantityDiscountRules}
               onAddMoneyAccount={handleQuickAddMoneyAccount}
               onOpenDocument={(mode, id) => {
                 if (!allowedSections.includes('documents')) {
@@ -7082,6 +7589,9 @@ export default function App() {
               onOwnerCustomizeInvoice={handleOwnerCustomizeInvoice}
               onOwnerDeleteInvoice={handleOwnerDeleteInvoice}
               onCollectCorporatePayment={handleCollectCorporatePayment}
+              onAddCorporateRewash={handleAddCorporateRewash}
+              onUpdateCorporateRewash={handleUpdateCorporateRewash}
+              onDeleteCorporateRewash={handleDeleteCorporateRewash}
               onOpenInvoice={(invId) => {
                 if (!allowedSections.includes('documents')) {
                   requireAction(false, 'view documents');
@@ -7220,8 +7730,15 @@ export default function App() {
               state={state}
               isOwner={currentUser.role === 'Owner'}
               onAddEmployee={handleAddEmployee}
+              onUpdateEmployee={handleUpdateEmployee}
               onDeleteEmployee={handleDeleteEmployee}
               onDeactivateEmployee={handleDeactivateEmployee}
+              onAddStaffRole={handleAddStaffRole}
+              onRenameStaffRole={handleRenameStaffRole}
+              onDeleteStaffRole={handleDeleteStaffRole}
+              onApplyStaffFine={handleApplyStaffFine}
+              onToggleStaffFineStatus={handleToggleStaffFineStatus}
+              onDeleteStaffFine={handleDeleteStaffFine}
               onPostPayroll={handlePostPayroll}
               onOwnerCustomizePayroll={handleOwnerCustomizePayroll}
               onOwnerDeletePayroll={handleOwnerDeletePayroll}
@@ -7245,6 +7762,7 @@ export default function App() {
                   },
                 }));
               }}
+              onRenameExpenseCategory={handleRenameExpenseCategory}
               onDeleteExpenseCategory={handleDeleteExpenseCategory}
               onGoToAccounting={() => setActiveSection('accounting')}
               onRequestDelete={setDeleteRequest}
@@ -7325,17 +7843,17 @@ export default function App() {
                     });
                     if (res.ok) {
                       const data = await res.json();
-                      commitState((prev) => ({
+                      setState((prev) => ({
                         ...prev,
                         settings: { ...prev.settings, lastBackupAt: data.lastBackupAt },
                       }));
                       return;
                     }
                   } catch {
-                    // fallback to updating backup timestamp locally & in Firestore
+                    // fallback to updating backup timestamp locally without triggering Firestore sync
                   }
                 }
-                commitState((prev) => ({
+                setState((prev) => ({
                   ...prev,
                   settings: { ...prev.settings, lastBackupAt: new Date().toISOString() },
                 }));
@@ -7356,8 +7874,10 @@ export default function App() {
                     // continue restoring to local/Firestore state
                   }
                 }
+                latestStateRef.current = migrated;
                 dirtyForFirestoreRef.current = true;
                 setState(migrated);
+                scheduleExplicitPersist(migrated);
               }}
               onCreateUser={handleCreateUser}
               onUpdateUser={handleUpdateUser}
@@ -7369,11 +7889,16 @@ export default function App() {
               onRefreshGitHubStatus={refreshGitHubStatus}
               onApplyPulledState={(pulledState) => {
                 const migrated = migrateErpState(pulledState);
+                latestStateRef.current = migrated;
                 dirtyForFirestoreRef.current = true;
                 if (typeof migrated.syncRevision === 'number') {
-                  syncedRevisionRef.current = migrated.syncRevision;
+                  syncedRevisionRef.current = Math.max(
+                    syncedRevisionRef.current,
+                    migrated.syncRevision
+                  );
                 }
                 setState(migrated);
+                scheduleExplicitPersist(migrated);
               }}
               firebaseUser={firebaseUser}
               workspaceContext={workspaceContext}
@@ -7394,13 +7919,13 @@ export default function App() {
         notifications={state.notifications}
         rules={state.notificationRules}
         onMarkRead={(id) =>
-          commitState((prev) => ({
+          setState((prev) => ({
             ...prev,
             notifications: prev.notifications.map((n) => (n.id === id ? { ...n, read: true } : n)),
           }))
         }
         onMarkAllRead={() =>
-          commitState((prev) => ({
+          setState((prev) => ({
             ...prev,
             notifications: prev.notifications.map((n) => ({ ...n, read: true })),
           }))

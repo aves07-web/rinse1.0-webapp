@@ -1,5 +1,5 @@
 import { AppSettings, Invoice } from '../types/erp';
-import { formatMoney } from '../utils/accounting';
+import { amountToWords, computeLineNetAmount, derivePaymentModeLabel, formatMoney } from '../utils/accounting';
 import { getLogoMaxHeightMm } from '../utils/theme';
 import { QrCanvas } from './QrCanvas';
 
@@ -22,6 +22,14 @@ export function A4InvoiceDocument({
   const brandAddress = invoice.companyAddressSnapshot || settings.companyAddress;
   const brandPhone = invoice.companyPhoneSnapshot || settings.companyPhone;
   const maxLogoMm = getLogoMaxHeightMm(logoSize);
+  const hasPerItemDiscount = invoice.lines.some((l) => Number(l.discount) > 0);
+  const paymentMode = derivePaymentModeLabel(
+    invoice.paidAmount,
+    invoice.grandTotal,
+    undefined,
+    invoice.paymentMode
+  );
+  const amountWords = amountToWords(invoice.grandTotal, settings.currencyCode);
 
   return (
     <div
@@ -93,69 +101,106 @@ export function A4InvoiceDocument({
           {invoice.periodCovered && (
             <p className="text-slate-700">Period: {invoice.periodCovered}</p>
           )}
+          <p className="text-slate-800">
+            Payment Mode: <strong>{paymentMode}</strong>
+          </p>
           <p className="text-slate-600">Terms: {invoice.paymentTerms}</p>
         </div>
       </div>
 
-      {/* Items Table: repeats header on page break, never splits rows */}
+      {/* Items Table: repeats header on page break, never splits rows; Discount column auto-hidden when all items have 0 discount */}
       <table className="w-full text-left text-xs border-collapse my-5 a4-invoice-table">
         <thead>
           <tr className="border-b-2 border-[#0071E3] bg-slate-50 text-slate-700 font-semibold">
-            <th className="py-2 px-2">Product</th>
-            <th className="py-2 px-2">Service</th>
-            <th className="py-2 px-2 text-right">Qty</th>
-            <th className="py-2 px-2 text-right">Unit Price</th>
-            <th className="py-2 px-2 text-right">Line Total</th>
+            <th className="py-2 px-2 w-10">S.N.</th>
+            <th className="py-2 px-2">Name</th>
+            <th className="py-2 px-2 text-right">Quantity</th>
+            <th className="py-2 px-2 text-right">Rate</th>
+            {hasPerItemDiscount && <th className="py-2 px-2 text-right">Discount</th>}
+            <th className="py-2 px-2 text-right">Amount</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-200 tabular-nums">
-          {invoice.lines.map((line, i) => (
-            <tr key={i}>
-              <td className="py-2.5 px-2 font-medium text-slate-900">{line.productName}</td>
-              <td className="py-2.5 px-2 text-slate-700">{line.serviceName}</td>
-              <td className="py-2.5 px-2 text-right font-mono">{line.quantity}</td>
-              <td className="py-2.5 px-2 text-right font-mono">
-                {formatMoney(line.unitPrice, sym)}
-              </td>
-              <td className="py-2.5 px-2 text-right font-mono font-semibold">
-                {formatMoney(line.total, sym)}
-              </td>
-            </tr>
-          ))}
+          {invoice.lines.map((line, i) => {
+            const calc = computeLineNetAmount(line.quantity, line.unitPrice, line.discount);
+            return (
+              <tr key={i}>
+                <td className="py-2.5 px-2 font-mono text-slate-500 align-top">{i + 1}</td>
+                <td className="py-2.5 px-2 align-top">
+                  <p className="font-medium text-slate-900">{line.productName}</p>
+                  {line.serviceName && (
+                    <p className="text-[11px] text-slate-500">{line.serviceName}</p>
+                  )}
+                </td>
+                <td className="py-2.5 px-2 text-right font-mono align-top">{line.quantity}</td>
+                <td className="py-2.5 px-2 text-right font-mono align-top">
+                  {formatMoney(line.unitPrice, sym)}
+                </td>
+                {hasPerItemDiscount && (
+                  <td className="py-2.5 px-2 text-right font-mono align-top">
+                    {calc.discount > 0 ? (
+                      <div>
+                        <span className="text-emerald-700 font-medium">
+                          {formatMoney(calc.discount, sym)}
+                        </span>
+                        <span className="block text-[10px] text-slate-500">
+                          ({calc.discountPct}%)
+                        </span>
+                      </div>
+                    ) : (
+                      <span className="text-slate-400">—</span>
+                    )}
+                  </td>
+                )}
+                <td className="py-2.5 px-2 text-right font-mono font-semibold align-top">
+                  {formatMoney(line.total, sym)}
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
 
-      {/* Totals + Terms + Signature Block kept together */}
+      {/* Totals + Amount in Words + Terms + Signature Block kept together */}
       <div className="a4-signature-keep">
-        <div className="flex justify-end border-t border-slate-200 pt-4">
-          <div className="w-72 space-y-1.5 text-xs tabular-nums">
-            <div className="flex justify-between items-center px-2.5 py-1 rounded-md bg-violet-50 text-violet-700 font-semibold">
-              <span>Subtotal</span>
-              <span className="font-mono">{formatMoney(invoice.subtotal, sym)}</span>
-            </div>
-            {invoice.extraCharges > 0 && (
-              <div className="flex justify-between items-center px-2.5 py-0.5 text-slate-600">
-                <span>Additional Charges</span>
-                <span className="font-mono">{formatMoney(invoice.extraCharges, sym)}</span>
+        <div className="grid grid-cols-1 sm:grid-cols-12 gap-4 items-start border-t border-slate-200 pt-4">
+          <div className="sm:col-span-6 p-3 rounded-md bg-slate-50 border border-slate-200 text-xs">
+            <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">
+              Amount in Words
+            </p>
+            <p className="text-slate-900 font-medium mt-1 leading-relaxed">{amountWords}</p>
+          </div>
+
+          <div className="sm:col-span-6 flex justify-end">
+            <div className="w-72 space-y-1.5 text-xs tabular-nums">
+              <div className="flex justify-between items-center px-2.5 py-1 rounded-md bg-violet-50 text-violet-700 font-semibold">
+                <span>Subtotal</span>
+                <span className="font-mono">{formatMoney(invoice.subtotal, sym)}</span>
               </div>
-            )}
-            {Number(invoice.discountTotal) > 0 && (
-              <div className="flex justify-between items-center px-2.5 py-1 rounded-md bg-emerald-50 text-emerald-700 font-semibold">
-                <span>Discount</span>
-                <span className="font-mono">-{formatMoney(invoice.discountTotal, sym)}</span>
+              {invoice.extraCharges > 0 && (
+                <div className="flex justify-between items-center px-2.5 py-0.5 text-slate-600">
+                  <span>Additional Charges</span>
+                  <span className="font-mono">{formatMoney(invoice.extraCharges, sym)}</span>
+                </div>
+              )}
+              {Number(invoice.discountTotal) > 0 && (
+                <div className="flex justify-between items-center px-2.5 py-1 rounded-md bg-emerald-50 text-emerald-700 font-semibold">
+                  <span>Discount</span>
+                  <span className="font-mono">-{formatMoney(invoice.discountTotal, sym)}</span>
+                </div>
+              )}
+              <div className="flex justify-between items-center text-sm font-bold px-2.5 py-1.5 rounded-md bg-blue-50 text-[#0071E3] border-t-2 border-[#0071E3]">
+                <span>Total Amount</span>
+                <span className="font-mono">{formatMoney(invoice.grandTotal, sym)}</span>
               </div>
-            )}
-            <div className="flex justify-between items-center text-sm font-bold px-2.5 py-1.5 rounded-md bg-blue-50 text-[#0071E3] border-t-2 border-[#0071E3]">
-              <span>Grand Total</span>
-              <span className="font-mono">{formatMoney(invoice.grandTotal, sym)}</span>
-            </div>
-            <div className="flex justify-between items-center px-2.5 pt-0.5 text-slate-700">
-              <span>Paid Amount</span>
-              <span className="font-mono">{formatMoney(invoice.paidAmount, sym)}</span>
-            </div>
-            <div className="flex justify-between items-center px-2.5 font-semibold text-slate-900">
-              <span>Balance Due</span>
-              <span className="font-mono">{formatMoney(invoice.dueAmount, sym)}</span>
+              <div className="flex justify-between items-center px-2.5 pt-0.5 text-slate-700">
+                <span>Received Amount</span>
+                <span className="font-mono">{formatMoney(invoice.paidAmount, sym)}</span>
+              </div>
+              <div className="flex justify-between items-center px-2.5 font-semibold text-slate-900">
+                <span>Amount Due</span>
+                <span className="font-mono">{formatMoney(invoice.dueAmount, sym)}</span>
+              </div>
             </div>
           </div>
         </div>
