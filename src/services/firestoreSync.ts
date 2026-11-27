@@ -89,6 +89,7 @@ export interface RemoteStateSnapshot {
   docIds: string[];
   sectionHashes: Record<string, string>;
   businessJson: string;
+  fromCache?: boolean;
 }
 
 function normalizeId(raw: string): string {
@@ -1055,7 +1056,11 @@ export async function saveStateToFirestoreBatch(params: {
     let metaSnap;
     try {
       metaSnap = await getDocFromServer(metaRef);
-    } catch {
+    } catch (metaErr) {
+      const errText = (metaErr instanceof Error ? metaErr.message : String(metaErr)).toLowerCase();
+      if (errText.includes('resource-exhausted') || errText.includes('quota exceeded')) {
+        handleFirestoreError(metaErr, OperationType.GET, `${RINSE_STATE_COLLECTION}/meta`);
+      }
       metaSnap = await getDoc(metaRef);
     }
     if (metaSnap.exists()) {
@@ -1074,7 +1079,11 @@ export async function saveStateToFirestoreBatch(params: {
         };
       }
     }
-  } catch {
+  } catch (outerMetaErr) {
+    const errText = (outerMetaErr instanceof Error ? outerMetaErr.message : String(outerMetaErr)).toLowerCase();
+    if (errText.includes('resource-exhausted') || errText.includes('quota exceeded')) {
+      throw outerMetaErr;
+    }
     // Allow fallback when offline or if meta lookup cannot reach cache/server; rules & queued checks still guard
   }
 
@@ -1271,7 +1280,10 @@ export function subscribeRinseState(params: {
         onEmpty();
         return;
       }
-      onSnapshotState(assembled);
+      onSnapshotState({
+        ...assembled,
+        fromCache: querySnapshot.metadata.fromCache,
+      });
     },
     (error) => {
       try {

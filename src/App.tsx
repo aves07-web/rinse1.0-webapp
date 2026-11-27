@@ -16,6 +16,7 @@ import {
   Package,
   Plus,
   Printer,
+  RefreshCw,
   Scale,
   Search,
   Settings,
@@ -39,6 +40,19 @@ import {
   subscribeRinseState,
   type WorkspaceContext,
 } from './services/firestoreSync';
+import {
+  clearConfirmedQueue,
+  type CloudSyncUiState,
+  computeNextRetryDelayMs,
+  loadOfflineSnapshot,
+  loadPendingQueue,
+  markQueueStatus,
+  mergeRemoteWithOfflineLocal,
+  type PendingSyncOperation,
+  saveLocalAndQueueSync,
+  saveOfflineSnapshot,
+  withWriteTimeout,
+} from './services/offlineSyncQueue';
 import { AccountingView } from './components/AccountingView';
 import { AnalyticsView } from './components/AnalyticsView';
 import { BlackBoxView } from './components/BlackBoxView';
@@ -191,7 +205,12 @@ function isTransientOfflineFirestoreError(err: unknown): boolean {
     msg.includes('unavailable') ||
     msg.includes('network-request-failed') ||
     msg.includes('could not reach cloud firestore') ||
-    msg.includes('failed to fetch')
+    msg.includes('failed to fetch') ||
+    msg.includes('deadline-exceeded') ||
+    msg.includes('write timeout') ||
+    msg.includes('timed out') ||
+    msg.includes('etimedout') ||
+    msg.includes('econnreset')
   );
 }
 
@@ -202,8 +221,17 @@ function isFirestoreQuotaError(err: unknown): boolean {
 }
 
 export default function App() {
-  const [state, setState] = useState<ErpState>(INITIAL_ERP_STATE);
-  const [loadedFromServer, setLoadedFromServer] = useState(false);
+  const initialOfflineBootRef = useRef(loadOfflineSnapshot());
+  const initialQueueBootRef = useRef<PendingSyncOperation[]>(loadPendingQueue());
+  const [state, setState] = useState<ErpState>(
+    () => initialOfflineBootRef.current?.state ?? INITIAL_ERP_STATE
+  );
+  const [pendingQueue, setPendingQueue] = useState<PendingSyncOperation[]>(
+    () => initialQueueBootRef.current
+  );
+  const [loadedFromServer, setLoadedFromServer] = useState(
+    () => Boolean(initialOfflineBootRef.current)
+  );
   const [currentUserId, setCurrentUserId] = useState<string | null>(() =>
     safeSessionGet(SESSION_USER_KEY)
   );
@@ -290,14 +318,25 @@ export default function App() {
       ? crypto.randomUUID()
       : `tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
   );
-  const syncedRevisionRef = useRef<number>(1);
-  const remoteSyncRevisionRef = useRef<number>(0);
+  const syncedRevisionRef = useRef<number>(
+    initialOfflineBootRef.current?.baselineRevision ?? 1
+  );
+  const remoteSyncRevisionRef = useRef<number>(
+    initialOfflineBootRef.current?.baselineRevision ?? 0
+  );
   const isRemoteUpdateRef = useRef<boolean>(false);
-  const dirtyForFirestoreRef = useRef<boolean>(false);
+  const dirtyForFirestoreRef = useRef<boolean>(initialQueueBootRef.current.length > 0);
   const firestoreDocIdsRef = useRef<string[]>([]);
-  const lastSyncedJsonRef = useRef<string>('');
-  const lastSyncedDocsRef = useRef<Record<string, string>>({});
+  const lastSyncedJsonRef = useRef<string>(
+    initialOfflineBootRef.current?.baselineBusinessJson ?? ''
+  );
+  const lastSyncedDocsRef = useRef<Record<string, string>>(
+    initialOfflineBootRef.current?.baselineSectionHashes ?? {}
+  );
   const saveTimerRef = useRef<number | null>(null);
+  const syncRetryTimerRef = useRef<number | null>(null);
+  const syncBackoffAttemptRef = useRef<number>(0);
+  const isFlushingQueueRef = useRef<boolean>(false);
   const latestStateRef = useRef<ErpState>(state);
   latestStateRef.current = state;
   const wsRef = useRef<WebSocket | null>(null);
@@ -313,7 +352,12 @@ export default function App() {
     'disconnected' | 'connecting' | 'synced' | 'unauthorized' | 'error'
   >('disconnected');
   const [firestoreStatusMessage, setFirestoreStatusMessage] = useState('');
+  const [syncNextRetryAt, setSyncNextRetryAt] = useState<number | null>(null);
   const [firestoreFatalError, setFirestoreFatalError] = useState<Error | null>(null);
+  const startFirestoreSyncRef = useRef<(() => Promise<void>) | null>(null);
+  const flushPendingSyncQueueRef = useRef<
+    ((targetState?: ErpState, opts?: { manual?: boolean; forceAll?: boolean }) => Promise<void>) | null
+  >(null);
 
   const firebaseUserRef = useRef<User | null>(firebaseUser);
   firebaseUserRef.current = firebaseUser;
@@ -343,7 +387,7 @@ export default function App() {
     }
   }, []);
 
-  // Load persisted state from server on mount (or localStorage backup on static hosts like GitHub Pages)
+  // Load persisted state from server on mount (preserving any unsynced local browser outbox edits!)
   useEffect(() => {
     let active = true;
     fetch('/api/state')
@@ -357,30 +401,37 @@ export default function App() {
       .then((data) => {
         if (!active) return;
         setBackendMode('server');
+        // Never overwrite unsynced local browser outbox edits with older local server state
+        if (loadPendingQueue().length > 0) {
+          return;
+        }
         if (data && data.settings && Array.isArray(data.accounts)) {
           const migrated = migrateErpState(data);
           isRemoteUpdateRef.current = true;
           dirtyForFirestoreRef.current = false;
           syncedRevisionRef.current = migrated.syncRevision ?? 1;
           setState(migrated);
+          saveOfflineSnapshot({
+            state: migrated,
+            savedAt: new Date().toISOString(),
+            baselineRevision: migrated.syncRevision ?? 1,
+            baselineBusinessJson: computeBusinessStateHash(migrated),
+            baselineSectionHashes: computeSectionHashes(migrated),
+          });
         }
         refreshGitHubStatus();
       })
       .catch(() => {
         if (!active) return;
         setBackendMode('static');
-        try {
-          const raw = window.localStorage.getItem(STATIC_STATE_KEY);
-          if (raw) {
-            const parsed = JSON.parse(raw) as Partial<ErpState>;
-            if (parsed && parsed.settings && Array.isArray(parsed.accounts)) {
-              isRemoteUpdateRef.current = true;
-              dirtyForFirestoreRef.current = false;
-              setState(migrateErpState(parsed));
-            }
-          }
-        } catch {
-          // ignore blocked storage
+        if (loadPendingQueue().length > 0) {
+          return;
+        }
+        const snap = loadOfflineSnapshot();
+        if (snap) {
+          isRemoteUpdateRef.current = true;
+          dirtyForFirestoreRef.current = false;
+          setState(snap.state);
         }
       })
       .finally(() => {
@@ -412,19 +463,29 @@ export default function App() {
     let cancelled = false;
     let unsubscribeSnapshot: (() => void) | null = null;
     let retryTimer: number | null = null;
+    let startupAttempt = 0;
 
-    const scheduleRetry = () => {
+    const scheduleRetry = (isQuota = false) => {
       if (cancelled || retryTimer !== null || typeof window === 'undefined') return;
+      const delayMs = computeNextRetryDelayMs(startupAttempt, isQuota);
+      startupAttempt += 1;
+      setSyncNextRetryAt(Date.now() + delayMs);
       retryTimer = window.setTimeout(() => {
         retryTimer = null;
         if (!cancelled) {
+          setSyncNextRetryAt(null);
           void startFirestoreSync();
         }
-      }, 15000);
+      }, delayMs);
     };
 
     const startFirestoreSync = async () => {
       if (cancelled) return;
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+        setFirestoreStatus('error');
+        setFirestoreStatusMessage('Browser offline — working locally; will sync automatically when online.');
+        return;
+      }
       if (unsubscribeSnapshot) {
         unsubscribeSnapshot();
         unsubscribeSnapshot = null;
@@ -442,6 +503,8 @@ export default function App() {
           return;
         }
 
+        startupAttempt = 0;
+        setSyncNextRetryAt(null);
         setWorkspaceContext(access.context);
 
         // 1. Check localStorage first: migrate real business records via writeBatch once, leaving backup untouched
@@ -465,6 +528,14 @@ export default function App() {
             lastSyncedDocsRef.current = migrationResult.sectionHashes;
           }
           setState(migrationResult.state);
+          setPendingQueue(
+            clearConfirmedQueue({
+              confirmedState: migrationResult.state,
+              confirmedRevision: syncedRevisionRef.current,
+              confirmedBusinessJson: lastSyncedJsonRef.current,
+              confirmedSectionHashes: lastSyncedDocsRef.current,
+            })
+          );
           showToast('Local records migrated to Firestore cloud sync (local backup kept).');
         }
 
@@ -474,6 +545,61 @@ export default function App() {
           workspace: access.context,
           onSnapshotState: (remote) => {
             if (cancelled) return;
+            startupAttempt = 0;
+            const activeOutbox = loadPendingQueue();
+            const hasLocalPending = activeOutbox.length > 0 || dirtyForFirestoreRef.current;
+
+            const normalizedSelfId = clientIdRef.current
+              .replace(/[^a-zA-Z0-9_-]/g, '_')
+              .slice(0, 128);
+            const isSelfEcho =
+              remote.originClientId === normalizedSelfId &&
+              remote.syncRevision <= syncedRevisionRef.current;
+
+            if (hasLocalPending && !isSelfEcho) {
+              // Safe 3-way merge: preserve untouched remote device updates AND keep pending local browser edits
+              const mergeResult = mergeRemoteWithOfflineLocal({
+                remoteState: remote.state,
+                remoteSectionHashes: remote.sectionHashes,
+                localState: latestStateRef.current,
+                baselineSectionHashes: lastSyncedDocsRef.current,
+                pendingOps: activeOutbox,
+              });
+
+              firestoreDocIdsRef.current = remote.docIds;
+              lastSyncedJsonRef.current = remote.businessJson;
+              lastSyncedDocsRef.current = remote.sectionHashes;
+              remoteSyncRevisionRef.current = Math.max(
+                remoteSyncRevisionRef.current,
+                remote.syncRevision
+              );
+              syncedRevisionRef.current = Math.max(syncedRevisionRef.current, remote.syncRevision);
+
+              latestStateRef.current = mergeResult.mergedState;
+              isRemoteUpdateRef.current = true;
+              dirtyForFirestoreRef.current = true;
+              setState(mergeResult.mergedState);
+              setLoadedFromServer(true);
+
+              saveOfflineSnapshot({
+                state: mergeResult.mergedState,
+                savedAt: new Date().toISOString(),
+                baselineRevision: remote.syncRevision,
+                baselineBusinessJson: remote.businessJson,
+                baselineSectionHashes: remote.sectionHashes,
+              });
+
+              if (mergeResult.hadRemoteChanges) {
+                showToast('Reconnected: merged remote updates with your local pending edits.');
+              }
+
+              // When listener confirms live backend connectivity (!fromCache), flush pending queue cleanly
+              if (remote.fromCache === false && flushPendingSyncQueueRef.current) {
+                void flushPendingSyncQueueRef.current(mergeResult.mergedState);
+              }
+              return;
+            }
+
             firestoreDocIdsRef.current = remote.docIds;
             lastSyncedJsonRef.current = remote.businessJson;
             lastSyncedDocsRef.current = remote.sectionHashes;
@@ -482,50 +608,89 @@ export default function App() {
               remote.syncRevision
             );
             syncedRevisionRef.current = Math.max(syncedRevisionRef.current, remote.syncRevision);
-            setFirestoreStatus('synced');
-            setFirestoreStatusMessage('Live multi-user sync active');
 
-            const normalizedSelfId = clientIdRef.current
-              .replace(/[^a-zA-Z0-9_-]/g, '_')
-              .slice(0, 128);
-            const isSelfEcho =
-              remote.originClientId === normalizedSelfId &&
-              remote.syncRevision <= syncedRevisionRef.current;
             if (isSelfEcho) {
+              if (
+                remote.fromCache ||
+                isFlushingQueueRef.current ||
+                (activeOutbox.length > 0 &&
+                  computeBusinessStateHash(latestStateRef.current) !== remote.businessJson)
+              ) {
+                if (
+                  activeOutbox.length > 0 &&
+                  remote.fromCache === false &&
+                  !isFlushingQueueRef.current &&
+                  flushPendingSyncQueueRef.current
+                ) {
+                  void flushPendingSyncQueueRef.current(latestStateRef.current);
+                }
+                return;
+              }
               dirtyForFirestoreRef.current = false;
+              setFirestoreStatus('synced');
+              setFirestoreStatusMessage('All changes confirmed in Firestore');
+              setPendingQueue(
+                clearConfirmedQueue({
+                  confirmedState: latestStateRef.current,
+                  confirmedRevision: remote.syncRevision,
+                  confirmedBusinessJson: remote.businessJson,
+                  confirmedSectionHashes: remote.sectionHashes,
+                })
+              );
               return;
             }
 
-            // Incoming remote update supersedes any queued debounced local write
+            // Incoming remote update supersedes any queued debounced local write when outbox is clean
             if (saveTimerRef.current) {
               window.clearTimeout(saveTimerRef.current);
               saveTimerRef.current = null;
             }
             dirtyForFirestoreRef.current = false;
+            setFirestoreStatus('synced');
+            setFirestoreStatusMessage('All changes confirmed in Firestore');
 
             if (computeBusinessStateHash(latestStateRef.current) === remote.businessJson) {
               setLoadedFromServer(true);
+              setPendingQueue([]);
               return;
             }
 
             isRemoteUpdateRef.current = true;
             setState(remote.state);
             setLoadedFromServer(true);
-
-            try {
-              if (window.localStorage.getItem(FIRESTORE_MIGRATED_KEY) === 'true') {
-                window.localStorage.setItem(STATIC_STATE_KEY, JSON.stringify(remote.state));
-              }
-            } catch {
-              // ignore storage quota
-            }
+            setPendingQueue(
+              clearConfirmedQueue({
+                confirmedState: remote.state,
+                confirmedRevision: remote.syncRevision,
+                confirmedBusinessJson: remote.businessJson,
+                confirmedSectionHashes: remote.sectionHashes,
+              })
+            );
           },
           onEmpty: () => {
             if (cancelled) return;
+            const activeOutbox = loadPendingQueue();
+            const currentHash = computeBusinessStateHash(latestStateRef.current);
+            const emptySeedHash = computeBusinessStateHash(INITIAL_ERP_STATE);
+
+            if (activeOutbox.length > 0 || currentHash !== emptySeedHash) {
+              remoteSyncRevisionRef.current = 0;
+              syncedRevisionRef.current = 0;
+              lastSyncedJsonRef.current = emptySeedHash;
+              lastSyncedDocsRef.current = computeSectionHashes(INITIAL_ERP_STATE);
+              dirtyForFirestoreRef.current = true;
+              setFirestoreStatus('connecting');
+              setFirestoreStatusMessage('Connected · Syncing local browser changes...');
+              if (flushPendingSyncQueueRef.current) {
+                void flushPendingSyncQueueRef.current(latestStateRef.current, { forceAll: true });
+              }
+              return;
+            }
+
             // Never seed default or demo data when Firestore is empty
             remoteSyncRevisionRef.current = 0;
             syncedRevisionRef.current = 0;
-            lastSyncedJsonRef.current = computeBusinessStateHash(latestStateRef.current);
+            lastSyncedJsonRef.current = currentHash;
             lastSyncedDocsRef.current = computeSectionHashes(latestStateRef.current);
             dirtyForFirestoreRef.current = false;
             setFirestoreStatus('synced');
@@ -536,14 +701,15 @@ export default function App() {
             if (isFirestoreQuotaError(err)) {
               setFirestoreStatus('error');
               setFirestoreStatusMessage(
-                'Firestore daily quota reached — working locally; quota resets tomorrow.'
+                'Firestore daily quota reached — working locally; will retry automatically.'
               );
+              scheduleRetry(true);
               return;
             }
             if (isTransientOfflineFirestoreError(err)) {
               setFirestoreStatus('error');
-              setFirestoreStatusMessage('Cloud sync offline — working locally; retrying automatically.');
-              scheduleRetry();
+              setFirestoreStatusMessage('Cloud sync offline — saved locally; retrying automatically.');
+              scheduleRetry(false);
               return;
             }
             setFirestoreStatus('error');
@@ -557,14 +723,15 @@ export default function App() {
         if (isFirestoreQuotaError(wrapped)) {
           setFirestoreStatus('error');
           setFirestoreStatusMessage(
-            'Firestore daily quota reached — working locally; quota resets tomorrow.'
+            'Firestore daily quota reached — working locally; will retry automatically.'
           );
+          scheduleRetry(true);
           return;
         }
         if (isTransientOfflineFirestoreError(wrapped)) {
           setFirestoreStatus('error');
-          setFirestoreStatusMessage('Cloud sync offline — working locally; retrying automatically.');
-          scheduleRetry();
+          setFirestoreStatusMessage('Cloud sync offline — saved locally; retrying automatically.');
+          scheduleRetry(false);
           return;
         }
         setFirestoreStatus('error');
@@ -573,29 +740,51 @@ export default function App() {
       }
     };
 
+    startFirestoreSyncRef.current = startFirestoreSync;
+
     const handleOnline = () => {
       if (!cancelled) {
+        startupAttempt = 0;
+        syncBackoffAttemptRef.current = 0;
+        setSyncNextRetryAt(null);
         if (retryTimer !== null && typeof window !== 'undefined') {
           window.clearTimeout(retryTimer);
           retryTimer = null;
+        }
+        if (syncRetryTimerRef.current !== null && typeof window !== 'undefined') {
+          window.clearTimeout(syncRetryTimerRef.current);
+          syncRetryTimerRef.current = null;
         }
         void startFirestoreSync();
       }
     };
 
+    const handleOffline = () => {
+      if (!cancelled) {
+        setFirestoreStatus('error');
+        setFirestoreStatusMessage('Browser offline — changes saved locally until reconnected.');
+        setPendingQueue(
+          markQueueStatus('paused', { errorMessage: 'Browser offline — waiting for connection.' })
+        );
+      }
+    };
+
     if (typeof window !== 'undefined') {
       window.addEventListener('online', handleOnline);
+      window.addEventListener('offline', handleOffline);
     }
 
     void startFirestoreSync();
 
     return () => {
       cancelled = true;
+      startFirestoreSyncRef.current = null;
       if (retryTimer !== null && typeof window !== 'undefined') {
         window.clearTimeout(retryTimer);
       }
       if (typeof window !== 'undefined') {
         window.removeEventListener('online', handleOnline);
+        window.removeEventListener('offline', handleOffline);
       }
       if (unsubscribeSnapshot) {
         unsubscribeSnapshot();
@@ -723,61 +912,174 @@ export default function App() {
     };
   }, [backendMode]);
 
-  // Cleanup any pending debounced explicit sync timer on unmount (no passive useEffect watching entire state)
+  // Cleanup any pending debounced sync or backoff timers on unmount
   useEffect(() => {
     return () => {
       if (saveTimerRef.current) {
         window.clearTimeout(saveTimerRef.current);
         saveTimerRef.current = null;
       }
+      if (syncRetryTimerRef.current) {
+        window.clearTimeout(syncRetryTimerRef.current);
+        syncRetryTimerRef.current = null;
+      }
     };
   }, []);
 
-  // Explicit-action-only persistence with strict revision guard and business-hash kill-switch
-  const persistExplicitState = useCallback(
-    async (targetState: ErpState) => {
-      if (!loadedFromServerRef.current) return;
-      if (!dirtyForFirestoreRef.current) return;
-      dirtyForFirestoreRef.current = false;
+  const scheduleQueueBackoffRetry = useCallback((isQuota: boolean) => {
+    if (typeof window === 'undefined' || syncRetryTimerRef.current !== null) return;
+    const delayMs = computeNextRetryDelayMs(syncBackoffAttemptRef.current, isQuota);
+    syncBackoffAttemptRef.current += 1;
+    setSyncNextRetryAt(Date.now() + delayMs);
+    syncRetryTimerRef.current = window.setTimeout(() => {
+      syncRetryTimerRef.current = null;
+      setSyncNextRetryAt(null);
+      if (flushPendingSyncQueueRef.current) {
+        void flushPendingSyncQueueRef.current(latestStateRef.current);
+      }
+    }, delayMs);
+  }, []);
 
-      if (backendModeRef.current === 'static') {
-        try {
-          const migratedDone = window.localStorage.getItem(FIRESTORE_MIGRATED_KEY) === 'true';
-          if (!firebaseUserRef.current || migratedDone) {
-            window.localStorage.setItem(STATIC_STATE_KEY, JSON.stringify(targetState));
-          }
-        } catch {
-          // ignore storage quota/blocked
+  // Resilient queue flusher with timeout, backoff, and server confirmation before clearing pending status
+  const flushPendingSyncQueue = useCallback(
+    async (
+      explicitState?: ErpState,
+      opts?: { manual?: boolean; forceAll?: boolean }
+    ) => {
+      const targetState = explicitState || latestStateRef.current;
+      const manual = Boolean(opts?.manual);
+      const forceAll = Boolean(opts?.forceAll);
+
+      if (isFlushingQueueRef.current) {
+        if (manual) {
+          showToast('Sync already in progress...');
         }
+        return;
       }
 
-      const currentHash = computeBusinessStateHash(targetState);
-      const hasUnsyncedFirestoreChanges =
-        Boolean(lastSyncedJsonRef.current) && currentHash !== lastSyncedJsonRef.current;
+      if (manual && syncRetryTimerRef.current) {
+        window.clearTimeout(syncRetryTimerRef.current);
+        syncRetryTimerRef.current = null;
+        setSyncNextRetryAt(null);
+        syncBackoffAttemptRef.current = 0;
+      }
 
       const activeFbUser = firebaseUserRef.current;
       const activeWs = workspaceContextRef.current;
+      const queuedOps = loadPendingQueue();
+      const currentHash = computeBusinessStateHash(targetState);
+      const hasHashDiff =
+        forceAll ||
+        (Boolean(lastSyncedJsonRef.current) && currentHash !== lastSyncedJsonRef.current) ||
+        queuedOps.length > 0;
 
-      if (activeFbUser && activeWs && hasUnsyncedFirestoreChanges) {
-        const localBaseRev = syncedRevisionRef.current;
-        const remoteRev = remoteSyncRevisionRef.current;
-        const nextRev = localBaseRev + 1;
-
-        if (remoteRev > localBaseRev || remoteRev >= nextRev) {
-          setFirestoreStatus('synced');
-          setFirestoreStatusMessage('Skipped stale write — newer cloud revision active');
-          return;
-        }
-
-        syncedRevisionRef.current = nextRev;
+      // Also persist to optional local Express server when running in server mode
+      if (backendModeRef.current === 'server') {
         try {
-          const result = await saveStateToFirestoreBatch({
-            state: {
-              ...targetState,
-              syncRevision: nextRev,
-              lastUpdatedAt: new Date().toISOString(),
-              lastUpdatedBy: activeUserNameRef.current,
-            },
+          const res = await fetch('/api/state', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              state: targetState,
+              baseRevision: syncedRevisionRef.current,
+              updatedBy: activeUserNameRef.current,
+              clientId: clientIdRef.current,
+            }),
+          });
+          if (res.ok) {
+            const data = (await res.json()) as { revision?: number };
+            if (typeof data.revision === 'number' && (!activeFbUser || !activeWs)) {
+              syncedRevisionRef.current = Math.max(syncedRevisionRef.current, data.revision);
+            }
+          } else if (res.status === 409 && (!activeFbUser || !activeWs)) {
+            const conflict = (await res.json()) as {
+              currentRevision?: number;
+              latestState?: Partial<ErpState>;
+            };
+            if (conflict.latestState && conflict.latestState.settings) {
+              isRemoteUpdateRef.current = true;
+              syncedRevisionRef.current = conflict.currentRevision ?? syncedRevisionRef.current;
+              setState(migrateErpState(conflict.latestState));
+              showToast('Another team member saved a newer update. Synced to latest shared data.');
+            }
+          }
+        } catch {
+          // ignore local Express network hiccup; browser storage already holds state
+        }
+      }
+
+      if (!activeFbUser) return;
+
+      if (!activeWs) {
+        if (manual && startFirestoreSyncRef.current) {
+          await startFirestoreSyncRef.current();
+        }
+        return;
+      }
+
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+        setFirestoreStatus('error');
+        setFirestoreStatusMessage('Browser offline — changes saved locally; waiting to reconnect.');
+        setPendingQueue(
+          markQueueStatus('paused', { errorMessage: 'Browser offline — waiting for connection.' })
+        );
+        if (manual) {
+          showToast('Offline: your changes are saved safely in the browser and will sync when online.');
+        }
+        return;
+      }
+
+      if (!hasHashDiff && firestoreDocIdsRef.current.length > 0) {
+        dirtyForFirestoreRef.current = false;
+        setPendingQueue(
+          clearConfirmedQueue({
+            confirmedState: targetState,
+            confirmedRevision: syncedRevisionRef.current,
+            confirmedBusinessJson: currentHash,
+            confirmedSectionHashes: computeSectionHashes(targetState),
+          })
+        );
+        setFirestoreStatus('synced');
+        setFirestoreStatusMessage('All changes confirmed in Firestore');
+        if (manual) {
+          showToast('Already up to date with Firestore (no pending changes).');
+        }
+        return;
+      }
+
+      const localBaseRev = syncedRevisionRef.current;
+      const remoteRev = remoteSyncRevisionRef.current;
+      const nextRev = localBaseRev + 1;
+
+      if (!forceAll && (remoteRev > localBaseRev || remoteRev >= nextRev)) {
+        if (manual && startFirestoreSyncRef.current) {
+          await startFirestoreSyncRef.current();
+        } else {
+          setFirestoreStatus('connecting');
+          setFirestoreStatusMessage('Reconciling newer cloud revision before flushing local queue...');
+        }
+        return;
+      }
+
+      isFlushingQueueRef.current = true;
+      setPendingQueue(markQueueStatus('syncing'));
+      if (manual) {
+        setFirestoreStatus('connecting');
+        setFirestoreStatusMessage('Flushing queued changes to Firestore...');
+      }
+
+      syncedRevisionRef.current = nextRev;
+      try {
+        const stampedState: ErpState = {
+          ...targetState,
+          syncRevision: nextRev,
+          lastUpdatedAt: new Date().toISOString(),
+          lastUpdatedBy: activeUserNameRef.current,
+        };
+
+        const result = await withWriteTimeout(
+          saveStateToFirestoreBatch({
+            state: stampedState,
             user: activeFbUser,
             workspace: activeWs,
             syncRevision: nextRev,
@@ -790,96 +1092,143 @@ export default function App() {
                 ? lastSyncedDocsRef.current
                 : undefined,
             lastSyncedJson: lastSyncedJsonRef.current,
-          });
-          if (result.abortedReason === 'stale-revision') {
-            const latestRev = Math.max(localBaseRev, result.remoteRevision ?? remoteRev);
-            syncedRevisionRef.current = latestRev;
-            remoteSyncRevisionRef.current = Math.max(remoteSyncRevisionRef.current, latestRev);
-            return;
-          }
-          firestoreDocIdsRef.current = result.docIds;
-          lastSyncedDocsRef.current = result.sectionHashes;
-          lastSyncedJsonRef.current = result.businessJson;
-          if (result.writtenCount === 0) {
-            syncedRevisionRef.current = localBaseRev;
-          } else {
-            remoteSyncRevisionRef.current = Math.max(remoteSyncRevisionRef.current, nextRev);
-          }
-          setFirestoreStatus('synced');
-        } catch (err) {
-          syncedRevisionRef.current = localBaseRev;
-          const wrapped = err instanceof Error ? err : new Error(String(err));
-          if (isFirestoreQuotaError(wrapped)) {
-            setFirestoreStatus('error');
-            setFirestoreStatusMessage(
-              'Firestore daily quota reached — changes saved locally until quota resets tomorrow.'
-            );
-          } else if (isTransientOfflineFirestoreError(wrapped)) {
-            dirtyForFirestoreRef.current = true;
-            setFirestoreStatus('error');
-            setFirestoreStatusMessage('Cloud sync offline — saved locally; waiting to reconnect.');
-          } else {
-            setFirestoreStatus('error');
-            setFirestoreStatusMessage(wrapped.message);
-            setFirestoreFatalError(wrapped);
-          }
-        }
-      }
-
-      if (backendModeRef.current !== 'server') return;
-      try {
-        const res = await fetch('/api/state', {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            state: targetState,
-            baseRevision: syncedRevisionRef.current,
-            updatedBy: activeUserNameRef.current,
-            clientId: clientIdRef.current,
+            forceAll,
           }),
-        });
-        if (res.ok) {
-          const data = (await res.json()) as { revision?: number };
-          if (
-            typeof data.revision === 'number' &&
-            (!firebaseUserRef.current || !workspaceContextRef.current)
-          ) {
-            syncedRevisionRef.current = Math.max(syncedRevisionRef.current, data.revision);
+          12_000
+        );
+
+        if (result.abortedReason === 'stale-revision') {
+          const latestRev = Math.max(localBaseRev, result.remoteRevision ?? remoteRev);
+          syncedRevisionRef.current = latestRev;
+          remoteSyncRevisionRef.current = Math.max(remoteSyncRevisionRef.current, latestRev);
+          dirtyForFirestoreRef.current = queuedOps.length > 0;
+          setPendingQueue(
+            markQueueStatus('paused', {
+              errorMessage: 'Newer cloud revision detected; reconciling...',
+            })
+          );
+          if (manual && startFirestoreSyncRef.current) {
+            await startFirestoreSyncRef.current();
           }
-        } else if (
-          res.status === 409 &&
-          (!firebaseUserRef.current || !workspaceContextRef.current)
-        ) {
-          const conflict = (await res.json()) as {
-            currentRevision?: number;
-            latestState?: Partial<ErpState>;
-          };
-          if (conflict.latestState && conflict.latestState.settings) {
-            isRemoteUpdateRef.current = true;
-            syncedRevisionRef.current = conflict.currentRevision ?? syncedRevisionRef.current;
-            setState(migrateErpState(conflict.latestState));
-            showToast('Another team member saved a newer update. Synced to latest shared data.');
+          return;
+        }
+
+        if (result.abortedReason === 'not-synced-yet' && !forceAll) {
+          syncedRevisionRef.current = localBaseRev;
+          setPendingQueue(
+            markQueueStatus('pending', { errorMessage: 'Waiting for initial cloud snapshot...' })
+          );
+          return;
+        }
+
+        // Confirmed by Firestore server! Clear outbox queue and reset backoff
+        syncBackoffAttemptRef.current = 0;
+        if (syncRetryTimerRef.current) {
+          window.clearTimeout(syncRetryTimerRef.current);
+          syncRetryTimerRef.current = null;
+        }
+        setSyncNextRetryAt(null);
+
+        firestoreDocIdsRef.current = result.docIds;
+        lastSyncedDocsRef.current = result.sectionHashes;
+        lastSyncedJsonRef.current = result.businessJson;
+        if (result.writtenCount === 0) {
+          syncedRevisionRef.current = localBaseRev;
+        } else {
+          remoteSyncRevisionRef.current = Math.max(remoteSyncRevisionRef.current, nextRev);
+          if (typeof window !== 'undefined') {
+            try {
+              window.localStorage.setItem(FIRESTORE_MIGRATED_KEY, 'true');
+            } catch {
+              // ignore
+            }
           }
         }
-      } catch {
-        // ignore network hiccup
+        dirtyForFirestoreRef.current = false;
+        setPendingQueue(
+          clearConfirmedQueue({
+            confirmedState: targetState,
+            confirmedRevision: syncedRevisionRef.current,
+            confirmedBusinessJson: result.businessJson,
+            confirmedSectionHashes: result.sectionHashes,
+          })
+        );
+        setFirestoreStatus('synced');
+        setFirestoreStatusMessage('All changes confirmed in Firestore');
+        if (manual) {
+          showToast(
+            result.writtenCount > 0
+              ? `Synced ${result.writtenCount} changed document(s) to Firestore.`
+              : 'All local changes are already confirmed in Firestore.'
+          );
+        }
+      } catch (err) {
+        syncedRevisionRef.current = localBaseRev;
+        const wrapped = err instanceof Error ? err : new Error(String(err));
+        const isQuota = isFirestoreQuotaError(wrapped);
+        const isTransient = isTransientOfflineFirestoreError(wrapped);
+
+        if (isQuota || isTransient) {
+          dirtyForFirestoreRef.current = true;
+          const reasonMsg = isQuota
+            ? 'Firestore quota/rate limit reached — changes saved locally; retry paused automatically.'
+            : 'Firestore unreachable/timed out — saved locally; retrying with backoff.';
+          setFirestoreStatus('error');
+          setFirestoreStatusMessage(reasonMsg);
+          setPendingQueue(
+            markQueueStatus('paused', {
+              incrementRetry: true,
+              errorMessage: isQuota ? 'Quota/rate limit exceeded' : 'Network offline or timeout',
+            })
+          );
+          scheduleQueueBackoffRetry(isQuota);
+          if (manual) {
+            showToast(reasonMsg);
+          }
+        } else {
+          setFirestoreStatus('error');
+          setFirestoreStatusMessage(wrapped.message);
+          setFirestoreFatalError(wrapped);
+        }
+      } finally {
+        isFlushingQueueRef.current = false;
       }
     },
-    [showToast]
+    [scheduleQueueBackoffRetry, showToast]
   );
+
+  flushPendingSyncQueueRef.current = flushPendingSyncQueue;
 
   const scheduleExplicitPersist = useCallback(
     (nextState: ErpState) => {
+      // If browser is offline or backoff timer is already active, do not spam writes—stay queued locally until retry/online/Sync Now
+      if (
+        (typeof navigator !== 'undefined' && navigator.onLine === false) ||
+        syncRetryTimerRef.current !== null
+      ) {
+        if (firebaseUserRef.current) {
+          setPendingQueue(
+            markQueueStatus('paused', {
+              errorMessage:
+                typeof navigator !== 'undefined' && navigator.onLine === false
+                  ? 'Browser offline — waiting for connection.'
+                  : 'Waiting for scheduled backoff retry.',
+            })
+          );
+        }
+        return;
+      }
+
       if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
       saveTimerRef.current = window.setTimeout(() => {
         saveTimerRef.current = null;
-        void persistExplicitState(nextState);
+        void flushPendingSyncQueue(nextState);
       }, 2000);
     },
-    [persistExplicitState]
+    [flushPendingSyncQueue]
   );
 
-  // Explicit user business action mutator: only marks Firestore dirty & schedules sync if business hash changed
+  // Explicit user business action mutator: ALWAYS saves immediately to browser storage + queue first, then schedules debounced sync
   const commitState = useCallback(
     (updater: (prev: ErpState) => ErpState, recordUndo = false) => {
       const prev = latestStateRef.current;
@@ -892,9 +1241,16 @@ export default function App() {
       }
       setState(next);
 
-      const prevHash = computeBusinessStateHash(prev);
-      const nextHash = computeBusinessStateHash(next);
-      if (nextHash !== prevHash) {
+      const { queued, queue } = saveLocalAndQueueSync({
+        prevState: prev,
+        nextState: next,
+        baselineRevision: syncedRevisionRef.current,
+        baselineBusinessJson: lastSyncedJsonRef.current,
+        baselineSectionHashes: lastSyncedDocsRef.current,
+      });
+
+      if (queued) {
+        setPendingQueue(queue);
         dirtyForFirestoreRef.current = true;
         scheduleExplicitPersist(next);
       }
@@ -1039,7 +1395,15 @@ export default function App() {
           setUndoStack((u) => u.slice(1));
           latestStateRef.current = prevSnap;
           setState(prevSnap);
-          if (computeBusinessStateHash(prevSnap) !== computeBusinessStateHash(state)) {
+          const { queued, queue } = saveLocalAndQueueSync({
+            prevState: state,
+            nextState: prevSnap,
+            baselineRevision: syncedRevisionRef.current,
+            baselineBusinessJson: lastSyncedJsonRef.current,
+            baselineSectionHashes: lastSyncedDocsRef.current,
+          });
+          if (queued) {
+            setPendingQueue(queue);
             dirtyForFirestoreRef.current = true;
             scheduleExplicitPersist(prevSnap);
           }
@@ -1054,7 +1418,15 @@ export default function App() {
           setRedoStack((r) => r.slice(1));
           latestStateRef.current = nextSnap;
           setState(nextSnap);
-          if (computeBusinessStateHash(nextSnap) !== computeBusinessStateHash(state)) {
+          const { queued, queue } = saveLocalAndQueueSync({
+            prevState: state,
+            nextState: nextSnap,
+            baselineRevision: syncedRevisionRef.current,
+            baselineBusinessJson: lastSyncedJsonRef.current,
+            baselineSectionHashes: lastSyncedDocsRef.current,
+          });
+          if (queued) {
+            setPendingQueue(queue);
             dirtyForFirestoreRef.current = true;
             scheduleExplicitPersist(nextSnap);
           }
@@ -7083,69 +7455,25 @@ export default function App() {
   }, [showToast]);
 
   const handleForceFirestoreSync = useCallback(async () => {
-    if (!firebaseUser || !workspaceContext) return;
-    if (!lastSyncedJsonRef.current) {
-      showToast('Waiting for initial Firestore snapshot before syncing.');
+    if (!firebaseUser) {
+      showToast('Connect Google Cloud Sync first to upload local changes.');
       return;
     }
-    const currentHash = computeBusinessStateHash(state);
-    if (currentHash === lastSyncedJsonRef.current && firestoreDocIdsRef.current.length > 0) {
-      showToast('Already up to date with Firestore (no changes to write).');
-      return;
+    if (saveTimerRef.current) {
+      window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
     }
+    await flushPendingSyncQueue(latestStateRef.current, { manual: true });
+  }, [firebaseUser, flushPendingSyncQueue, showToast]);
 
-    const prevRev = syncedRevisionRef.current;
-    const remoteRev = remoteSyncRevisionRef.current;
-    const nextRev = prevRev + 1;
-    if (remoteRev > prevRev || remoteRev >= nextRev) {
-      showToast('Remote revision is newer; waiting for incoming cloud snapshot.');
-      return;
-    }
-
-    syncedRevisionRef.current = nextRev;
-    try {
-      const result = await saveStateToFirestoreBatch({
-        state: {
-          ...state,
-          syncRevision: nextRev,
-          lastUpdatedAt: new Date().toISOString(),
-          lastUpdatedBy: activeUserName,
-        },
-        user: firebaseUser,
-        workspace: workspaceContext,
-        syncRevision: nextRev,
-        localBaseRevision: prevRev,
-        remoteSyncRevision: remoteRev,
-        originClientId: clientIdRef.current,
-        knownDocIds: firestoreDocIdsRef.current,
-        lastSyncedDocs:
-          Object.keys(lastSyncedDocsRef.current).length > 0
-            ? lastSyncedDocsRef.current
-            : undefined,
-        lastSyncedJson: lastSyncedJsonRef.current,
-      });
-      if (result.abortedReason === 'stale-revision') {
-        const latestRev = Math.max(prevRev, result.remoteRevision ?? remoteRev);
-        syncedRevisionRef.current = latestRev;
-        remoteSyncRevisionRef.current = Math.max(remoteSyncRevisionRef.current, latestRev);
-        showToast('Sync aborted: newer revision detected in Firestore.');
-        return;
-      }
-      firestoreDocIdsRef.current = result.docIds;
-      lastSyncedDocsRef.current = result.sectionHashes;
-      lastSyncedJsonRef.current = result.businessJson;
-      if (result.writtenCount === 0) {
-        syncedRevisionRef.current = prevRev;
-        showToast('Already up to date with Firestore (no changes to write).');
-      } else {
-        remoteSyncRevisionRef.current = Math.max(remoteSyncRevisionRef.current, nextRev);
-        showToast(`Synced ${result.writtenCount} changed document(s) to Firestore rinse_state.`);
-      }
-    } catch (err) {
-      syncedRevisionRef.current = prevRev;
-      throw err;
-    }
-  }, [firebaseUser, workspaceContext, state, activeUserName, showToast]);
+  const cloudSyncUiState = useMemo<CloudSyncUiState>(() => {
+    if (firestoreStatus === 'unauthorized') return 'unauthorized';
+    if (!firebaseUser) return pendingQueue.length > 0 ? 'pending' : 'offline_local';
+    if (firestoreStatus === 'error' || syncNextRetryAt !== null) return 'paused';
+    if (pendingQueue.length > 0 || firestoreStatus === 'connecting') return 'pending';
+    if (firestoreStatus === 'synced') return 'synced';
+    return 'paused';
+  }, [firestoreStatus, firebaseUser, pendingQueue.length, syncNextRetryAt]);
 
   // Require login when no active user session exists
   if (!currentUser) {
@@ -7376,32 +7704,57 @@ export default function App() {
                 }}
                 title={
                   firebaseUser
-                    ? firestoreStatusMessage || `Cloud Sync (${firestoreStatus})`
-                    : 'Connect Google Cloud Sync'
+                    ? firestoreStatusMessage || `Cloud Sync (${cloudSyncUiState})`
+                    : pendingQueue.length > 0
+                      ? `${pendingQueue.length} change(s) saved locally in browser`
+                      : 'Connect Google Cloud Sync'
                 }
-                className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl border text-xs font-medium transition-colors whitespace-nowrap ${
-                  firestoreStatus === 'synced'
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl border text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                  cloudSyncUiState === 'synced'
                     ? 'bg-emerald-50/90 border-emerald-200 text-emerald-700 hover:bg-emerald-100/80'
-                    : firestoreStatus === 'unauthorized' || firestoreStatus === 'error'
-                      ? 'bg-amber-50 border-amber-200 text-amber-800'
-                      : 'bg-white/80 border-slate-200/80 text-slate-600 hover:bg-white'
+                    : cloudSyncUiState === 'pending'
+                      ? 'bg-sky-50 border-sky-200 text-sky-700 hover:bg-sky-100/80'
+                      : cloudSyncUiState === 'paused' || cloudSyncUiState === 'unauthorized'
+                        ? 'bg-amber-50 border-amber-200 text-amber-800 hover:bg-amber-100/80'
+                        : 'bg-white/80 border-slate-200/80 text-slate-600 hover:bg-white'
                 }`}
               >
-                {firestoreStatus === 'synced' ? (
+                {cloudSyncUiState === 'synced' ? (
                   <Cloud className="w-3.5 h-3.5 text-emerald-600" />
+                ) : cloudSyncUiState === 'pending' ? (
+                  <RefreshCw className="w-3.5 h-3.5 text-sky-600" />
                 ) : (
-                  <CloudOff className="w-3.5 h-3.5 text-slate-400" />
+                  <CloudOff className="w-3.5 h-3.5 text-amber-600" />
                 )}
                 <span className="hidden md:inline">
-                  {firestoreStatus === 'synced'
-                    ? 'Cloud Live'
-                    : firestoreStatus === 'connecting'
-                      ? 'Syncing...'
-                      : firestoreStatus === 'unauthorized'
-                        ? 'Needs Invite'
-                        : 'Connect Cloud'}
+                  {cloudSyncUiState === 'synced'
+                    ? 'Synced'
+                    : cloudSyncUiState === 'pending'
+                      ? pendingQueue.length > 0
+                        ? `Saved Locally (${pendingQueue.length} Pending)`
+                        : 'Syncing...'
+                      : cloudSyncUiState === 'paused'
+                        ? pendingQueue.length > 0
+                          ? `Sync Paused (${pendingQueue.length})`
+                          : 'Sync Paused - Retry Soon'
+                        : cloudSyncUiState === 'unauthorized'
+                          ? 'Needs Invite'
+                          : 'Connect Cloud'}
                 </span>
               </button>
+              {firebaseUser &&
+                cloudSyncUiState !== 'unauthorized' &&
+                (pendingQueue.length > 0 || cloudSyncUiState === 'paused') && (
+                  <button
+                    type="button"
+                    onClick={() => void handleForceFirestoreSync()}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-[#0071E3] text-white text-xs font-semibold hover:bg-[#0077ED] transition-colors whitespace-nowrap shrink-0"
+                    title="Retry syncing browser outbox to Firestore now"
+                  >
+                    <RefreshCw className="w-3 h-3" />
+                    <span className="hidden sm:inline">Sync Now</span>
+                  </button>
+                )}
               <button
                 onClick={() => setNotificationsOpen(true)}
                 className="relative inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white/80 border border-slate-200/80 text-xs font-medium text-slate-700 hover:bg-white transition-colors whitespace-nowrap"
@@ -7874,9 +8227,18 @@ export default function App() {
                     // continue restoring to local/Firestore state
                   }
                 }
+                const prevSnap = latestStateRef.current;
                 latestStateRef.current = migrated;
                 dirtyForFirestoreRef.current = true;
                 setState(migrated);
+                const { queue } = saveLocalAndQueueSync({
+                  prevState: prevSnap,
+                  nextState: migrated,
+                  baselineRevision: syncedRevisionRef.current,
+                  baselineBusinessJson: lastSyncedJsonRef.current,
+                  baselineSectionHashes: lastSyncedDocsRef.current,
+                });
+                setPendingQueue(queue);
                 scheduleExplicitPersist(migrated);
               }}
               onCreateUser={handleCreateUser}
@@ -7888,6 +8250,7 @@ export default function App() {
               githubStatus={githubStatus}
               onRefreshGitHubStatus={refreshGitHubStatus}
               onApplyPulledState={(pulledState) => {
+                const prevSnap = latestStateRef.current;
                 const migrated = migrateErpState(pulledState);
                 latestStateRef.current = migrated;
                 dirtyForFirestoreRef.current = true;
@@ -7898,12 +8261,23 @@ export default function App() {
                   );
                 }
                 setState(migrated);
+                const { queue } = saveLocalAndQueueSync({
+                  prevState: prevSnap,
+                  nextState: migrated,
+                  baselineRevision: syncedRevisionRef.current,
+                  baselineBusinessJson: lastSyncedJsonRef.current,
+                  baselineSectionHashes: lastSyncedDocsRef.current,
+                });
+                setPendingQueue(queue);
                 scheduleExplicitPersist(migrated);
               }}
               firebaseUser={firebaseUser}
               workspaceContext={workspaceContext}
               firestoreStatus={firestoreStatus}
               firestoreStatusMessage={firestoreStatusMessage}
+              cloudSyncUiState={cloudSyncUiState}
+              pendingSyncQueue={pendingQueue}
+              syncNextRetryAt={syncNextRetryAt}
               onGoogleSignIn={handleGoogleSignIn}
               onGoogleSignOut={handleGoogleSignOut}
               onForceFirestoreSync={handleForceFirestoreSync}
